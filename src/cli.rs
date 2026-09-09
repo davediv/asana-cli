@@ -105,6 +105,10 @@ pub enum ProjectCmd {
     View(project_view::Args),
 }
 
+/// The one-line `about` of each leaf is what its group screen lists. The
+/// list reads in one grammatical number, gh's singular (`Delete a task`,
+/// `View a task`), so the two commands that take several tasks are named
+/// here in the same form; their own `--help` still opens with "one or more".
 #[derive(Subcommand, Debug)]
 pub enum TaskCmd {
     #[command(visible_alias = "ls")]
@@ -112,8 +116,9 @@ pub enum TaskCmd {
     View(task_view::Args),
     #[command(visible_alias = "new")]
     Create(task_create::Args),
-    #[command(visible_alias = "close")]
+    #[command(visible_alias = "close", about = "Mark a task complete")]
     Complete(task_complete::CompleteArgs),
+    #[command(about = "Reopen a task")]
     Reopen(task_complete::ReopenArgs),
     Assign(task_assign::Args),
     Comment(task_comment::Args),
@@ -170,6 +175,7 @@ impl Commands {
     /// Whether the invoked leaf asked for `--json`.
     pub fn wants_json(&self) -> bool {
         match self {
+            Commands::Workspace(WorkspaceCmd::List(a)) => a.json,
             Commands::Project(ProjectCmd::List(a)) => a.json,
             Commands::Project(ProjectCmd::View(a)) => a.json,
             Commands::Task(TaskCmd::List(a)) => a.json,
@@ -242,10 +248,13 @@ pub fn command_path(root: &Command, argv: &[OsString]) -> Vec<String> {
     path
 }
 
-/// `asana help [<command>... | <topic>]` and `asana version`, which gh
-/// supports and clap reports as unknown subcommands. `help` follows the
-/// command tree as far as it matches, like cobra's; a first word that is
-/// neither a command nor a topic is `Unknown help topic`.
+/// `asana help [<command>... | <topic>]`, `asana <topic>` and `asana
+/// version`, which gh supports and clap reports as unknown subcommands.
+/// `help` follows the command tree as far as it matches, like cobra's; a
+/// first word that is neither a command nor a topic is `Unknown help
+/// topic`. gh registers its topics as hidden commands, so `gh formatting`
+/// and `gh formatting --help` print the topic too; a topic given with any
+/// flag but `--help`/`--no-color` is left to clap's unknown-command report.
 pub(crate) fn builtin_request(
     root: &Command,
     argv: &[OsString],
@@ -257,6 +266,12 @@ pub(crate) fn builtin_request(
         code: 0,
     };
     let words = bare_words(argv);
+    let only_help_flags = || {
+        argv.iter().skip(1).all(|a| {
+            let s = a.to_string_lossy();
+            !s.starts_with('-') || matches!(s.as_ref(), "--help" | "-h" | "--no-color")
+        })
+    };
     match words.first().map(String::as_str) {
         Some("version") => Some(ok(render_version())),
         Some("help") => {
@@ -289,6 +304,9 @@ pub(crate) fn builtin_request(
                 });
             }
             Some(ok(render_help(&path, palette)))
+        }
+        Some(topic) if words.len() == 1 && only_help_flags() => {
+            help::topic(topic).map(|t| ok(render_topic(t)))
         }
         _ => None,
     }
@@ -428,12 +446,24 @@ pub fn render_version() -> String {
     )
 }
 
-/// `asana help <topic>`: the topic text alone, like gh's help topics.
+/// `asana help <topic>`: the topic text alone, like gh's help topics, and
+/// when the topic has examples a plain (never coloured) `EXAMPLES` heading
+/// after two blank lines with the examples indented, as `gh help
+/// formatting` prints them.
 pub fn render_topic(topic: &help::Topic) -> String {
-    match topic.body {
+    let mut out = match topic.body {
         help::Body::Text(text) => text.to_string(),
         help::Body::Reference => render_reference(&command()),
+    };
+    if !topic.example.is_empty() {
+        out.push_str("\n\nEXAMPLES\n");
+        for line in topic.example.trim_end_matches('\n').lines() {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
     }
+    out
 }
 
 /// `asana help reference`: every command with its usage line, description
@@ -732,6 +762,7 @@ CORE COMMANDS
 HELP TOPICS
   environment:   Environment variables that can be used with asana
   exit-codes:    Exit codes used by asana
+  formatting:    Formatting options for JSON and piped output from asana
   reference:     A comprehensive reference of all asana commands
 
 FLAGS
@@ -750,6 +781,7 @@ LEARN MORE
   Read the manual at https://github.com/davediv/asana-cli#readme
   Learn about exit codes using `asana help exit-codes`
   Learn about environment variables using `asana help environment`
+  Learn about output formatting using `asana help formatting`
 
 ";
         assert_eq!(render_help(&[], &Palette::off()), expected);
@@ -782,7 +814,59 @@ ARGUMENTS
         assert!(project.contains(expected_tail), "{project}");
         assert!(!project.contains("\nFLAGS\n"));
         assert!(!project.contains("HELP TOPICS"));
-        assert!(project.ends_with("`asana help environment`\n\n"));
+        assert!(project.ends_with("`asana help formatting`\n\n"));
+    }
+
+    /// Every description on the task screen names one task, the way gh's
+    /// `Delete issue` and `View an issue` do; `complete` and `reopen` take
+    /// several but are listed in the same number as their siblings.
+    #[test]
+    fn task_group_descriptions_agree_in_number() {
+        let p = Palette::off();
+        let task = render_help(&["task".to_string()], &p);
+        let expected = "\
+TARGETED COMMANDS
+  assign:        Assign a task to someone
+  comment:       Add a comment to a task
+  complete:      Mark a task complete
+  delete:        Delete a task
+  reopen:        Reopen a task
+  view:          View a task
+
+";
+        assert!(task.contains(expected), "{task}");
+        assert!(!task.contains("tasks complete"), "{task}");
+        assert!(!task.contains("Reopen tasks"), "{task}");
+    }
+
+    /// `asana help formatting` reads like `gh help formatting`: the prose,
+    /// two blank lines, a plain `EXAMPLES` heading and the examples indented
+    /// two spaces (blank lines included), with no colour anywhere.
+    #[test]
+    fn formatting_topic_has_examples_like_gh() {
+        let topic = help::topic("formatting").expect("formatting topic");
+        let out = render_topic(topic);
+        assert!(out.starts_with("By default, the result of `asana` commands is output in line-based plain text format"), "{out}");
+        assert!(out.contains("`--json`"), "{out}");
+        assert!(out.contains("tab-separated with no header"), "{out}");
+        assert!(
+            out.contains(".\n\n\nEXAMPLES\n  # Default output format\n  $ asana task list\n  \n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n  $ asana task list --json\n  [\n    {\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("\n  https://app.asana.com/0/1200000000000000/1211234567890123\n"),
+            "{out}"
+        );
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains("USAGE"));
+        // Topics without examples end with their prose.
+        let exit = render_topic(help::topic("exit-codes").expect("exit-codes"));
+        assert!(!exit.contains("EXAMPLES"));
+        assert!(exit.ends_with("exits with 0.\n"));
     }
 
     /// A group without groupings of its own lists `AVAILABLE COMMANDS`, as
@@ -925,10 +1009,36 @@ ARGUMENTS
         assert!(r.stdout.ends_with("exits with 0.\n"));
         assert!(!r.stdout.contains("USAGE"));
 
+        let r = run(&["asana", "help", "formatting"]).expect("formatting topic");
+        assert_eq!(r.code, 0);
+        assert_eq!(r.stdout, render_topic(help::topic("formatting").unwrap()));
+
+        // Topics are hidden commands in gh: `gh formatting`, `gh formatting --help`.
+        for (parts, name) in [
+            (&["asana", "formatting"][..], "formatting"),
+            (&["asana", "formatting", "--help"], "formatting"),
+            (&["asana", "--no-color", "exit-codes", "-h"], "exit-codes"),
+        ] {
+            let r = run(parts).expect("topic as a command");
+            let topic = help::topic(name).unwrap();
+            assert_eq!((r.code, r.stdout), (0, render_topic(topic)), "{parts:?}");
+        }
+        // With another word or flag it is an ordinary unknown command.
+        assert!(run(&["asana", "formatting", "list"]).is_none());
+        assert!(run(&["asana", "formatting", "--json"]).is_none());
+        assert!(run(&["asana", "--workspace", "x", "formatting"]).is_none());
+
         let r = run(&["asana", "help", "reference"]).expect("reference");
         assert_eq!(r.code, 0);
         assert!(r.stdout.starts_with("# asana reference\n\n## `asana auth <command> [flags]`\n\nCheck authentication with Asana\n\n### `asana auth status [flags]`\n\n"), "{}", r.stdout);
         assert!(r.stdout.contains("\n## `asana task <command> [flags]`\n\nManage tasks\n\n### `asana task assign {<gid> | <url>} [<assignee>] [flags]`\n"), "{}", r.stdout);
+        assert!(
+            r.stdout.contains(
+                "\n### `asana task complete {<gids> | <urls>} [flags]`\n\nMark a task complete\n"
+            ),
+            "{}",
+            r.stdout
+        );
         assert!(r.stdout.contains("\n```\n    --json"), "{}", r.stdout);
         assert!(r.stdout.contains("\n-L, --limit int"), "{}", r.stdout);
         assert!(!r.stdout.contains("--help"), "{}", r.stdout);
