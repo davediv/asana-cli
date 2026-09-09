@@ -5,6 +5,17 @@
 //! command, unknown flag, `accepts N arg(s)`, the `Usage:` block under usage
 //! errors) lives in `error.rs`, which borrows the flag-table formatting from
 //! here.
+//!
+//! Line length follows one rule on every screen. gh never rewraps: its
+//! descriptions are hand-wrapped under 80 columns in the source and its
+//! flag tables print as pflag lays them out. Ours are hand-wrapped the same
+//! way (`cmd::help::PROSE_WIDTH`), and because a terminal narrower than a
+//! line would break it mid-word, the renderer also breaks any line wider
+//! than the terminal (capped at [`MAX_HELP_WIDTH`]) at a space, keeping the
+//! column the text started in: prose keeps its indent, a bullet hangs, a
+//! flag or command description continues under itself. Examples are
+//! commands and print verbatim. Every piece's help gets this without
+//! touching its text; only the width of the terminal decides.
 
 use std::ffi::OsString;
 
@@ -22,6 +33,127 @@ use crate::render::Palette;
 pub use crate::error::{usage_error, Cancelled, Rendered, SilentExit, UsageError};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The widest a help line is laid out for, whatever the terminal: prose
+/// keeps a readable measure on a wide screen, and gh's own hand-wrapped
+/// descriptions stay under this.
+pub const MAX_HELP_WIDTH: usize = 100;
+
+/// The width help is rendered at: the terminal's (stdout, else stderr, so
+/// `asana --help | less` still sees the screen it is read on), else
+/// `COLUMNS`, else 80, capped at [`MAX_HELP_WIDTH`].
+fn help_width() -> usize {
+    let detected = terminal_size::terminal_size()
+        .map(|(terminal_size::Width(w), _)| w as usize)
+        .filter(|w| *w > 0)
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|c| c.trim().parse::<usize>().ok())
+                .filter(|w| *w > 0)
+        })
+        .unwrap_or(80);
+    detected.min(MAX_HELP_WIDTH)
+}
+
+/// Break one logical line into lines no wider than `limit`, the first
+/// prefixed with `first` and the rest with `rest`. Greedy, at ASCII spaces
+/// only, like a terminal would if it broke at words: no hyphenation, and a
+/// word wider than the limit (a URL) stays whole on a line of its own. A
+/// line that already fits comes back as it is.
+fn wrap_line(text: &str, limit: usize, first: &str, rest: &str) -> Vec<String> {
+    let text = text.trim_end();
+    if text.is_empty() {
+        return vec![first.trim_end().to_string()];
+    }
+    if crate::render::text::width(first) + crate::render::text::width(text) <= limit {
+        return vec![format!("{first}{text}")];
+    }
+    let opts = textwrap::Options::new(limit)
+        .initial_indent(first)
+        .subsequent_indent(rest)
+        .break_words(false)
+        .word_separator(textwrap::WordSeparator::AsciiSpace)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation)
+        .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
+    textwrap::wrap(text, &opts)
+        .into_iter()
+        .map(|l| l.into_owned())
+        .collect()
+}
+
+/// `<https://...>` written as a bare URL: the angle brackets are markdown's
+/// autolink syntax and mean nothing on a terminal.
+fn unbracket_urls(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find("<http") {
+        let after = &rest[i + 1..];
+        match after.find('>') {
+            Some(j)
+                if (after.starts_with("http://") || after.starts_with("https://"))
+                    && !after[..j].contains(char::is_whitespace) =>
+            {
+                out.push_str(&rest[..i]);
+                out.push_str(&after[..j]);
+                rest = &after[j + 1..];
+            }
+            _ => {
+                out.push_str(&rest[..i + 1]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A block of prose (a description, ARGUMENTS, LEARN MORE) laid out under
+/// `indent` and wrapped to `limit`: each line is broken at spaces if it must
+/// be, a `- ` bullet's continuation hangs under its text, blank lines stay
+/// empty (never indent-only), and URLs are bare.
+fn prose(out: &mut String, text: &str, indent: &str, limit: usize) {
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let line = unbracket_urls(line);
+        let body = line.trim_start();
+        let lead = &line[..line.len() - body.len()];
+        let hang = if body.starts_with("- ") || body.starts_with("* ") {
+            "  "
+        } else {
+            ""
+        };
+        let first = format!("{indent}{lead}");
+        let rest = format!("{indent}{lead}{hang}");
+        for l in wrap_line(body, limit, &first, &rest) {
+            out.push_str(&l);
+            out.push('\n');
+        }
+    }
+}
+
+/// A two-column row (`  name:        description`, `  -s, --long   help`):
+/// the description wraps under itself when the row is wider than `limit`,
+/// as pflag's `FlagUsagesWrapped` does, unless the column leaves it fewer
+/// than 24 cells, when it prints whole.
+fn columns(out: &mut String, left: &str, desc: &str, limit: Option<usize>) {
+    let col = crate::render::text::width(left);
+    let room = limit.map(|l| l.saturating_sub(col));
+    if desc.is_empty() || room.is_some_and(|r| r < 24) {
+        out.push_str(left);
+        out.push_str(desc);
+        out.push('\n');
+        return;
+    }
+    let rest = " ".repeat(col);
+    for l in wrap_line(desc, limit.unwrap_or(usize::MAX), left, &rest) {
+        out.push_str(&l);
+        out.push('\n');
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -402,13 +534,15 @@ pub(crate) fn flag_lines_with_gutter(args: Vec<&clap::Arg>, gutter: bool) -> Vec
         .collect()
 }
 
-/// The flag table as it sits under a help heading: two-space indent, the
-/// descriptions aligned three spaces past the longest flag.
+/// The flag table as it sits under a usage error: two-space indent, the
+/// descriptions aligned three spaces past the longest flag, never wrapped
+/// (cobra prints `FlagUsages()` as is there).
 pub(crate) fn render_flag_table(lines: &[FlagLine]) -> String {
-    flag_table(lines, "  ")
+    flag_table(lines, "  ", None)
 }
 
-fn flag_table(lines: &[FlagLine], indent: &str) -> String {
+/// The same table under a help heading, wrapped to `limit`.
+fn flag_table(lines: &[FlagLine], indent: &str, limit: Option<usize>) -> String {
     let max = lines
         .iter()
         .map(|l| l.left.chars().count())
@@ -417,7 +551,8 @@ fn flag_table(lines: &[FlagLine], indent: &str) -> String {
     let mut out = String::new();
     for l in lines {
         let pad = " ".repeat(max - l.left.chars().count());
-        out.push_str(&format!("{indent}{}{}   {}\n", l.left, pad, l.help));
+        let left = format!("{indent}{}{}   ", l.left, pad);
+        columns(&mut out, &left, &l.help, limit);
     }
     out
 }
@@ -453,19 +588,36 @@ pub fn render_version() -> String {
 /// after two blank lines with the examples indented, as `gh help
 /// formatting` prints them.
 pub fn render_topic(topic: &help::Topic) -> String {
-    let mut out = match topic.body {
-        help::Body::Text(text) => text.to_string(),
-        help::Body::Reference => render_reference(&command()),
+    render_topic_at(topic, help_width())
+}
+
+/// `render_topic` laid out for `width` columns: the prose wraps like a help
+/// screen's, the reference (markdown) and the examples print verbatim.
+pub fn render_topic_at(topic: &help::Topic, width: usize) -> String {
+    let mut out = String::new();
+    match topic.body {
+        help::Body::Text(text) => prose(&mut out, text, "", width),
+        help::Body::Reference => out.push_str(&render_reference(&command())),
     };
     if !topic.example.is_empty() {
         out.push_str("\n\nEXAMPLES\n");
-        for line in topic.example.trim_end_matches('\n').lines() {
+        examples(&mut out, topic.example);
+    }
+    out
+}
+
+/// An EXAMPLES body under its two-space indent: commands print verbatim,
+/// blank lines between groups stay empty.
+fn examples(out: &mut String, text: &str) {
+    for line in text.trim_end().lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+        } else {
             out.push_str("  ");
             out.push_str(line);
             out.push('\n');
         }
     }
-    out
 }
 
 /// `asana help reference`: every command with its usage line, description
@@ -479,7 +631,7 @@ pub fn render_reference(root: &Command) -> String {
         let lines = flag_lines(local_flags(cmd));
         if !lines.is_empty() {
             out.push_str("```\n");
-            out.push_str(&flag_table(&lines, ""));
+            out.push_str(&flag_table(&lines, "", None));
             out.push_str("```\n\n");
         }
         for sub in sorted_subcommands(cmd) {
@@ -505,17 +657,23 @@ fn sorted_subcommands(cmd: &Command) -> Vec<&Command> {
     subs
 }
 
-/// Render the gh-shaped help screen for a command path.
+/// Render the gh-shaped help screen for a command path, laid out for the
+/// terminal (see the module notes on line length).
 pub fn render_help(path: &[String], palette: &Palette) -> String {
-    let root = command();
-    if find(&root, path).is_none() {
-        return render_help_for(&root, &[], palette);
-    }
-    render_help_for(&root, path, palette)
+    render_help_at(path, palette, help_width())
 }
 
-/// `render_help` over a given tree; `path` must exist in it.
-fn render_help_for(root: &Command, path: &[String], palette: &Palette) -> String {
+/// `render_help` laid out for `width` columns.
+pub fn render_help_at(path: &[String], palette: &Palette, width: usize) -> String {
+    let root = command();
+    if find(&root, path).is_none() {
+        return render_help_for(&root, &[], palette, width);
+    }
+    render_help_for(&root, path, palette, width)
+}
+
+/// `render_help_at` over a given tree; `path` must exist in it.
+fn render_help_for(root: &Command, path: &[String], palette: &Palette, width: usize) -> String {
     let cmd = find(root, path).expect("path exists in the tree");
     let heading = |s: &str| palette.bold(s);
     let mut out = String::new();
@@ -532,8 +690,11 @@ fn render_help_for(root: &Command, path: &[String], palette: &Palette) -> String
             .or_else(|| cmd.get_about().map(|s| s.to_string()))
             .unwrap_or_default()
     };
-    out.push_str(&about);
-    out.push_str("\n\n");
+    prose(&mut out, &about, "", width);
+    if about.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
 
     out.push_str(&heading("USAGE"));
     out.push_str(&format!("\n  {}\n\n", usage_line(path)));
@@ -607,12 +768,8 @@ fn render_help_for(root: &Command, path: &[String], palette: &Palette) -> String
             out.push('\n');
             for c in members {
                 let about = c.get_about().map(|s| s.to_string()).unwrap_or_default();
-                out.push_str(&format!(
-                    "  {:<pad$}{}\n",
-                    format!("{}:", c.get_name()),
-                    about,
-                    pad = pad
-                ));
+                let left = format!("  {:<pad$}", format!("{}:", c.get_name()), pad = pad);
+                columns(&mut out, &left, &about, Some(width));
             }
             out.push('\n');
         }
@@ -620,12 +777,8 @@ fn render_help_for(root: &Command, path: &[String], palette: &Palette) -> String
             out.push_str(&heading("HELP TOPICS"));
             out.push('\n');
             for t in help::TOPICS {
-                out.push_str(&format!(
-                    "  {:<pad$}{}\n",
-                    format!("{}:", t.name),
-                    t.short,
-                    pad = pad
-                ));
+                let left = format!("  {:<pad$}", format!("{}:", t.name), pad = pad);
+                columns(&mut out, &left, t.short, Some(width));
             }
             out.push('\n');
         }
@@ -649,49 +802,39 @@ fn render_help_for(root: &Command, path: &[String], palette: &Palette) -> String
     if !local_lines.is_empty() {
         out.push_str(&heading("FLAGS"));
         out.push('\n');
-        out.push_str(&render_flag_table(&local_lines));
+        out.push_str(&flag_table(&local_lines, "  ", Some(width)));
         out.push('\n');
     }
     let inherited_lines = flag_lines_with_gutter(inherited, gutter);
     if !inherited_lines.is_empty() {
         out.push_str(&heading("INHERITED FLAGS"));
         out.push('\n');
-        out.push_str(&render_flag_table(&inherited_lines));
+        out.push_str(&flag_table(&inherited_lines, "  ", Some(width)));
         out.push('\n');
     }
 
     if let Some(text) = help::arguments(&strs(path)) {
         out.push_str(&heading("ARGUMENTS"));
         out.push('\n');
-        for line in text.lines() {
-            out.push_str(&format!("  {line}\n"));
-        }
+        prose(&mut out, text, "  ", width);
         out.push('\n');
     }
 
-    let examples = if path.is_empty() {
+    let example_text = if path.is_empty() {
         Some(help::ROOT_EXAMPLES.to_string())
     } else {
         cmd.get_after_help().map(|s| s.to_string())
     };
-    if let Some(ex) = examples.filter(|e| !e.trim().is_empty()) {
+    if let Some(ex) = example_text.filter(|e| !e.trim().is_empty()) {
         out.push_str(&heading("EXAMPLES"));
         out.push('\n');
-        for line in ex.trim_end().lines() {
-            if line.is_empty() {
-                out.push_str("  \n");
-            } else {
-                out.push_str(&format!("  {line}\n"));
-            }
-        }
+        examples(&mut out, &ex);
         out.push('\n');
     }
 
     out.push_str(&heading("LEARN MORE"));
     out.push('\n');
-    for line in help::learn_more() {
-        out.push_str(&format!("  {line}\n"));
-    }
+    prose(&mut out, &help::learn_more().join("\n"), "  ", width);
     out.push('\n');
     out
 }
@@ -702,6 +845,29 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<OsString> {
         parts.iter().map(OsString::from).collect()
+    }
+
+    /// The screens as the critic captures them: a 120-column pty, so the
+    /// layout width is the cap.
+    fn help(path: &[&str], palette: &Palette) -> String {
+        let path: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        render_help_at(&path, palette, MAX_HELP_WIDTH)
+    }
+
+    /// Every command path in the tree, the root first.
+    fn all_paths() -> Vec<Vec<String>> {
+        fn walk(cmd: &Command, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            out.push(path.clone());
+            for sub in cmd.get_subcommands().filter(|c| !c.is_hide_set()) {
+                path.push(sub.get_name().to_string());
+                walk(sub, path, out);
+                path.pop();
+            }
+        }
+        let root = command();
+        let mut out = Vec::new();
+        walk(&root, &mut Vec::new(), &mut out);
+        out
     }
 
     #[test]
@@ -725,7 +891,7 @@ mod tests {
     #[test]
     fn help_screens_have_gh_sections() {
         let p = Palette::off();
-        let root = render_help(&[], &p);
+        let root = help(&[], &p);
         assert!(root.starts_with(help::ROOT_ABOUT));
         for section in ["USAGE", "CORE COMMANDS", "FLAGS", "EXAMPLES", "LEARN MORE"] {
             assert!(
@@ -733,12 +899,12 @@ mod tests {
                 "{section} missing in:\n{root}"
             );
         }
-        let task = render_help(&["task".to_string()], &p);
+        let task = help(&["task"], &p);
         assert!(task.contains("\nGENERAL COMMANDS\n"));
         assert!(task.contains("\nTARGETED COMMANDS\n"));
         assert!(task.contains("\nARGUMENTS\n"));
         assert!(task.contains("  asana task <command> [flags]"));
-        let list = render_help(&["task".to_string(), "list".to_string()], &p);
+        let list = help(&["task", "list"], &p);
         assert!(list.contains("\nALIASES\n  asana task ls\n"));
         assert!(list.contains("-L, --limit int"));
         assert!(list.contains("(default 30)"));
@@ -774,41 +940,45 @@ FLAGS
   --workspace NAME   Select the workspace by name or gid
 
 EXAMPLES
-  # Get started with a personal access token from https://app.asana.com/0/my-apps
+  # Create a personal access token at https://app.asana.com/0/my-apps
   $ export ASANA_TOKEN=<token>
   $ asana auth status
-  
+
   # Work with tasks
   $ asana task list
   $ asana task create --title \"Fix the login page\"
   $ asana task view 1211234567890123 --web
 
 LEARN MORE
-  Use `asana <command> <subcommand> --help` for more information about a command.
+  Use `asana <command> <subcommand> --help` for more information on a command.
   Read the manual at https://github.com/davediv/asana-cli#readme
   Learn about exit codes using `asana help exit-codes`
   Learn about environment variables using `asana help environment`
   Learn about output formatting using `asana help formatting`
 
 ";
-        assert_eq!(render_help(&[], &Palette::off()), expected);
+        assert_eq!(help(&[], &Palette::off()), expected);
+        // Every line fits an 80-column terminal, so the screen reads the
+        // same at 80 as at the critic's 120.
+        assert_eq!(render_help_at(&[], &Palette::off(), 80), expected);
+        assert!(!expected.contains("\n  \n"), "whitespace-only line");
     }
 
     #[test]
     fn headings_use_gh_colour_bytes_only_when_enabled() {
-        let coloured = render_help(&[], &Palette::new(true));
+        let coloured = help(&[], &Palette::new(true));
         assert!(coloured.contains("\x1b[0;1;39mUSAGE\x1b[0m\n"));
         assert!(coloured.contains("\x1b[0;1;39mLEARN MORE\x1b[0m\n"));
         // Nothing but the headings is styled.
         let stripped = coloured.replace("\x1b[0;1;39m", "").replace("\x1b[0m", "");
-        assert_eq!(stripped, render_help(&[], &Palette::off()));
-        assert!(!render_help(&[], &Palette::off()).contains('\x1b'));
+        assert_eq!(stripped, help(&[], &Palette::off()));
+        assert!(!help(&[], &Palette::off()).contains('\x1b'));
     }
 
     #[test]
     fn group_help_lists_inherited_flags_and_arguments() {
         let p = Palette::off();
-        let project = render_help(&["project".to_string()], &p);
+        let project = help(&["project"], &p);
         let expected_tail = "\
 INHERITED FLAGS
   --help             Show help for command
@@ -830,7 +1000,7 @@ ARGUMENTS
     #[test]
     fn task_group_descriptions_agree_in_number() {
         let p = Palette::off();
-        let task = render_help(&["task".to_string()], &p);
+        let task = help(&["task"], &p);
         let expected = "\
 TARGETED COMMANDS
   assign:        Assign a task to someone
@@ -852,12 +1022,12 @@ TARGETED COMMANDS
     #[test]
     fn formatting_topic_has_examples_like_gh() {
         let topic = help::topic("formatting").expect("formatting topic");
-        let out = render_topic(topic);
-        assert!(out.starts_with("By default, the result of `asana` commands is output in line-based plain text format"), "{out}");
+        let out = render_topic_at(topic, MAX_HELP_WIDTH);
+        assert!(out.starts_with("By default, the result of `asana` commands is output in line-based plain\ntext format"), "{out}");
         assert!(out.contains("`--json`"), "{out}");
         assert!(out.contains("tab-separated with no header"), "{out}");
         assert!(
-            out.contains(".\n\n\nEXAMPLES\n  # Default output format\n  $ asana task list\n  \n"),
+            out.contains(".\n\n\nEXAMPLES\n  # Default output format\n  $ asana task list\n\n"),
             "{out}"
         );
         assert!(
@@ -870,10 +1040,21 @@ TARGETED COMMANDS
         );
         assert!(!out.contains('\x1b'));
         assert!(!out.contains("USAGE"));
+        assert!(!out.contains("\n  \n"), "whitespace-only line in {out}");
         // Topics without examples end with their prose.
-        let exit = render_topic(help::topic("exit-codes").expect("exit-codes"));
+        let exit = render_topic_at(help::topic("exit-codes").expect("exit-codes"), 80);
         assert!(!exit.contains("EXAMPLES"));
         assert!(exit.ends_with("exits with 0.\n"));
+        // The bracketed-URL and hand-wrap rules hold on every topic at 80.
+        for t in help::TOPICS {
+            let out = render_topic_at(t, 80);
+            for line in out.lines() {
+                assert!(!line.contains("<http"), "{}: {line}", t.name);
+                if matches!(t.body, help::Body::Text(_)) {
+                    assert!(line.chars().count() <= 80, "{}: {line}", t.name);
+                }
+            }
+        }
     }
 
     /// A group without groupings of its own lists `AVAILABLE COMMANDS`, as
@@ -881,7 +1062,7 @@ TARGETED COMMANDS
     #[test]
     fn ungrouped_commands_are_available_commands() {
         let p = Palette::off();
-        let auth = render_help(&["auth".to_string()], &p);
+        let auth = help(&["auth"], &p);
         assert!(
             auth.contains(
                 "\nUSAGE\n  asana auth <command> [flags]\n\nAVAILABLE COMMANDS\n  status:        "
@@ -890,7 +1071,7 @@ TARGETED COMMANDS
         );
         assert!(!auth.contains("\nCOMMANDS\n"));
         assert!(!auth.contains("ADDITIONAL COMMANDS"));
-        let ws = render_help(&["workspace".to_string()], &p);
+        let ws = help(&["workspace"], &p);
         assert!(
             ws.contains("\nAVAILABLE COMMANDS\n  list:          "),
             "{ws}"
@@ -901,18 +1082,21 @@ TARGETED COMMANDS
     /// says how: the token page, the environment variable, the config file,
     /// and the topic with the details. Its first line is the root screen's
     /// `auth:` summary, as gh's is, and the root EXAMPLES show the same
-    /// first-run path before anything else.
+    /// first-run path before anything else. The paragraph is hand-wrapped
+    /// short of 78 columns with a bare URL, so it reads the same at 80 and
+    /// at 120.
     #[test]
     fn auth_screens_say_how_to_authenticate() {
         let p = Palette::off();
-        let auth = render_help(&["auth".to_string()], &p);
+        let auth = help(&["auth"], &p);
         let expected_head = "\
 Authenticate with Asana.
 
 asana authenticates with a personal access token. Create one at
-<https://app.asana.com/0/my-apps>, then either set the ASANA_TOKEN environment variable
-to it or put `token = \"...\"` in ~/.config/asana/config.toml. Run `asana auth status` to
-check which account the token belongs to; `asana help environment` has the details.
+https://app.asana.com/0/my-apps, then either set the ASANA_TOKEN environment
+variable to it or put `token = \"...\"` in ~/.config/asana/config.toml.
+Run `asana auth status` to check which account the token belongs to;
+`asana help environment` has the details.
 
 USAGE
   asana auth <command> [flags]
@@ -920,14 +1104,16 @@ USAGE
 AVAILABLE COMMANDS
   status:        ";
         assert!(auth.starts_with(expected_head), "{auth}");
+        assert_eq!(render_help_at(&["auth".to_string()], &p, 80), auth);
         assert!(
             auth.contains("\nEXAMPLES\n  $ export ASANA_TOKEN=<token>\n  $ asana auth status\n\n"),
             "{auth}"
         );
+        assert!(!auth.contains('<') || !auth.contains("<http"), "{auth}");
         for line in auth.lines() {
-            assert!(line.len() <= 90, "auth line too long: {line}");
+            assert!(line.chars().count() <= 80, "auth line too long: {line}");
         }
-        let root = render_help(&[], &p);
+        let root = help(&[], &p);
         assert!(
             root.contains(&format!("\n  auth:          {}\n", help::AUTH_ABOUT)),
             "{root}"
@@ -940,16 +1126,132 @@ AVAILABLE COMMANDS
             .expect("root EXAMPLES");
         assert!(
             examples.starts_with(
-                "  # Get started with a personal access token from https://app.asana.com/0/my-apps\n  $ export ASANA_TOKEN=<token>\n  $ asana auth status\n  \n  # Work with tasks\n"
+                "  # Create a personal access token at https://app.asana.com/0/my-apps\n  $ export ASANA_TOKEN=<token>\n  $ asana auth status\n\n  # Work with tasks\n"
             ),
             "{examples}"
         );
         for line in examples.lines() {
             assert!(
-                line == "  " || line.starts_with("  $ ") || line.starts_with("  # "),
+                line.is_empty() || line.starts_with("  $ ") || line.starts_with("  # "),
                 "not an example line: {line:?}"
             );
         }
+    }
+
+    /// One rule for every screen: at 80 columns no line of any help screen
+    /// is wider than the terminal, however long a piece wrote its text, and
+    /// at the critic's 120 columns a line under the cap is left exactly as
+    /// written. Examples are the exception: they are commands and print
+    /// verbatim.
+    #[test]
+    fn every_screen_fits_the_terminal() {
+        let p = Palette::off();
+        for path in all_paths() {
+            let at80 = render_help_at(&path, &p, 80);
+            let mut in_examples = false;
+            for line in at80.lines() {
+                if line == "EXAMPLES" {
+                    in_examples = true;
+                } else if line == "LEARN MORE" {
+                    in_examples = false;
+                }
+                assert!(!line.contains("<http"), "{path:?}: bracketed URL: {line}");
+                assert!(
+                    line.is_empty() || !line.trim().is_empty(),
+                    "{path:?}: whitespace-only line"
+                );
+                if in_examples {
+                    continue;
+                }
+                assert!(line.chars().count() <= 80, "{path:?} at 80 columns: {line}");
+            }
+            // Wrapping only adds lines: the wide layout is the narrow one
+            // with its continuation lines joined back.
+            let wide = render_help_at(&path, &p, MAX_HELP_WIDTH);
+            assert!(wide.lines().count() <= at80.lines().count(), "{path:?}");
+            for line in wide.lines() {
+                assert!(
+                    line.chars().count() <= MAX_HELP_WIDTH
+                        || line.starts_with("  $ ")
+                        || line.split_whitespace().any(|w| w.chars().count() > 60),
+                    "{path:?} at {MAX_HELP_WIDTH} columns: {line}"
+                );
+            }
+        }
+    }
+
+    /// The wrapper is greedy, breaks only at spaces, hangs bullets and
+    /// flag descriptions under their column, and leaves a lone long word (a
+    /// URL) whole.
+    #[test]
+    fn wrapping_keeps_columns_and_words() {
+        assert_eq!(wrap_line("short", 20, "  ", "  "), vec!["  short"]);
+        assert_eq!(
+            wrap_line("one two three four five", 14, "  ", "    "),
+            vec!["  one two", "    three four", "    five"]
+        );
+        assert_eq!(
+            wrap_line(
+                "see https://example.com/a/very/long/path/indeed now",
+                20,
+                "",
+                ""
+            ),
+            vec!["see", "https://example.com/a/very/long/path/indeed", "now"]
+        );
+        // No hyphenation: `case-insensitive` never splits at its hyphen.
+        assert_eq!(
+            wrap_line("a case-insensitive name", 17, "", ""),
+            vec!["a", "case-insensitive", "name"]
+        );
+
+        let mut out = String::new();
+        prose(
+            &mut out,
+            "- by gid, e.g. \"1211234567890123\"; or\n\nplain <https://x.y/z> end",
+            "  ",
+            24,
+        );
+        assert_eq!(
+            out,
+            "  - by gid, e.g.\n    \"1211234567890123\";\n    or\n\n  plain https://x.y/z\n  end\n"
+        );
+
+        let mut out = String::new();
+        columns(
+            &mut out,
+            "  -F, --file file   ",
+            "Read the body from file (use \"-\" for stdin)",
+            Some(50),
+        );
+        assert_eq!(
+            out,
+            "  -F, --file file   Read the body from file (use\n                    \"-\" for stdin)\n"
+        );
+        // Too little room for the description: printed whole.
+        let mut out = String::new();
+        columns(
+            &mut out,
+            "  -F, --file file   ",
+            "Read the body from file",
+            Some(30),
+        );
+        assert_eq!(out, "  -F, --file file   Read the body from file\n");
+        let mut out = String::new();
+        columns(&mut out, "  --workspace NAME   ", "", Some(80));
+        assert_eq!(out, "  --workspace NAME   \n");
+
+        assert_eq!(
+            unbracket_urls("at <https://a.b/c>, then"),
+            "at https://a.b/c, then"
+        );
+        assert_eq!(unbracket_urls("<https://a.b/c>"), "https://a.b/c");
+        assert_eq!(
+            unbracket_urls("key:<TAB>value <not a url>"),
+            "key:<TAB>value <not a url>"
+        );
+        assert_eq!(unbracket_urls("<https://a.b/c d>"), "<https://a.b/c d>");
+        assert_eq!(unbracket_urls("<http"), "<http");
     }
 
     /// The flag gutter follows gh: on a screen where some flag has a short
@@ -959,7 +1261,7 @@ AVAILABLE COMMANDS
     #[test]
     fn flag_gutter_is_decided_per_screen() {
         let p = Palette::off();
-        let list = render_help(&["task".to_string(), "list".to_string()], &p);
+        let list = help(&["task", "list"], &p);
         assert!(list.contains("\n  -L, --limit int"), "{list}");
         assert!(
             list.contains(
@@ -967,12 +1269,12 @@ AVAILABLE COMMANDS
             ),
             "{list}"
         );
-        let task = render_help(&["task".to_string()], &p);
+        let task = help(&["task"], &p);
         assert!(
             task.contains("\nINHERITED FLAGS\n  --help             Show help for command\n"),
             "{task}"
         );
-        let root = render_help(&[], &p);
+        let root = help(&[], &p);
         assert!(
             root.contains("\nFLAGS\n  --help             Show help for command\n"),
             "{root}"
@@ -1017,16 +1319,72 @@ AVAILABLE COMMANDS
                 ),
             );
         root.build();
-        let one = render_help_for(&root, &["one".to_string()], &p);
+        let one = render_help_for(&root, &["one".to_string()], &p, 80);
         assert!(
             one.starts_with(
                 "First paragraph.\n\nSecond paragraph.\n\n\nUSAGE\n  asana one [flags]\n"
             ),
             "{one}"
         );
-        let two = render_help_for(&root, &["two".to_string()], &p);
+        let two = render_help_for(&root, &["two".to_string()], &p, 80);
         assert!(two.starts_with("Two\n\nUSAGE\n"), "{two}");
         assert!(two.contains("\n  --workspace NAME   \n"), "{two}");
+    }
+
+    /// Another piece's text that overruns the terminal is broken at a space
+    /// with the column kept, and left alone on a terminal wide enough.
+    #[test]
+    fn overlong_text_from_a_piece_wraps_at_narrow_widths_only() {
+        let p = Palette::off();
+        let mut root = Command::new("asana").subcommand(
+            Command::new("wide")
+                .disable_help_flag(true)
+                .about("Do a thing")
+                .long_about(
+                    "A project can be given by gid, by URL, or by name (case-insensitive; a unique prefix is enough).\n\n\
+                     The `--assignee` flag supports the following special values:\n\
+                     - `@me`: assign yourself, or anyone else by email, by user gid, or by name when it is unique",
+                )
+                .arg(
+                    clap::Arg::new("notes-file")
+                        .short('F')
+                        .long("notes-file")
+                        .value_name("file")
+                        .help("Read the description from file (use \"-\" to read from standard input)"),
+                )
+                .after_help("$ asana wide --notes-file - < a-very-long-file-name-that-nobody-would-ever-break-across-lines.txt"),
+        );
+        root.build();
+        let path = ["wide".to_string()];
+        let narrow = render_help_for(&root, &path, &p, 80);
+        let expected_head = "\
+A project can be given by gid, by URL, or by name (case-insensitive; a unique
+prefix is enough).
+
+The `--assignee` flag supports the following special values:
+- `@me`: assign yourself, or anyone else by email, by user gid, or by name when
+  it is unique
+
+USAGE
+  asana wide [flags]
+
+FLAGS
+  -F, --notes-file file   Read the description from file (use \"-\" to read from
+                          standard input)
+
+EXAMPLES
+  $ asana wide --notes-file - < a-very-long-file-name-that-nobody-would-ever-break-across-lines.txt
+";
+        assert!(narrow.starts_with(expected_head), "{narrow}");
+        let wide = render_help_for(&root, &path, &p, MAX_HELP_WIDTH);
+        assert!(
+            wide.starts_with("A project can be given by gid, by URL, or by name (case-insensitive; a unique prefix is enough).\n\n"),
+            "{wide}"
+        );
+        assert!(
+            wide.contains("\n  -F, --notes-file file   Read the description from file (use \"-\" to read from standard input)\n"),
+            "{wide}"
+        );
     }
 
     #[test]
