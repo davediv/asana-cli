@@ -22,17 +22,19 @@ pub const ROOT_ABOUT: &str = "Work with an Asana workspace from the command line
 
 /// The root screen's examples open with the first-run path, since nothing
 /// works before a token is stored: the one command that logs in, with the
-/// page the token comes from in its comment. gh's leaf screens group
+/// page the token comes from in its comment. Then one taste of each noun,
+/// as gh's root screen gives one of `issue`, `repo` and `pr`, none of them
+/// repeating the group screens' own examples. gh's leaf screens group
 /// examples this way, a `# comment` line over each block and a blank line
 /// between.
 pub const ROOT_EXAMPLES: &str = "\
 # Log in with a personal access token from https://app.asana.com/0/my-apps
 $ asana auth login
 
-# Work with tasks
+# Work with tasks and projects
 $ asana task list
-$ asana task create --title \"Fix the login page\"
-$ asana task view 1211234567890123 --web";
+$ asana project view \"Roadmap\"
+$ asana task create --title \"Fix the login page\" --project \"Roadmap\"";
 
 /// The `auth:` line on the root screen and the first line of `asana auth
 /// --help` say the same thing, as gh's do ("Authenticate gh and git with

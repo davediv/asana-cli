@@ -14,9 +14,12 @@
 //! than the terminal (capped at [`MAX_HELP_WIDTH`]) at a space, keeping the
 //! column the text started in: prose keeps its indent, a bullet hangs, a
 //! flag or command description continues under itself (the shared
-//! `render::text::wrap_prose` and `wrap_line` do the breaking). Examples
-//! are commands and print verbatim. Every piece's help gets this without
-//! touching its text; only the width of the terminal decides.
+//! `render::text::wrap_prose` and `wrap_line` do the breaking), and a
+//! flag's `(default "open")` note moves whole rather than splitting.
+//! Examples are commands and print verbatim. Every piece's help gets this
+//! without touching its text; only the width of the terminal decides, and
+//! the layout leaves the terminal's last column free, as the shared
+//! `PROSE_WIDTH` keeps prose to 79 columns on an 80-column terminal.
 
 use std::ffi::OsString;
 
@@ -42,11 +45,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// descriptions stay under this.
 pub const MAX_HELP_WIDTH: usize = 100;
 
-/// The width help is rendered at: the terminal's (stdout, else stderr, so
-/// `asana --help | less` still sees the screen it is read on), else
-/// `COLUMNS`, else 80, capped at [`MAX_HELP_WIDTH`].
+/// The width help is laid out for: one column short of the terminal's
+/// (stdout, else stderr, so `asana --help | less` still sees the screen it
+/// is read on; else `COLUMNS`, else 80), so no row ever fills the last
+/// column, and capped at [`MAX_HELP_WIDTH`]. On an 80-column terminal that
+/// is 79, the shared `render::text::PROSE_WIDTH`.
 fn help_width() -> usize {
-    text::terminal_width().min(MAX_HELP_WIDTH)
+    text::terminal_width().saturating_sub(1).min(MAX_HELP_WIDTH)
 }
 
 /// A block of prose (a description, ARGUMENTS, LEARN MORE) laid out under
@@ -97,7 +102,7 @@ fn columns(out: &mut String, left: &str, desc: &str, limit: Option<usize>) {
 )]
 pub struct Cli {
     /// Select the workspace by name or gid
-    #[arg(long, global = true, value_name = "NAME")]
+    #[arg(long, global = true, value_name = "<name|gid>")]
     pub workspace: Option<String>,
 
     /// Disable color output
@@ -395,10 +400,13 @@ pub(crate) fn usage_line(path: &[String]) -> String {
     s
 }
 
-/// One flag as cobra prints it: `-s, --long placeholder` and its description.
+/// One flag as cobra prints it: `-s, --long placeholder`, its description,
+/// and the `(default 30)` / `(default "open")` note pflag appends, kept
+/// apart so the table can move it whole when the row has to wrap.
 pub(crate) struct FlagLine {
     left: String,
     help: String,
+    default: Option<String>,
 }
 
 /// gh lists `--help` without its `-h` shorthand.
@@ -443,16 +451,22 @@ pub(crate) fn flag_lines_with_gutter(args: Vec<&clap::Arg>, gutter: bool) -> Vec
                 left.push(' ');
                 left.push_str(&name);
             }
-            let mut help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
-            if let Some(default) = a.get_default_values().first() {
+            let help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+            let default = a.get_default_values().first().and_then(|default| {
                 let d = default.to_string_lossy();
                 if d.parse::<f64>().is_ok() {
-                    help.push_str(&format!(" (default {d})"));
+                    Some(format!("(default {d})"))
                 } else if !d.is_empty() && d != "false" {
-                    help.push_str(&format!(" (default \"{d}\")"));
+                    Some(format!("(default \"{d}\")"))
+                } else {
+                    None
                 }
+            });
+            FlagLine {
+                left,
+                help,
+                default,
             }
-            FlagLine { left, help }
         })
         .collect()
 }
@@ -464,8 +478,12 @@ pub(crate) fn render_flag_table(lines: &[FlagLine]) -> String {
     flag_table(lines, "  ", None)
 }
 
-/// The same table under a help heading, wrapped to `limit`.
+/// The same table under a help heading, wrapped to `limit`. The spaces
+/// inside a default note are non-breaking while the row is laid out, so
+/// `(default "open")` is never split across lines but moves whole to the
+/// continuation line; they print as plain spaces.
 fn flag_table(lines: &[FlagLine], indent: &str, limit: Option<usize>) -> String {
+    const NBSP: char = '\u{a0}';
     let max = lines
         .iter()
         .map(|l| l.left.chars().count())
@@ -475,7 +493,14 @@ fn flag_table(lines: &[FlagLine], indent: &str, limit: Option<usize>) -> String 
     for l in lines {
         let pad = " ".repeat(max - l.left.chars().count());
         let left = format!("{indent}{}{}   ", l.left, pad);
-        columns(&mut out, &left, &l.help, limit);
+        let desc = match &l.default {
+            Some(d) if l.help.is_empty() => d.replace(' ', &NBSP.to_string()),
+            Some(d) => format!("{} {}", l.help, d.replace(' ', &NBSP.to_string())),
+            None => l.help.clone(),
+        };
+        let mut row = String::new();
+        columns(&mut row, &left, &desc, limit);
+        out.push_str(&row.replace(NBSP, " "));
     }
     out
 }
@@ -777,6 +802,10 @@ mod tests {
         render_help_at(&path, palette, MAX_HELP_WIDTH)
     }
 
+    /// The layout width on an 80-column terminal: one column is left free,
+    /// as `help_width` leaves it.
+    const NARROW: usize = 79;
+
     /// Every command path in the tree, the root first.
     fn all_paths() -> Vec<Vec<String>> {
         fn walk(cmd: &Command, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
@@ -857,19 +886,19 @@ HELP TOPICS
   reference:     A comprehensive reference of all asana commands
 
 FLAGS
-  --help             Show help for command
-  --no-color         Disable color output
-  --version          Show asana version
-  --workspace NAME   Select the workspace by name or gid
+  --help                   Show help for command
+  --no-color               Disable color output
+  --version                Show asana version
+  --workspace <name|gid>   Select the workspace by name or gid
 
 EXAMPLES
   # Log in with a personal access token from https://app.asana.com/0/my-apps
   $ asana auth login
 
-  # Work with tasks
+  # Work with tasks and projects
   $ asana task list
-  $ asana task create --title \"Fix the login page\"
-  $ asana task view 1211234567890123 --web
+  $ asana project view \"Roadmap\"
+  $ asana task create --title \"Fix the login page\" --project \"Roadmap\"
 
 LEARN MORE
   Use `asana <command> <subcommand> --help` for more information on a command.
@@ -882,7 +911,7 @@ LEARN MORE
         assert_eq!(help(&[], &Palette::off()), expected);
         // Every line fits an 80-column terminal, so the screen reads the
         // same at 80 as at the critic's 120.
-        assert_eq!(render_help_at(&[], &Palette::off(), 80), expected);
+        assert_eq!(render_help_at(&[], &Palette::off(), NARROW), expected);
         assert!(!expected.contains("\n  \n"), "whitespace-only line");
     }
 
@@ -903,9 +932,9 @@ LEARN MORE
         let project = help(&["project"], &p);
         let expected_tail = "\
 INHERITED FLAGS
-  --help             Show help for command
-  --no-color         Disable color output
-  --workspace NAME   Select the workspace by name or gid
+  --help                   Show help for command
+  --no-color               Disable color output
+  --workspace <name|gid>   Select the workspace by name or gid
 
 ARGUMENTS
   A project can be supplied as argument in any of the following formats:
@@ -1029,7 +1058,7 @@ USAGE
 AVAILABLE COMMANDS
   login:         ";
         assert!(auth.starts_with(expected_head), "{auth}");
-        assert_eq!(render_help_at(&["auth".to_string()], &p, 80), auth);
+        assert_eq!(render_help_at(&["auth".to_string()], &p, NARROW), auth);
         let expected_examples = "\
 EXAMPLES
   # Log in by pasting a token when prompted
@@ -1047,7 +1076,7 @@ LEARN MORE
         assert!(!auth.contains("export ASANA_TOKEN"), "{auth}");
         assert!(!auth.contains('<') || !auth.contains("<http"), "{auth}");
         for line in auth.lines() {
-            assert!(line.chars().count() <= 80, "auth line too long: {line}");
+            assert!(line.chars().count() <= NARROW, "auth line too long: {line}");
         }
         let root = help(&[], &p);
         assert!(
@@ -1062,7 +1091,7 @@ LEARN MORE
             .expect("root EXAMPLES");
         assert!(
             examples.starts_with(
-                "  # Log in with a personal access token from https://app.asana.com/0/my-apps\n  $ asana auth login\n\n  # Work with tasks\n"
+                "  # Log in with a personal access token from https://app.asana.com/0/my-apps\n  $ asana auth login\n\n  # Work with tasks and projects\n"
             ),
             "{examples}"
         );
@@ -1074,16 +1103,43 @@ LEARN MORE
         }
     }
 
-    /// One rule for every screen: at 80 columns no line of any help screen
-    /// is wider than the terminal, however long a piece wrote its text, and
-    /// at the critic's 120 columns a line under the cap is left exactly as
-    /// written. Examples are the exception: they are commands and print
-    /// verbatim.
+    /// The root's examples give a taste of each noun, as `gh --help` does
+    /// with `issue`, `repo` and `pr`; they are not a group screen's examples
+    /// printed again.
+    #[test]
+    fn root_examples_are_not_a_group_screens() {
+        let p = Palette::off();
+        let examples = |screen: String| -> Vec<String> {
+            screen
+                .split("\nEXAMPLES\n")
+                .nth(1)
+                .and_then(|s| s.split("\nLEARN MORE\n").next())
+                .expect("EXAMPLES")
+                .lines()
+                .filter(|l| l.starts_with("  $ "))
+                .map(str::to_string)
+                .collect()
+        };
+        let root = examples(help(&[], &p));
+        assert!(root.iter().any(|l| l.contains(" task ")), "{root:?}");
+        assert!(root.iter().any(|l| l.contains(" project ")), "{root:?}");
+        for group in ["task", "project", "auth"] {
+            let theirs = examples(help(&[group], &p));
+            let shared = root.iter().filter(|l| theirs.contains(l)).count();
+            assert!(shared <= 1, "{group}: {shared} examples repeat the root's");
+        }
+    }
+
+    /// One rule for every screen: on an 80-column terminal no line of any
+    /// help screen reaches the last column, however long a piece wrote its
+    /// text, and at the critic's 120 columns a line under the cap is left
+    /// exactly as written. Examples are the exception: they are commands
+    /// and print verbatim.
     #[test]
     fn every_screen_fits_the_terminal() {
         let p = Palette::off();
         for path in all_paths() {
-            let at80 = render_help_at(&path, &p, 80);
+            let at80 = render_help_at(&path, &p, NARROW);
             let mut in_examples = false;
             for line in at80.lines() {
                 if line == "EXAMPLES" {
@@ -1099,7 +1155,10 @@ LEARN MORE
                 if in_examples {
                     continue;
                 }
-                assert!(line.chars().count() <= 80, "{path:?} at 80 columns: {line}");
+                assert!(
+                    line.chars().count() <= NARROW,
+                    "{path:?} at 80 columns: {line}"
+                );
             }
             // Wrapping only adds lines: the wide layout is the narrow one
             // with its continuation lines joined back.
@@ -1160,8 +1219,8 @@ LEARN MORE
         );
         assert_eq!(out, "  -F, --file file   Read the body from file\n");
         let mut out = String::new();
-        columns(&mut out, "  --workspace NAME   ", "", Some(80));
-        assert_eq!(out, "  --workspace NAME   \n");
+        columns(&mut out, "  --workspace <name|gid>   ", "", Some(80));
+        assert_eq!(out, "  --workspace <name|gid>   \n");
     }
 
     /// The flag gutter follows gh: on a screen where some flag has a short
@@ -1175,18 +1234,18 @@ LEARN MORE
         assert!(list.contains("\n  -L, --limit int"), "{list}");
         assert!(
             list.contains(
-                "\nINHERITED FLAGS\n      --help             Show help for command\n      --no-color         Disable color output\n      --workspace NAME   Select the workspace by name or gid\n"
+                "\nINHERITED FLAGS\n      --help                   Show help for command\n      --no-color               Disable color output\n      --workspace <name|gid>   Select the workspace by name or gid\n"
             ),
             "{list}"
         );
         let task = help(&["task"], &p);
         assert!(
-            task.contains("\nINHERITED FLAGS\n  --help             Show help for command\n"),
+            task.contains("\nINHERITED FLAGS\n  --help                   Show help for command\n"),
             "{task}"
         );
         let root = help(&[], &p);
         assert!(
-            root.contains("\nFLAGS\n  --help             Show help for command\n"),
+            root.contains("\nFLAGS\n  --help                   Show help for command\n"),
             "{root}"
         );
     }
@@ -1199,7 +1258,7 @@ LEARN MORE
         let lines = flag_lines(root_flags(&root));
         let table = render_flag_table(&lines);
         assert!(
-            table.starts_with("  --help             Show help for command\n"),
+            table.starts_with("  --help                   Show help for command\n"),
             "{table}"
         );
         let list = find(&root, &["task".to_string(), "list".to_string()]).unwrap();
@@ -1294,6 +1353,58 @@ EXAMPLES
         assert!(
             wide.contains("\n  -F, --notes-file file   Read the description from file (use \"-\" to read from standard input)\n"),
             "{wide}"
+        );
+    }
+
+    /// pflag's `(default "open")` note is part of the description, but when
+    /// a row has to wrap it moves whole to the continuation line rather
+    /// than leaving `(default` behind; on a terminal wide enough the row is
+    /// one line, and under a usage error (never wrapped) it prints with
+    /// plain spaces.
+    #[test]
+    fn default_note_moves_whole_when_a_flag_row_wraps() {
+        let p = Palette::off();
+        let mut root = Command::new("asana").subcommand(
+            Command::new("list")
+                .disable_help_flag(true)
+                .about("List things")
+                .arg(
+                    clap::Arg::new("state")
+                        .short('s')
+                        .long("state")
+                        .value_name("string")
+                        .default_value("open")
+                        .help("Filter by state: {open|completed|all}"),
+                )
+                .arg(
+                    clap::Arg::new("limit")
+                        .short('L')
+                        .long("limit")
+                        .value_name("int")
+                        .default_value("30")
+                        .help("Maximum number of things to fetch"),
+                ),
+        );
+        root.build();
+        let path = ["list".to_string()];
+        let row = "  -s, --state string   Filter by state: {open|completed|all} (default \"open\")";
+        assert_eq!(row.len(), 77);
+        let wide = render_help_for(&root, &path, &p, 77);
+        assert!(wide.contains(&format!("\n{row}\n")), "{wide}");
+        let narrow = render_help_for(&root, &path, &p, 76);
+        assert!(
+            narrow.contains(
+                "\n  -s, --state string   Filter by state: {open|completed|all}\n                       (default \"open\")\n"
+            ),
+            "{narrow}"
+        );
+        assert!(narrow
+            .contains("\n  -L, --limit int      Maximum number of things to fetch (default 30)\n"));
+        assert!(!narrow.contains('\u{a0}'));
+        let table = render_flag_table(&flag_lines(local_flags(find(&root, &path).expect("list"))));
+        assert_eq!(
+            table,
+            "  -L, --limit int      Maximum number of things to fetch (default 30)\n  -s, --state string   Filter by state: {open|completed|all} (default \"open\")\n"
         );
     }
 
