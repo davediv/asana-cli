@@ -137,6 +137,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "toml_edit",
  "unicode-segmentation",
  "unicode-width",
  "url",

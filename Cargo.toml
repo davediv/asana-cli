@@ -29,6 +29,7 @@ anstream = "0.6"
 textwrap = { version = "0.16", features = ["unicode-width", "terminal_size"] }
 dirs = "6"
 toml = "0.8"
+toml_edit = "0.22"
 url = "2"
 regex = "1"
 open = "5"
