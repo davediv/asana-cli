@@ -1,0 +1,49 @@
+[package]
+name = "asana-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Work with an Asana workspace from the command line"
+license = "MIT"
+default-run = "asana"
+
+[[bin]]
+name = "asana"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4.5", features = ["derive", "wrap_help", "env", "string", "cargo", "unicode"] }
+clap_complete = "4.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "http2"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-std", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+chrono-tz = "0.10"
+unicode-width = "0.2"
+unicode-segmentation = "1"
+terminal_size = "0.4"
+anstyle = "1"
+anstream = "0.6"
+textwrap = { version = "0.16", features = ["unicode-width", "terminal_size"] }
+dirs = "6"
+toml = "0.8"
+url = "2"
+regex = "1"
+open = "5"
+html2text = "0.14"
+indicatif = "0.17"
+strsim = "0.11"
+percent-encoding = "2"
+futures = "0.3"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+insta = "1"
+tempfile = "3"
+
+[profile.dev]
+opt-level = 0
+debug = 1
