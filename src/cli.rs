@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "name")]
     pub workspace: Option<String>,
 
-    /// Disable colour output
+    /// Disable color output
     #[arg(long, global = true, action = ArgAction::SetTrue)]
     pub no_color: bool,
 
@@ -222,11 +222,10 @@ fn find<'a>(root: &'a Command, path: &[String]) -> Option<&'a Command> {
     Some(cur)
 }
 
-/// Work out which command the user was addressing from the raw argv, so help
-/// and usage errors are rendered for the right level.
-pub fn command_path(root: &Command, argv: &[OsString]) -> Vec<String> {
-    let mut path = Vec::new();
-    let mut cur = root;
+/// The bare words of argv (flags skipped, along with `--workspace`'s value),
+/// up to `--`.
+fn bare_words(argv: &[OsString]) -> Vec<String> {
+    let mut words = Vec::new();
     let mut iter = argv.iter().skip(1);
     while let Some(a) = iter.next() {
         let s = a.to_string_lossy();
@@ -239,13 +238,27 @@ pub fn command_path(root: &Command, argv: &[OsString]) -> Vec<String> {
             }
             continue;
         }
-        if s == "help" {
+        words.push(s.into_owned());
+    }
+    words
+}
+
+/// A direct subcommand by name or alias.
+fn subcommand<'a>(cmd: &'a Command, name: &str) -> Option<&'a Command> {
+    cmd.get_subcommands()
+        .find(|c| c.get_name() == name || c.get_all_aliases().any(|al| al == name))
+}
+
+/// Work out which command the user was addressing from the raw argv, so help
+/// and usage errors are rendered for the right level.
+pub fn command_path(root: &Command, argv: &[OsString]) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut cur = root;
+    for word in bare_words(argv) {
+        if word == "help" {
             continue;
         }
-        let found = cur
-            .get_subcommands()
-            .find(|c| c.get_name() == s || c.get_all_aliases().any(|al| al == s));
-        match found {
+        match subcommand(cur, &word) {
             Some(sub) => {
                 path.push(sub.get_name().to_string());
                 cur = sub;
@@ -254,6 +267,51 @@ pub fn command_path(root: &Command, argv: &[OsString]) -> Vec<String> {
         }
     }
     path
+}
+
+/// `asana help [<command>... | <topic>]` and `asana version`, which gh
+/// supports and clap reports as unknown subcommands. `help` follows the
+/// command tree as far as it matches, like cobra's; a first word that is
+/// neither a command nor a topic is `Unknown help topic`.
+fn builtin_request(root: &Command, argv: &[OsString], palette: &Palette) -> Option<Rendered> {
+    let ok = |stdout: String| Rendered {
+        stdout,
+        stderr: String::new(),
+        code: 0,
+    };
+    let words = bare_words(argv);
+    match words.first().map(String::as_str) {
+        Some("version") => Some(ok(render_version())),
+        Some("help") => {
+            let rest = &words[1..];
+            let Some(first) = rest.first() else {
+                return Some(ok(render_help(&[], palette)));
+            };
+            if let Some(topic) = help::topic(first) {
+                return Some(ok(render_topic(topic)));
+            }
+            let mut path = Vec::new();
+            let mut cur = root;
+            for word in rest {
+                match subcommand(cur, word) {
+                    Some(sub) => {
+                        path.push(sub.get_name().to_string());
+                        cur = sub;
+                    }
+                    None => break,
+                }
+            }
+            if path.is_empty() {
+                return Some(Rendered {
+                    stdout: String::new(),
+                    stderr: format!("Unknown help topic [`{first}`]\n{}", usage_block(&[])),
+                    code: 1,
+                });
+            }
+            Some(ok(render_help(&path, palette)))
+        }
+        _ => None,
+    }
 }
 
 fn strs(path: &[String]) -> Vec<&str> {
@@ -390,13 +448,26 @@ pub fn usage_block(path: &[String]) -> String {
     out
 }
 
+/// `asana version` / `asana --version`, two lines like gh's.
+pub fn render_version() -> String {
+    format!(
+        "asana version {VERSION}\n{}/v{VERSION}\n",
+        help::RELEASES_URL
+    )
+}
+
+/// `asana help <topic>`: the topic text alone, like gh's help topics.
+pub fn render_topic(topic: &help::Topic) -> String {
+    topic.long.to_string()
+}
+
 /// Render the gh-shaped help screen for a command path.
 pub fn render_help(path: &[String], palette: &Palette) -> String {
     let root = command();
     let Some(cmd) = find(&root, path) else {
         return render_help(&[], palette);
     };
-    let heading = |s: &str| palette.bold(s);
+    let heading = |s: &str| help::heading(palette, s);
     let mut out = String::new();
 
     let about = if path.is_empty() {
@@ -430,9 +501,16 @@ pub fn render_help(path: &[String], palette: &Palette) -> String {
 
     let subs: Vec<&Command> = cmd.get_subcommands().filter(|c| !c.is_hide_set()).collect();
     if !subs.is_empty() {
+        // cobra pads `name:` to the longest name plus one, never under 15.
+        let topic_names = help::TOPICS
+            .iter()
+            .filter(|_| path.is_empty())
+            .map(|t| t.name);
         let pad = subs
             .iter()
-            .map(|c| c.get_name().len() + 1)
+            .map(|c| c.get_name())
+            .chain(topic_names)
+            .map(|n| n.len() + 2)
             .max()
             .unwrap_or(0)
             .max(15);
@@ -474,6 +552,19 @@ pub fn render_help(path: &[String], palette: &Palette) -> String {
                     "  {:<pad$}{}\n",
                     format!("{}:", c.get_name()),
                     about,
+                    pad = pad
+                ));
+            }
+            out.push('\n');
+        }
+        if path.is_empty() {
+            out.push_str(&heading("HELP TOPICS"));
+            out.push('\n');
+            for t in help::TOPICS {
+                out.push_str(&format!(
+                    "  {:<pad$}{}\n",
+                    format!("{}:", t.name),
+                    t.short,
                     pad = pad
                 ));
             }
@@ -640,11 +731,19 @@ pub fn render_clap_error(err: &clap::Error, argv: &[OsString], palette: &Palette
         stderr: format!("{message}\n"),
         code: 1,
     };
+    if matches!(
+        err.kind(),
+        ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument
+    ) {
+        if let Some(rendered) = builtin_request(&root, argv, palette) {
+            return rendered;
+        }
+    }
     match err.kind() {
         ErrorKind::DisplayHelp
         | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         | ErrorKind::MissingSubcommand => ok(render_help(&path, palette)),
-        ErrorKind::DisplayVersion => ok(format!("asana version {VERSION}\n")),
+        ErrorKind::DisplayVersion => ok(render_version()),
         ErrorKind::InvalidSubcommand => unknown_command(
             &context_string(err, ContextKind::InvalidSubcommand).unwrap_or_default(),
             &root,
@@ -799,6 +898,153 @@ mod tests {
         assert!(list.contains("-L, --limit int"));
         assert!(list.contains("(default 30)"));
         assert!(list.contains("\nINHERITED FLAGS\n"));
+    }
+
+    /// The root screen, character for character: every string on it belongs
+    /// to this piece, so it can be pinned. Its shape is gh's `gh --help`.
+    #[test]
+    fn root_help_reads_like_gh() {
+        let expected = "\
+Work with an Asana workspace from the command line.
+
+USAGE
+  asana <command> <subcommand> [flags]
+
+CORE COMMANDS
+  auth:          Check authentication with Asana
+  project:       Manage projects
+  task:          Manage tasks
+  workspace:     Manage workspaces
+
+HELP TOPICS
+  environment:   Environment variables that can be used with asana
+  exit-codes:    Exit codes used by asana
+
+FLAGS
+  --help             Show help for command
+  --no-color         Disable color output
+  --version          Show asana version
+  --workspace name   Select the workspace by name or gid
+
+EXAMPLES
+  $ asana task list
+  $ asana task create --title \"Fix the login page\"
+  $ asana task view 1211234567890123 --web
+
+LEARN MORE
+  Use `asana <command> <subcommand> --help` for more information about a command.
+  Read the manual at https://github.com/davediv/asana-cli#readme
+  Learn about exit codes using `asana help exit-codes`
+  Learn about environment variables using `asana help environment`
+
+";
+        assert_eq!(render_help(&[], &Palette::off()), expected);
+    }
+
+    #[test]
+    fn headings_use_gh_colour_bytes_only_when_enabled() {
+        let coloured = render_help(&[], &Palette::new(true));
+        assert!(coloured.contains("\x1b[0;1;39mUSAGE\x1b[0m\n"));
+        assert!(coloured.contains("\x1b[0;1;39mLEARN MORE\x1b[0m\n"));
+        // Nothing but the headings is styled.
+        let stripped = coloured.replace("\x1b[0;1;39m", "").replace("\x1b[0m", "");
+        assert_eq!(stripped, render_help(&[], &Palette::off()));
+        assert!(!render_help(&[], &Palette::off()).contains('\x1b'));
+    }
+
+    #[test]
+    fn group_help_lists_inherited_flags_and_arguments() {
+        let p = Palette::off();
+        let project = render_help(&["project".to_string()], &p);
+        let expected_tail = "\
+INHERITED FLAGS
+  --help             Show help for command
+  --no-color         Disable color output
+  --workspace name   Select the workspace by name or gid
+
+ARGUMENTS
+  A project can be supplied as argument in any of the following formats:
+";
+        assert!(project.contains(expected_tail), "{project}");
+        assert!(!project.contains("\nFLAGS\n"));
+        assert!(!project.contains("HELP TOPICS"));
+        assert!(project.ends_with("`asana help environment`\n\n"));
+    }
+
+    #[test]
+    fn help_and_version_words_are_builtins() {
+        let root = command();
+        let p = Palette::off();
+        let run = |parts: &[&str]| builtin_request(&root, &argv(parts), &p);
+
+        let r = run(&["asana", "help"]).expect("help");
+        assert_eq!((r.code, r.stdout), (0, render_help(&[], &p)));
+
+        let r = run(&["asana", "--no-color", "help", "task", "ls"]).expect("help task ls");
+        assert_eq!(r.code, 0);
+        assert!(r.stdout.starts_with("List tasks"));
+        assert!(r.stdout.contains("  asana task list [flags]\n"));
+
+        // Like cobra, extra words after a matching command are ignored.
+        let r = run(&["asana", "help", "task", "nope"]).expect("help task nope");
+        assert_eq!(
+            (r.code, r.stdout),
+            (0, render_help(&["task".to_string()], &p))
+        );
+
+        let r = run(&["asana", "help", "exit-codes"]).expect("topic");
+        assert_eq!(r.code, 0);
+        assert!(r
+            .stdout
+            .starts_with("asana follows normal conventions regarding exit codes.\n"));
+        assert!(r.stdout.ends_with("exits with 0.\n"));
+        assert!(!r.stdout.contains("USAGE"));
+
+        let r = run(&["asana", "help", "nope"]).expect("unknown topic");
+        assert_eq!(r.code, 1);
+        assert!(r.stdout.is_empty());
+        assert!(r.stderr.starts_with(
+            "Unknown help topic [`nope`]\nUsage:  asana <command> <subcommand> [flags]\n"
+        ));
+
+        let r = run(&["asana", "version"]).expect("version");
+        assert_eq!(r.code, 0);
+        assert_eq!(
+            r.stdout,
+            format!("asana version {VERSION}\nhttps://github.com/davediv/asana-cli/releases/tag/v{VERSION}\n")
+        );
+
+        // `help` anywhere but first is an ordinary word for clap to judge.
+        assert!(run(&["asana", "task", "help"]).is_none());
+        assert!(run(&["asana", "task", "list"]).is_none());
+        assert!(run(&["asana", "--workspace", "help"]).is_none());
+    }
+
+    #[test]
+    fn clap_errors_route_help_and_version_to_stdout() {
+        let p = Palette::off();
+        for parts in [
+            vec!["asana", "help"],
+            vec!["asana", "help", "task"],
+            vec!["asana", "task", "--help"],
+            vec!["asana", "-h"],
+            vec!["asana", "version"],
+            vec!["asana", "--version"],
+        ] {
+            let args = argv(&parts);
+            let err = Cli::try_parse_from(&args).expect_err("clap reports these");
+            let r = render_clap_error(&err, &args, &p);
+            assert_eq!(r.code, 0, "{parts:?}");
+            assert!(r.stderr.is_empty(), "{parts:?}");
+            assert!(!r.stdout.is_empty(), "{parts:?}");
+        }
+        let args = argv(&["asana", "task", "help"]);
+        let err = Cli::try_parse_from(&args).expect_err("unknown subcommand");
+        let r = render_clap_error(&err, &args, &p);
+        assert_eq!(r.code, 1);
+        assert!(r
+            .stderr
+            .starts_with("unknown command \"help\" for \"asana task\"\n"));
     }
 
     #[test]

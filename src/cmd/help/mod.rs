@@ -1,6 +1,9 @@
 //! The prose pieces of the help screens that clap cannot express: the root
 //! description and examples, usage lines, command groupings, the ARGUMENTS
-//! sections, and the LEARN MORE footer. `cli.rs` renders them.
+//! sections, the help topics (`asana help exit-codes`), and the LEARN MORE
+//! footer. `cli.rs` renders them.
+
+use crate::render::Palette;
 
 pub const ROOT_ABOUT: &str = "Work with an Asana workspace from the command line.";
 
@@ -8,7 +11,18 @@ pub const ROOT_EXAMPLES: &str = "$ asana task list\n$ asana task create --title 
 
 pub const MANUAL_URL: &str = "https://github.com/davediv/asana-cli#readme";
 
-pub const PAT_URL: &str = "https://app.asana.com/0/my-apps";
+pub const RELEASES_URL: &str = "https://github.com/davediv/asana-cli/releases/tag";
+
+/// A section heading, styled exactly as gh does it: `\e[0;1;39m` (reset,
+/// bold, default foreground) and `\e[0m` after. The shared `Palette::bold`
+/// emits plain `\e[1m`, which reads the same but is not byte-identical.
+pub fn heading(palette: &Palette, text: &str) -> String {
+    if palette.enabled && !text.is_empty() {
+        format!("\x1b[0;1;39m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
 
 /// The `LEARN MORE` footer printed on every help screen.
 pub fn learn_more() -> Vec<String> {
@@ -16,7 +30,8 @@ pub fn learn_more() -> Vec<String> {
         "Use `asana <command> <subcommand> --help` for more information about a command."
             .to_string(),
         format!("Read the manual at {MANUAL_URL}"),
-        format!("Create a personal access token at {PAT_URL} and export it as ASANA_TOKEN"),
+        "Learn about exit codes using `asana help exit-codes`".to_string(),
+        "Learn about environment variables using `asana help environment`".to_string(),
     ]
 }
 
@@ -72,5 +87,105 @@ pub fn arguments(path: &[&str]) -> Option<&'static str> {
              - by name, e.g. \"Roadmap\" (case-insensitive; a unique prefix is enough).",
         ),
         _ => None,
+    }
+}
+
+/// A help topic: `asana help <name>` prints `long`; the root screen lists
+/// `name: short` under `HELP TOPICS`, like gh.
+pub struct Topic {
+    pub name: &'static str,
+    pub short: &'static str,
+    pub long: &'static str,
+}
+
+pub const TOPICS: &[Topic] = &[
+    Topic {
+        name: "environment",
+        short: "Environment variables that can be used with asana",
+        long: "ASANA_TOKEN, ASANA_ACCESS_TOKEN (in order of precedence): a personal access token used to authenticate\n\
+               with Asana. Setting either overrides `token` in the config file. Create one at\n\
+               https://app.asana.com/0/my-apps.\n\
+               \n\
+               ASANA_WORKSPACE: the gid or name of the workspace commands operate in. Overrides `workspace` in the\n\
+               config file; the `--workspace` flag overrides both. When nothing is set and the token belongs to\n\
+               exactly one workspace, that workspace is used.\n\
+               \n\
+               XDG_CONFIG_HOME: the directory the config file is read from, as \"asana/config.toml\" under it.\n\
+               If not set, \"$HOME/.config/asana/config.toml\" is used. The file may hold `token = \"...\"` and\n\
+               `workspace = \"...\"`.\n\
+               \n\
+               ASANA_BASE_URL: the API base URL to use instead of \"https://app.asana.com/api/1.0\", for testing\n\
+               against a mock server.\n\
+               \n\
+               NO_COLOR: set to any value to avoid printing ANSI escape sequences for color output.\n\
+               \n\
+               TERM: set to \"dumb\" to disable color output.\n\
+               \n\
+               COLUMNS: the width to lay tables out for when the terminal size cannot be detected (default 80).\n",
+    },
+    Topic {
+        name: "exit-codes",
+        short: "Exit codes used by asana",
+        long: "asana follows normal conventions regarding exit codes.\n\
+               \n\
+               - If a command completes successfully, the exit code will be 0\n\
+               - If a command fails for any reason, the exit code will be 1\n\
+               - If a command is running but gets cancelled, the exit code will be 2\n\
+               - If a command encounters an authentication issue, the exit code will be 4\n\
+               \n\
+               NOTE: Usage errors, such as an unknown flag or a missing argument, exit with 1 like any other\n\
+               failure. Completing a task that is already complete counts as success and exits with 0.\n",
+    },
+];
+
+pub fn topic(name: &str) -> Option<&'static Topic> {
+    TOPICS.iter().find(|t| t.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heading_uses_gh_bold_sequence() {
+        assert_eq!(
+            heading(&Palette::new(true), "USAGE"),
+            "\x1b[0;1;39mUSAGE\x1b[0m"
+        );
+        assert_eq!(heading(&Palette::off(), "USAGE"), "USAGE");
+        assert_eq!(heading(&Palette::new(true), ""), "");
+    }
+
+    #[test]
+    fn topics_are_well_formed() {
+        for t in TOPICS {
+            assert!(t.long.ends_with('\n'), "{} must end with a newline", t.name);
+            assert!(
+                !t.long.ends_with("\n\n"),
+                "{} ends with a blank line",
+                t.name
+            );
+            assert!(
+                !t.short.ends_with('.'),
+                "{} short ends with a period",
+                t.name
+            );
+            for line in t.long.lines() {
+                assert!(line.len() <= 110, "{}: line too long: {line}", t.name);
+            }
+        }
+        assert!(topic("exit-codes").is_some());
+        assert!(topic("nope").is_none());
+    }
+
+    #[test]
+    fn learn_more_points_at_the_topics() {
+        let lines = learn_more();
+        assert_eq!(lines.len(), 4);
+        for t in TOPICS {
+            assert!(lines
+                .iter()
+                .any(|l| l.contains(&format!("asana help {}", t.name))));
+        }
     }
 }
