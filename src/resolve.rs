@@ -1,0 +1,294 @@
+//! Turn what the user typed into Asana identifiers.
+//!
+//! - tasks: a gid or any app.asana.com task URL
+//! - projects: a gid, a URL, or a (case-insensitive, prefix-tolerant) name
+//! - assignees: `me`/`@me`, an email, a gid, or a name via typeahead
+
+use anyhow::{anyhow, bail, Result};
+use url::Url;
+
+use crate::api::{Named, Project, PROJECT_FIELDS};
+use crate::ctx::Ctx;
+
+fn is_gid(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+fn path_segments(u: &Url) -> Vec<String> {
+    u.path_segments()
+        .map(|it| it.filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Extract a task gid from a gid or an Asana URL. Accepted URL shapes:
+/// `/0/<project>/<task>`, `/0/<project>/<task>/f`, `/1/<ws>/task/<task>`,
+/// `/1/<ws>/project/<p>/task/<task>`, and `.../task/<task>/f`.
+pub fn parse_task_id(input: &str) -> Result<String> {
+    let s = input.trim();
+    if is_gid(s) {
+        return Ok(s.to_string());
+    }
+    let invalid = || anyhow!("invalid task format: \"{input}\"");
+    let url = Url::parse(s).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(invalid());
+    }
+    let segs = path_segments(&url);
+    // .../task/<gid>[/f]
+    if let Some(pos) = segs.iter().position(|s| s == "task") {
+        if let Some(gid) = segs.get(pos + 1).filter(|g| is_gid(g)) {
+            return Ok(gid.clone());
+        }
+        return Err(invalid());
+    }
+    // /0/<project>/<task>[/f]
+    if segs.first().map(String::as_str) == Some("0") {
+        if let (Some(project), Some(task)) = (segs.get(1), segs.get(2)) {
+            if is_gid(project) && is_gid(task) {
+                return Ok(task.clone());
+            }
+        }
+    }
+    Err(invalid())
+}
+
+/// Extract a project gid from a gid or an Asana URL, if it looks like one.
+fn parse_project_gid(input: &str) -> Option<String> {
+    let s = input.trim();
+    if is_gid(s) {
+        return Some(s.to_string());
+    }
+    let url = Url::parse(s).ok()?;
+    let segs = path_segments(&url);
+    if let Some(pos) = segs.iter().position(|s| s == "project") {
+        return segs.get(pos + 1).filter(|g| is_gid(g)).cloned();
+    }
+    if segs.first().map(String::as_str) == Some("0") {
+        return segs
+            .get(1)
+            .filter(|g| is_gid(g) && g.as_str() != "0")
+            .cloned();
+    }
+    None
+}
+
+/// Resolve a project by gid, URL or name within the current workspace.
+pub async fn resolve_project(ctx: &Ctx, input: &str) -> Result<Project> {
+    if let Some(gid) = parse_project_gid(input) {
+        let project: Project = ctx
+            .api
+            .get(
+                &format!("/projects/{gid}"),
+                &[("opt_fields", PROJECT_FIELDS)],
+            )
+            .await?;
+        return Ok(project);
+    }
+    let name = input.trim();
+    if name.is_empty() {
+        bail!("invalid project format: \"{input}\"");
+    }
+    let ws = ctx.workspace().await?;
+    let projects: Vec<Project> = ctx
+        .api
+        .get_all(
+            "/projects",
+            &[
+                ("workspace", ws.gid.as_str()),
+                ("opt_fields", PROJECT_FIELDS),
+            ],
+            None,
+        )
+        .await?;
+    let lower = name.to_lowercase();
+    let exact: Vec<&Project> = projects
+        .iter()
+        .filter(|p| p.name.as_deref().is_some_and(|n| n.to_lowercase() == lower))
+        .collect();
+    let candidates = if exact.is_empty() {
+        projects
+            .iter()
+            .filter(|p| {
+                p.name
+                    .as_deref()
+                    .is_some_and(|n| n.to_lowercase().starts_with(&lower))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        exact
+    };
+    match candidates.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!("no project named \"{name}\" in {}", ws.display()),
+        many => {
+            let mut msg = format!(
+                "\"{name}\" matches {} projects in {}:",
+                many.len(),
+                ws.display()
+            );
+            for p in many {
+                msg.push_str(&format!("\n  {} ({})", p.display(), p.gid));
+            }
+            msg.push_str("\nUse the gid to pick one.");
+            bail!(msg)
+        }
+    }
+}
+
+/// A resolved assignee: the value to send to the API and a display name.
+#[derive(Debug, Clone)]
+pub struct Assignee {
+    /// `me` or a user gid.
+    pub gid: String,
+    pub name: String,
+}
+
+/// Resolve `me`/`@me`, an email, a gid, or a name (via typeahead).
+pub async fn resolve_assignee(ctx: &Ctx, input: &str) -> Result<Assignee> {
+    let s = input.trim();
+    if s.is_empty() {
+        bail!("invalid assignee: \"{input}\"");
+    }
+    if s == "me" || s == "@me" {
+        let me = ctx.me().await?;
+        return Ok(Assignee {
+            gid: "me".to_string(),
+            name: me.display().to_string(),
+        });
+    }
+    if is_gid(s) || s.contains('@') {
+        // /users/{gid_or_email}
+        let user: Named = ctx
+            .api
+            .get(&format!("/users/{s}"), &[("opt_fields", "name,email")])
+            .await?;
+        return Ok(Assignee {
+            gid: user.gid.clone(),
+            name: user.display().to_string(),
+        });
+    }
+    let ws = ctx.workspace().await?;
+    let matches: Vec<Named> = ctx
+        .api
+        .get_all(
+            &format!("/workspaces/{}/typeahead", ws.gid),
+            &[
+                ("resource_type", "user"),
+                ("query", s),
+                ("opt_fields", "name,email"),
+            ],
+            Some(20),
+        )
+        .await?;
+    let lower = s.to_lowercase();
+    let exact: Vec<&Named> = matches
+        .iter()
+        .filter(|u| u.name.as_deref().is_some_and(|n| n.to_lowercase() == lower))
+        .collect();
+    let candidates: Vec<&Named> = if exact.is_empty() {
+        matches.iter().collect()
+    } else {
+        exact
+    };
+    match candidates.as_slice() {
+        [one] => Ok(Assignee {
+            gid: one.gid.clone(),
+            name: one.display().to_string(),
+        }),
+        [] => bail!("no user matching \"{s}\" in {}", ws.display()),
+        many => {
+            let mut msg = format!("\"{s}\" matches {} people in {}:", many.len(), ws.display());
+            for u in many {
+                let email = u
+                    .email
+                    .as_deref()
+                    .map(|e| format!(" <{e}>"))
+                    .unwrap_or_default();
+                msg.push_str(&format!("\n  {}{email} ({})", u.display(), u.gid));
+            }
+            msg.push_str("\nUse an email or gid to pick one.");
+            bail!(msg)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_ids_from_gids_and_urls() {
+        assert_eq!(
+            parse_task_id("1211234567890123").unwrap(),
+            "1211234567890123"
+        );
+        assert_eq!(
+            parse_task_id(" 1211234567890123 ").unwrap(),
+            "1211234567890123"
+        );
+        assert_eq!(
+            parse_task_id("https://app.asana.com/0/1200000000000000/1211234567890123").unwrap(),
+            "1211234567890123"
+        );
+        assert_eq!(
+            parse_task_id("https://app.asana.com/0/1200000000000000/1211234567890123/f").unwrap(),
+            "1211234567890123"
+        );
+        assert_eq!(
+            parse_task_id("https://app.asana.com/0/0/1211234567890123/f").unwrap(),
+            "1211234567890123"
+        );
+        assert_eq!(
+            parse_task_id("https://app.asana.com/1/1100000000000000/task/1211234567890123")
+                .unwrap(),
+            "1211234567890123"
+        );
+        assert_eq!(
+            parse_task_id("https://app.asana.com/1/1100000000000000/project/1200000000000000/task/1211234567890123/f").unwrap(),
+            "1211234567890123"
+        );
+        assert_eq!(
+            parse_task_id("https://app.asana.com/1/11/task/1211234567890123?focus=true").unwrap(),
+            "1211234567890123"
+        );
+    }
+
+    #[test]
+    fn task_ids_reject_junk() {
+        for bad in [
+            "abc",
+            "",
+            "12a",
+            "https://app.asana.com/0/123",
+            "https://app.asana.com/0/abc/def",
+            "ftp://x/task/1",
+            "https://app.asana.com/1/11/task/abc",
+        ] {
+            let err = parse_task_id(bad).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("invalid task format: \"{bad}\""),
+                "input {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_gids_from_urls() {
+        assert_eq!(parse_project_gid("123").as_deref(), Some("123"));
+        assert_eq!(
+            parse_project_gid("https://app.asana.com/0/1200000000000000/list").as_deref(),
+            Some("1200000000000000")
+        );
+        assert_eq!(
+            parse_project_gid("https://app.asana.com/1/11/project/1200000000000000/list")
+                .as_deref(),
+            Some("1200000000000000")
+        );
+        assert_eq!(parse_project_gid("Roadmap"), None);
+        assert_eq!(
+            parse_project_gid("https://app.asana.com/0/0/1211234567890123"),
+            None
+        );
+    }
+}
