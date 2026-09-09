@@ -1,0 +1,6 @@
+/target
+/bin
+/.scratch
+/.env
+*.log
+.DS_Store
