@@ -701,6 +701,16 @@ fn render_help_for(root: &Command, path: &[String], palette: &Palette, width: us
             .copied()
             .collect();
         rest.sort_by_key(|c| c.get_name().to_string());
+        // A heading over a single line is scaffolding, so a split earns its
+        // headings only when every section holds at least two commands
+        // (`gh repo --help` separates two GENERAL from sixteen TARGETED;
+        // `gh auth --help`, with nothing to separate, lists AVAILABLE
+        // COMMANDS). A group that falls short prints as cobra prints an
+        // ungrouped command: one section, in name order.
+        if sections.iter().any(|(_, members)| members.len() < 2) {
+            sections.clear();
+            rest = sorted_subcommands(cmd);
+        }
         // gh: `AVAILABLE COMMANDS` when a command has no groups, otherwise
         // the ungrouped ones go under `ADDITIONAL COMMANDS`.
         if !rest.is_empty() {
@@ -1027,6 +1037,66 @@ TARGETED COMMANDS
             ws.contains("\nAVAILABLE COMMANDS\n  list:          "),
             "{ws}"
         );
+    }
+
+    /// A GENERAL / TARGETED split earns its headings only when every
+    /// section holds at least two commands: `task` (two against six) keeps
+    /// gh's `issue` layout, while `project`, with one of each, folds into a
+    /// single `AVAILABLE COMMANDS` section in name order, like `gh auth`,
+    /// instead of printing a heading over each of two lines.
+    #[test]
+    fn one_entry_sections_fold_into_available_commands() {
+        let p = Palette::off();
+        let project = help(&["project"], &p);
+        let expected = "\
+USAGE
+  asana project <command> [flags]
+
+AVAILABLE COMMANDS
+  list:          List projects in the workspace
+  view:          View a project
+
+INHERITED FLAGS
+";
+        assert!(project.contains(expected), "{project}");
+        assert!(!project.contains("GENERAL COMMANDS"), "{project}");
+        assert!(!project.contains("TARGETED COMMANDS"), "{project}");
+        assert!(!project.contains("ADDITIONAL COMMANDS"), "{project}");
+        // The classification is still there for the day `project` grows.
+        assert_eq!(help::groups(&["project"]).len(), 2);
+
+        let task = help(&["task"], &p);
+        assert!(
+            task.contains(
+                "\nGENERAL COMMANDS\n  create:        Create a new task\n  list:          "
+            ),
+            "{task}"
+        );
+        assert!(
+            task.contains("\nTARGETED COMMANDS\n  assign:        "),
+            "{task}"
+        );
+        assert!(!task.contains("AVAILABLE COMMANDS"), "{task}");
+
+        // The rule holds on every screen in the tree: a command section
+        // never lists a single command unless it is the only section.
+        for path in all_paths() {
+            let screen = render_help_at(&path, &p, MAX_HELP_WIDTH);
+            let sections: Vec<(&str, usize)> = screen
+                .split("\n\n")
+                .filter_map(|block| {
+                    let (title, body) = block.split_once('\n')?;
+                    title
+                        .ends_with(" COMMANDS")
+                        .then(|| (title, body.lines().count()))
+                })
+                .collect();
+            if sections.len() > 1 {
+                for (title, n) in &sections {
+                    assert!(*n >= 2, "{path:?}: {title} lists {n} command(s):\n{screen}");
+                }
+            }
+        }
     }
 
     /// `asana auth --help` is the screen a new user opens to log in, so it

@@ -103,8 +103,14 @@ pub fn usage(path: &[&str]) -> Option<&'static str> {
     })
 }
 
-/// How the subcommands of a command are grouped on its help screen. Commands
-/// not named here fall into `ADDITIONAL COMMANDS`.
+/// How the subcommands of a command divide by purpose, gh's `GENERAL
+/// COMMANDS` (act on the collection: `create`, `list`) against `TARGETED
+/// COMMANDS` (act on one thing named as an argument). Commands not named
+/// here fall into `ADDITIONAL COMMANDS`. This is the classification only:
+/// the renderer in `cli.rs` prints the split when every section holds at
+/// least two commands (`task` does) and otherwise one `AVAILABLE COMMANDS`
+/// section, so `project`, with one of each, reads like `gh auth --help`
+/// rather than like a template built for a fifteen-command group.
 pub fn groups(path: &[&str]) -> Vec<(&'static str, &'static [&'static str])> {
     match path {
         [] => vec![("CORE COMMANDS", &["auth", "project", "task", "workspace"])],
