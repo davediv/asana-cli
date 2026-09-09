@@ -198,10 +198,10 @@ mod tests {
             message: "user: Unknown object: x@y.z".to_string(),
             url: "u".to_string(),
         });
-        assert_eq!(
-            not_found_message(err, "x@y.z").to_string(),
-            "user: Unknown object: x@y.z"
-        );
+        // ApiError's Display belongs to the errors piece; only assert that
+        // Asana's own text survives untouched.
+        let shown = not_found_message(err, "x@y.z").to_string();
+        assert!(shown.contains("user: Unknown object: x@y.z"), "{shown}");
         let err = anyhow::Error::new(ApiError::NotFound {
             message: "Not Found".to_string(),
             url: "u".to_string(),

@@ -362,7 +362,7 @@ mod tests {
         assert!(out.contains("  \x1b[0;32m✓\x1b[0m Logged in to app.asana.com account \x1b[0;1;39mDave Div\x1b[0m (ASANA_TOKEN)\n"));
         assert!(out.contains("  - Token: \x1b[0;1;39m2/12****\x1b[0m\n"));
         assert!(Style::new(false).bold("x") == "x");
-        assert!(Style::new(true).bold("") == "");
+        assert!(Style::new(true).bold("").is_empty());
     }
 
     #[test]
