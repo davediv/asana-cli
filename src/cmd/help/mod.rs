@@ -21,13 +21,13 @@ pub const PROSE_WIDTH: usize = 78;
 pub const ROOT_ABOUT: &str = "Work with an Asana workspace from the command line.";
 
 /// The root screen's examples open with the first-run path, since nothing
-/// works before a token is set: where the token comes from, how it is
-/// given, and the command that checks it. gh's leaf screens group examples
-/// this way, a `# comment` line over each block and a blank line between.
+/// works before a token is stored: the one command that logs in, with the
+/// page the token comes from in its comment. gh's leaf screens group
+/// examples this way, a `# comment` line over each block and a blank line
+/// between.
 pub const ROOT_EXAMPLES: &str = "\
-# Create a personal access token at https://app.asana.com/0/my-apps
-$ export ASANA_TOKEN=<token>
-$ asana auth status
+# Log in with a personal access token from https://app.asana.com/0/my-apps
+$ asana auth login
 
 # Work with tasks
 $ asana task list
@@ -40,20 +40,34 @@ $ asana task view 1211234567890123 --web";
 pub const AUTH_ABOUT: &str = "Authenticate with Asana";
 
 /// `asana auth --help` is where a new user looks for how to log in, so its
-/// description says how: there is no `auth login`, the token comes from
-/// Asana's own page and goes in an environment variable or the config file.
+/// description says how, in the order gh's `auth login` screen and its
+/// no-auth error use: `asana auth login` first (what it asks for, where the
+/// token comes from, where it is stored), the environment variable second
+/// as the route for scripts, then the command that checks the result.
 /// `AUTH_ABOUT` plus a period, then the how-to, hand-wrapped like gh's
 /// heredoc descriptions.
 pub const AUTH_LONG_ABOUT: &str = "\
 Authenticate with Asana.
 
-asana authenticates with a personal access token. Create one at
-https://app.asana.com/0/my-apps, then either set the ASANA_TOKEN environment
-variable to it or put `token = \"...\"` in ~/.config/asana/config.toml.
-Run `asana auth status` to check which account the token belongs to;
-`asana help environment` has the details.";
+Run `asana auth login` to get started: it prompts for a personal access
+token from https://app.asana.com/0/my-apps, checks it against Asana and
+stores it in ~/.config/asana/config.toml for every other command to use.
+Alternatively, populate the ASANA_TOKEN environment variable with a token,
+which suits scripts and automation; `asana help environment` has the
+details. Run `asana auth status` to see which account is in use and where
+its token came from.";
 
-pub const AUTH_EXAMPLES: &str = "$ export ASANA_TOKEN=<token>\n$ asana auth status";
+/// The auth group's examples, commented like `gh auth login --help`'s: the
+/// interactive login, the scripted one, and the check.
+pub const AUTH_EXAMPLES: &str = "\
+# Log in by pasting a token when prompted
+$ asana auth login
+
+# Log in from a script by reading the token from a file
+$ asana auth login --with-token < token.txt
+
+# Check which account and workspace are in use
+$ asana auth status";
 
 pub const MANUAL_URL: &str = "https://github.com/davediv/asana-cli#readme";
 
@@ -365,13 +379,27 @@ mod tests {
         assert!(!AUTH_ABOUT.ends_with('.'));
         assert!(AUTH_LONG_ABOUT.starts_with(&format!("{AUTH_ABOUT}.\n\n")));
         assert!(!AUTH_LONG_ABOUT.ends_with('\n'));
-        assert!(AUTH_LONG_ABOUT.contains("ASANA_TOKEN"));
+        // Login leads, the environment variable is the alternative, and
+        // the check comes last, as on gh's login screen.
+        let login = AUTH_LONG_ABOUT.find("`asana auth login`").expect("login");
+        let env = AUTH_LONG_ABOUT
+            .find("Alternatively, populate the ASANA_TOKEN environment variable")
+            .expect("env var");
+        let status = AUTH_LONG_ABOUT.find("`asana auth status`").expect("status");
+        assert!(login < env && env < status);
         assert!(AUTH_LONG_ABOUT.contains("https://app.asana.com/0/my-apps,"));
+        assert!(AUTH_LONG_ABOUT.contains("~/.config/asana/config.toml"));
         assert!(AUTH_LONG_ABOUT.contains("`asana help environment`"));
+        assert!(!AUTH_LONG_ABOUT.contains("export"));
         assert_prose("auth", AUTH_LONG_ABOUT, 0);
         assert_prose("root about", ROOT_ABOUT, 0);
         for ex in [ROOT_EXAMPLES, AUTH_EXAMPLES] {
-            assert!(ex.contains("$ export ASANA_TOKEN=<token>\n$ asana auth status"));
+            assert!(ex.contains("\n$ asana auth login\n"));
+            assert!(
+                !ex.contains("ASANA_TOKEN"),
+                "examples are commands, not exports"
+            );
+            assert!(ex.starts_with("# "));
             assert!(!ex.ends_with('\n'));
             assert_prose("examples", ex, 2);
             for line in ex.lines() {
@@ -381,8 +409,9 @@ mod tests {
                 );
             }
         }
-        assert!(ROOT_EXAMPLES.starts_with("# "));
-        assert!(ROOT_EXAMPLES.contains("https://app.asana.com/0/my-apps"));
+        assert!(ROOT_EXAMPLES.contains("https://app.asana.com/0/my-apps\n$ asana auth login\n"));
+        assert!(AUTH_EXAMPLES.contains("\n$ asana auth login --with-token < token.txt\n"));
+        assert!(AUTH_EXAMPLES.ends_with("\n$ asana auth status"));
         for path in [&[][..], &["task"], &["project"]] {
             if let Some(text) = arguments(path) {
                 assert_prose("arguments", text, 2);

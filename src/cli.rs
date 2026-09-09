@@ -947,9 +947,8 @@ FLAGS
   --workspace NAME   Select the workspace by name or gid
 
 EXAMPLES
-  # Create a personal access token at https://app.asana.com/0/my-apps
-  $ export ASANA_TOKEN=<token>
-  $ asana auth status
+  # Log in with a personal access token from https://app.asana.com/0/my-apps
+  $ asana auth login
 
   # Work with tasks
   $ asana task list
@@ -1086,12 +1085,13 @@ TARGETED COMMANDS
     }
 
     /// `asana auth --help` is the screen a new user opens to log in, so it
-    /// says how: the token page, the environment variable, the config file,
-    /// and the topic with the details. Its first line is the root screen's
-    /// `auth:` summary, as gh's is, and the root EXAMPLES show the same
-    /// first-run path before anything else. The paragraph is hand-wrapped
-    /// short of 78 columns with a bare URL, so it reads the same at 80 and
-    /// at 120.
+    /// says how, around `asana auth login` the way gh's auth screens are
+    /// written around `gh auth login`: the login command first, the
+    /// environment variable as the alternative for scripts, then the
+    /// command that checks the result. Its first line is the root screen's
+    /// `auth:` summary, as gh's is, and the root EXAMPLES open with the same
+    /// login before anything else. The paragraph is hand-wrapped short of
+    /// 78 columns with a bare URL, so it reads the same at 80 and at 120.
     #[test]
     fn auth_screens_say_how_to_authenticate() {
         let p = Palette::off();
@@ -1099,11 +1099,13 @@ TARGETED COMMANDS
         let expected_head = "\
 Authenticate with Asana.
 
-asana authenticates with a personal access token. Create one at
-https://app.asana.com/0/my-apps, then either set the ASANA_TOKEN environment
-variable to it or put `token = \"...\"` in ~/.config/asana/config.toml.
-Run `asana auth status` to check which account the token belongs to;
-`asana help environment` has the details.
+Run `asana auth login` to get started: it prompts for a personal access
+token from https://app.asana.com/0/my-apps, checks it against Asana and
+stores it in ~/.config/asana/config.toml for every other command to use.
+Alternatively, populate the ASANA_TOKEN environment variable with a token,
+which suits scripts and automation; `asana help environment` has the
+details. Run `asana auth status` to see which account is in use and where
+its token came from.
 
 USAGE
   asana auth <command> [flags]
@@ -1112,10 +1114,21 @@ AVAILABLE COMMANDS
   login:         ";
         assert!(auth.starts_with(expected_head), "{auth}");
         assert_eq!(render_help_at(&["auth".to_string()], &p, 80), auth);
-        assert!(
-            auth.contains("\nEXAMPLES\n  $ export ASANA_TOKEN=<token>\n  $ asana auth status\n\n"),
-            "{auth}"
-        );
+        let expected_examples = "\
+EXAMPLES
+  # Log in by pasting a token when prompted
+  $ asana auth login
+
+  # Log in from a script by reading the token from a file
+  $ asana auth login --with-token < token.txt
+
+  # Check which account and workspace are in use
+  $ asana auth status
+
+LEARN MORE
+";
+        assert!(auth.contains(expected_examples), "{auth}");
+        assert!(!auth.contains("export ASANA_TOKEN"), "{auth}");
         assert!(!auth.contains('<') || !auth.contains("<http"), "{auth}");
         for line in auth.lines() {
             assert!(line.chars().count() <= 80, "auth line too long: {line}");
@@ -1133,7 +1146,7 @@ AVAILABLE COMMANDS
             .expect("root EXAMPLES");
         assert!(
             examples.starts_with(
-                "  # Create a personal access token at https://app.asana.com/0/my-apps\n  $ export ASANA_TOKEN=<token>\n  $ asana auth status\n\n  # Work with tasks\n"
+                "  # Log in with a personal access token from https://app.asana.com/0/my-apps\n  $ asana auth login\n\n  # Work with tasks\n"
             ),
             "{examples}"
         );
