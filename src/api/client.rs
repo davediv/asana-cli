@@ -45,8 +45,9 @@ pub enum ApiError {
     /// innermost reason.
     #[error("error connecting to app.asana.com")]
     Network(#[from] reqwest::Error),
-    /// The body was not the JSON we expected.
-    #[error("could not parse the response from {url}: {source}")]
+    /// The body was not the JSON we expected; the serde error is the
+    /// `#[source]`, printed after a colon by `error::report`.
+    #[error("could not parse the response from {url}")]
     Decode {
         url: String,
         #[source]
@@ -518,9 +519,17 @@ mod tests {
         let client = Client::with_base(&base, "tok").unwrap();
         let err = client.get::<Value>("/tasks", &[]).await.unwrap_err();
         assert!(matches!(err, ApiError::Decode { .. }), "{err:?}");
-        assert!(err
-            .to_string()
-            .starts_with(&format!("could not parse the response from {base}/tasks: ")));
+        assert_eq!(
+            err.to_string(),
+            format!("could not parse the response from {base}/tasks")
+        );
+        // The serde error is the source, so anyhow's `{:#}` prints it once.
+        let chain = format!("{:#}", anyhow::Error::new(err));
+        assert!(
+            chain.starts_with(&format!("could not parse the response from {base}/tasks: ")),
+            "{chain}"
+        );
+        assert_eq!(chain.matches("could not parse").count(), 1);
         server.join().unwrap();
     }
 

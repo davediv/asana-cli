@@ -123,6 +123,9 @@ fn comment_url(task: &Task, story_gid: &str) -> String {
     }
 }
 
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for Args {}
+
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let gid = parse_task_id(&args.task)?;
     let sp = spinner(ctx);

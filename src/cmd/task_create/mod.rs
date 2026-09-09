@@ -13,12 +13,16 @@ use serde_json::{json, Value};
 
 use crate::api::Task;
 use crate::cli::{usage_error, Cancelled};
-use crate::cmd::{finish, open_in_browser, read_text_file, spinner};
+use crate::cmd::{finish, open_in_browser, read_text_file, spinner, Prevalidate};
 use crate::ctx::Ctx;
 use crate::render::time::today;
 use crate::resolve::{resolve_assignee, resolve_project};
 
 const PATH: &[&str] = &["task", "create"];
+
+/// gh's wording for a script that forgot the flags (`reference/gh-errors/
+/// create-noninteractive.txt`, with `--notes` for gh's `--body`).
+const NON_INTERACTIVE: &str = "must provide `--title` and `--notes` when not running interactively";
 
 #[derive(clap::Args, Debug)]
 #[command(
@@ -81,6 +85,28 @@ pub struct Args {
     /// Open the browser to create a task
     #[arg(short = 'w', long)]
     pub web: bool,
+}
+
+impl Args {
+    /// A non-blank `--title`.
+    fn title(&self) -> Option<&str> {
+        self.title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+}
+
+impl Prevalidate for Args {
+    /// Without a terminal to ask on, the title must come from `--title`
+    /// (`--web` needs none). Runs before the token is read, so this exits 1
+    /// with gh's usage error rather than 4 for a missing token.
+    fn prevalidate(&self, interactive: bool) -> Result<()> {
+        if self.web || interactive || self.title().is_some() {
+            return Ok(());
+        }
+        Err(usage_error(PATH, NON_INTERACTIVE))
+    }
 }
 
 /// `YYYY-MM-DD`, `today`, `tomorrow`, or a weekday name (`friday`, `fri`)
@@ -223,20 +249,11 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
         return open_in_browser(&url?);
     }
 
-    let title = match args
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
+    let title = match args.title() {
         Some(t) => t.to_string(),
         None if can_prompt(ctx) => prompt_title(ctx)?,
-        None => {
-            return Err(usage_error(
-                PATH,
-                "must provide `--title` when not running interactively",
-            ))
-        }
+        // Unreachable after `prevalidate`, kept for callers that skip it.
+        None => return Err(usage_error(PATH, NON_INTERACTIVE)),
     };
     let notes = match (&args.notes, &args.notes_file) {
         (Some(n), _) => Some(n.clone()),
@@ -320,6 +337,29 @@ mod tests {
                 "input {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn non_interactive_needs_a_title_before_auth() {
+        let args = |title: Option<&str>, web: bool| Args {
+            title: title.map(str::to_string),
+            notes: None,
+            notes_file: None,
+            project: None,
+            assignee: None,
+            due: None,
+            web,
+        };
+        let err = args(None, false).prevalidate(false).unwrap_err();
+        let usage = err
+            .downcast_ref::<crate::cli::UsageError>()
+            .expect("a usage error");
+        assert_eq!(usage.message, NON_INTERACTIVE);
+        assert_eq!(usage.path, vec!["task", "create"]);
+        assert!(args(Some("  "), false).prevalidate(false).is_err());
+        assert!(args(Some("Fix it"), false).prevalidate(false).is_ok());
+        assert!(args(None, true).prevalidate(false).is_ok());
+        assert!(args(None, false).prevalidate(true).is_ok());
     }
 
     #[test]

@@ -289,6 +289,9 @@ async fn web_url(ctx: &Ctx, args: &Args) -> Result<String> {
     })
 }
 
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for Args {}
+
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     if args.web {
         let sp = spinner(ctx);

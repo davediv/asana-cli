@@ -171,6 +171,9 @@ fn sort_newest_first(items: &mut [Item]) {
     items.sort_by(|a, b| b.project.modified_at.cmp(&a.project.modified_at));
 }
 
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for Args {}
+
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let ws = ctx.workspace().await?;
     if args.web {

@@ -95,6 +95,9 @@ pub fn task_url(gid: &str, permalink: Option<&str>) -> String {
     }
 }
 
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for Args {}
+
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let gid = parse_task_id(&args.task)?;
     if let Some(blank) = args.assignee.as_deref().filter(|a| a.trim().is_empty()) {

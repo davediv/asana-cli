@@ -26,6 +26,9 @@ pub struct Args {
     pub yes: bool,
 }
 
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for Args {}
+
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let p = Palette::new(ctx.color);
     let gid = parse_task_id(&args.task)?;

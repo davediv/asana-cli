@@ -1,5 +1,5 @@
-//! Display-width aware truncation, indentation, wrapping, and rendering of
-//! Asana notes (plain or `html_notes`) for the terminal.
+//! Display-width aware truncation, indentation, wrapping, and the plain
+//! shape of Asana notes (`render_notes`; the full renderer is `render::notes`).
 
 use unicode_width::UnicodeWidthStr;
 
@@ -45,6 +45,7 @@ pub fn pad_right(s: &str, w: usize) -> String {
 }
 
 /// Prefix every line with `n` spaces (blank lines stay blank).
+#[allow(dead_code)]
 pub fn indent(s: &str, n: usize) -> String {
     let pad = " ".repeat(n);
     s.lines()
@@ -60,6 +61,7 @@ pub fn indent(s: &str, n: usize) -> String {
 }
 
 /// Wrap paragraphs to `w` cells, preserving blank lines between them.
+#[allow(dead_code)]
 pub fn wrap(s: &str, w: usize) -> String {
     let opts = textwrap::Options::new(w.max(20)).break_words(false);
     s.lines()
@@ -74,23 +76,20 @@ pub fn wrap(s: &str, w: usize) -> String {
         .join("\n")
 }
 
-/// Render Asana notes for a terminal: prefer `html_notes` (converted with
-/// html2text), else plain `notes`. Returns an empty string when there is nothing.
+/// Render Asana notes for a terminal: prefer `html_notes`, else plain
+/// `notes`; no margin, no colour, wrapped to `w`. Literal newlines survive,
+/// link URLs are kept (`text url`), lists get `•` and `1.` markers. See
+/// `render::notes` for the coloured and margined shapes. Returns an empty
+/// string when there is nothing.
+#[allow(dead_code)]
 pub fn render_notes(html_notes: Option<&str>, notes: Option<&str>, w: usize) -> String {
-    let w = w.max(20);
-    if let Some(html) = html_notes.map(str::trim).filter(|h| !h.is_empty()) {
-        let cfg = html2text::config::plain_no_decorate();
-        if let Ok(text) = cfg.string_from_read(html.as_bytes(), w) {
-            let text = text.trim_end().to_string();
-            if !text.trim().is_empty() {
-                return text;
-            }
-        }
-    }
-    match notes.map(str::trim).filter(|n| !n.is_empty()) {
-        Some(plain) => wrap(plain, w),
-        None => String::new(),
-    }
+    let layout = super::notes::Layout {
+        width: w.max(20),
+        color: false,
+        margin: 0,
+        pad_to: None,
+    };
+    super::notes::render_lines(html_notes, notes, &layout).join("\n")
 }
 
 /// gh shows URLs without the scheme in "Opening ... in your browser."
@@ -128,14 +127,24 @@ mod tests {
             None,
             80,
         );
-        assert!(out.contains("Hello world"));
-        assert!(out.contains("one"));
+        assert_eq!(out, "Hello world\n• one");
         assert_eq!(render_notes(None, Some("  plain  "), 80), "plain");
         assert_eq!(
             render_notes(Some("<body></body>"), Some("fallback"), 80),
             "fallback"
         );
         assert_eq!(render_notes(None, None, 80), "");
+    }
+
+    #[test]
+    fn notes_keep_newlines_and_urls() {
+        let html = "<body>Step one.\nStep two, see <a href=\"https://x.y/doc\">the doc</a>.\n\nDone.</body>";
+        assert_eq!(
+            render_notes(Some(html), None, 80),
+            "Step one.\nStep two, see the doc https://x.y/doc.\n\nDone."
+        );
+        assert_eq!(render_notes(None, Some("a\nb\n\nc"), 80), "a\nb\n\nc");
+        assert!(!render_notes(Some(html), None, 80).contains('\x1b'));
     }
 
     #[test]

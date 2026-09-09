@@ -285,6 +285,9 @@ async fn fetch_counts(ctx: &Ctx, gid: &str) -> Option<Counts> {
         .ok()
 }
 
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for Args {}
+
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let sp = spinner(ctx);
     let gid = match parse_project_gid(&args.project) {
@@ -566,9 +569,9 @@ mod tests {
         let counts = Counts::default();
         let out = render_tty(&sample(), &counts, 80, true, at());
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[0].starts_with("\x1b[1mRoadmap\x1b[0m"), "{:?}", lines[0]);
-        assert!(lines[1].starts_with("\x1b[32mActive\x1b[0m • owned by Div"), "{:?}", lines[1]);
-        assert!(lines[2].starts_with("\x1b[1mStatus: \x1b[0m\x1b[32mOn track\x1b[0m"), "{:?}", lines[2]);
+        assert!(lines[0].starts_with("\x1b[0;1;39mRoadmap\x1b[0m"), "{:?}", lines[0]);
+        assert!(lines[1].starts_with("\x1b[0;32mActive\x1b[0m • owned by Div"), "{:?}", lines[1]);
+        assert!(lines[2].starts_with("\x1b[0;1;39mStatus: \x1b[0m\x1b[0;32mOn track\x1b[0m"), "{:?}", lines[2]);
         assert!(lines.last().unwrap().starts_with("\x1b[38;5;242mView this project in Asana:"));
     }
 

@@ -50,6 +50,9 @@ pub struct Args {
     pub show_token: bool,
 }
 
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for Args {}
+
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let style = Style::new(ctx.color);
     let host = host();

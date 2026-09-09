@@ -54,6 +54,9 @@ pub struct Args {
     pub web: bool,
 }
 
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for Args {}
+
 /// Where the comment text comes from, in gh's terms.
 #[derive(Debug, PartialEq, Eq)]
 enum Input {

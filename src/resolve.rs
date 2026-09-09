@@ -53,7 +53,9 @@ pub fn parse_task_id(input: &str) -> Result<String> {
 }
 
 /// Extract a project gid from a gid or an Asana URL, if it looks like one.
-fn parse_project_gid(input: &str) -> Option<String> {
+/// Accepted URL shapes: `/0/<project>/...` (not `/0/0/...`, which is a
+/// project-less task link) and `.../project/<project>/...`.
+pub fn parse_project_gid(input: &str) -> Option<String> {
     let s = input.trim();
     if is_gid(s) {
         return Some(s.to_string());
@@ -140,16 +142,38 @@ pub async fn resolve_project(ctx: &Ctx, input: &str) -> Result<Project> {
 pub struct Assignee {
     /// `me` or a user gid.
     pub gid: String,
+    /// The display name, for messages that name the person.
+    #[allow(dead_code)]
     pub name: String,
 }
 
-/// Resolve `me`/`@me`, an email, a gid, or a name (via typeahead).
+/// `me` or `@me`: the special values Asana accepts in place of your own gid.
+pub fn is_me(input: &str) -> bool {
+    matches!(input.trim(), "me" | "@me")
+}
+
+/// The assignee value to send to the API (`me` or a user gid), without
+/// asking who `me` is: the fast path for callers that only need the value,
+/// like `task assign` and `task create`. Anything else goes through
+/// `resolve_assignee`.
+#[allow(dead_code)]
+pub async fn resolve_assignee_value(ctx: &Ctx, input: &str) -> Result<String> {
+    if is_me(input) {
+        return Ok("me".to_string());
+    }
+    Ok(resolve_assignee(ctx, input).await?.gid)
+}
+
+/// Resolve `me`/`@me`, an email, a gid, or a name (via typeahead). `me`
+/// costs a `GET /users/me` for the display name (cached in `Ctx`, so free
+/// when the workspace has already been resolved); use
+/// `resolve_assignee_value` when the name is not needed.
 pub async fn resolve_assignee(ctx: &Ctx, input: &str) -> Result<Assignee> {
     let s = input.trim();
     if s.is_empty() {
         bail!("invalid assignee: \"{input}\"");
     }
-    if s == "me" || s == "@me" {
+    if is_me(s) {
         let me = ctx.me().await?;
         return Ok(Assignee {
             gid: "me".to_string(),
@@ -271,6 +295,16 @@ mod tests {
                 "input {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn me_is_special() {
+        assert!(is_me("me"));
+        assert!(is_me("@me"));
+        assert!(is_me(" me "));
+        assert!(!is_me("Me"));
+        assert!(!is_me("jane@example.com"));
+        assert!(!is_me(""));
     }
 
     #[test]

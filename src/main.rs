@@ -3,8 +3,9 @@
 //!
 //! The wording of every error lives in `error.rs`; this file only decides
 //! the order things happen in: clap first (so `--help`, typos and missing
-//! arguments never need a token), then the cheap identifier checks, then the
-//! token and workspace, then the command itself.
+//! arguments never need a token), then the cheap identifier and flag checks
+//! (`prevalidate`, still without a token), then the token and workspace,
+//! then the command itself.
 
 mod api;
 mod cli;
@@ -101,7 +102,11 @@ async fn run() -> i32 {
         print!("{}", cli::render_help(&[], &palette));
         return EXIT_OK;
     };
-    if let Err(err) = command.prevalidate() {
+    // gh's CanPrompt: the command may ask questions only when every stream
+    // is a terminal. Usage checks run before the token is read, so a script
+    // missing `--title` exits 1 whether or not it is authenticated.
+    let interactive = is_tty && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    if let Err(err) = command.prevalidate(interactive) {
         return emit(error::report(&err, None));
     }
 

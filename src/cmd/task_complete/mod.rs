@@ -74,6 +74,12 @@ pub struct ReopenArgs {
     pub comment: Option<String>,
 }
 
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for CompleteArgs {}
+
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for ReopenArgs {}
+
 pub async fn run(ctx: &Ctx, args: CompleteArgs) -> Result<()> {
     set_completed(ctx, &args.tasks, args.comment.as_deref(), true).await
 }
@@ -260,12 +266,12 @@ mod tests {
         let p = Palette::new(true);
         let line = done_line(&p, COMPLETE.verb, "1 (x)");
         assert!(
-            line.starts_with("\x1b[32m✓\x1b[0m Completed task 1 (x)"),
+            line.starts_with("\x1b[0;32m✓\x1b[0m Completed task 1 (x)"),
             "{line:?}"
         );
         let line = already_line(&p, COMPLETE.state, "1 (x)");
         assert!(
-            line.starts_with("\x1b[33m!\x1b[0m Task 1 (x) is already complete"),
+            line.starts_with("\x1b[0;33m!\x1b[0m Task 1 (x) is already complete"),
             "{line:?}"
         );
     }

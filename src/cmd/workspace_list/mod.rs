@@ -21,6 +21,9 @@ pub struct Args {
     pub json: bool,
 }
 
+/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for Args {}
+
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let sp = spinner(ctx);
     let me = ctx.me().await;

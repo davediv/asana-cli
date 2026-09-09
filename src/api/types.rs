@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const USER_FIELDS: &str = "name,email,workspaces.name";
 
 /// Fields requested when listing or viewing projects.
-pub const PROJECT_FIELDS: &str = "name,archived,color,due_on,modified_at,owner.name,current_status.title,current_status.color,team.name,permalink_url,notes,members,created_at,public,completed,start_on";
+pub const PROJECT_FIELDS: &str = "name,archived,color,due_on,modified_at,owner.name,current_status.title,current_status.color,team.name,permalink_url,notes,members,created_at,public,privacy_setting,completed,start_on";
 
 /// Fields requested for task lists and views.
 pub const TASK_FIELDS: &str = "name,notes,completed,completed_at,assignee.name,assignee.email,due_on,due_at,start_on,created_at,modified_at,projects.name,memberships.section.name,memberships.project.name,tags.name,parent.name,num_subtasks,permalink_url,created_by.name,followers.name,num_likes,custom_fields.name,custom_fields.display_value,workspace.name";
@@ -20,7 +20,7 @@ pub const TASK_VIEW_FIELDS: &str = "name,notes,html_notes,completed,completed_at
 
 /// Fields requested for task stories (comments and system events).
 pub const STORY_FIELDS: &str =
-    "created_at,created_by.name,text,type,resource_subtype,is_pinned,num_likes,html_text";
+    "created_at,created_by.name,text,type,resource_subtype,is_pinned,is_edited,num_likes,html_text";
 
 /// Fields requested for subtasks.
 pub const SUBTASK_FIELDS: &str = "name,completed,assignee.name,due_on";
@@ -99,7 +99,10 @@ pub struct Project {
     pub html_notes: Option<String>,
     #[serde(default)]
     pub members: Vec<Named>,
+    /// Deprecated by Asana in favour of `privacy_setting`; still sent.
     pub public: Option<bool>,
+    /// `public_to_workspace`, `private_to_team` or `private`.
+    pub privacy_setting: Option<String>,
     pub completed: Option<bool>,
     pub workspace: Option<Workspace>,
 }
@@ -107,6 +110,17 @@ pub struct Project {
 impl Project {
     pub fn display(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.gid)
+    }
+
+    /// Whether the project is visible to the whole workspace, from
+    /// `privacy_setting` when Asana sent it, else the deprecated `public`.
+    #[allow(dead_code)]
+    pub fn is_public(&self) -> Option<bool> {
+        match self.privacy_setting.as_deref() {
+            Some("public_to_workspace") => Some(true),
+            Some(_) => Some(false),
+            None => self.public,
+        }
     }
 }
 
@@ -205,6 +219,8 @@ pub struct Story {
     pub story_type: Option<String>,
     pub resource_subtype: Option<String>,
     pub is_pinned: Option<bool>,
+    /// The comment was edited after it was posted (` • Edited` in gh).
+    pub is_edited: Option<bool>,
     pub num_likes: Option<u64>,
 }
 
