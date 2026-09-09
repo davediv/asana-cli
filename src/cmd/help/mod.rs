@@ -1,12 +1,46 @@
 //! The prose pieces of the help screens that clap cannot express: the root
-//! description and examples, usage lines, command groupings, the ARGUMENTS
-//! sections, the help topics (`asana help exit-codes`, `asana help
-//! formatting`), and the LEARN MORE footer. `cli.rs` renders them; headings are painted with the shared
-//! `Palette::bold`, which emits gh's `\e[0;1;39m`.
+//! description and examples, the `auth` group's description (where a new
+//! user learns how to authenticate), usage lines, command groupings, the
+//! ARGUMENTS sections, the help topics (`asana help exit-codes`, `asana help
+//! formatting`), and the LEARN MORE footer. `cli.rs` renders them; headings
+//! are painted with the shared `Palette::bold`, which emits gh's
+//! `\e[0;1;39m`.
 
 pub const ROOT_ABOUT: &str = "Work with an Asana workspace from the command line.";
 
-pub const ROOT_EXAMPLES: &str = "$ asana task list\n$ asana task create --title \"Fix the login page\"\n$ asana task view 1211234567890123 --web";
+/// The root screen's examples open with the first-run path, since nothing
+/// works before a token is set: where the token comes from, how it is
+/// given, and the command that checks it. gh's leaf screens group examples
+/// this way, a `# comment` line over each block and a blank line between.
+pub const ROOT_EXAMPLES: &str = "\
+# Get started with a personal access token from https://app.asana.com/0/my-apps
+$ export ASANA_TOKEN=<token>
+$ asana auth status
+
+# Work with tasks
+$ asana task list
+$ asana task create --title \"Fix the login page\"
+$ asana task view 1211234567890123 --web";
+
+/// The `auth:` line on the root screen and the first line of `asana auth
+/// --help` say the same thing, as gh's do ("Authenticate gh and git with
+/// GitHub" on both).
+pub const AUTH_ABOUT: &str = "Authenticate with Asana";
+
+/// `asana auth --help` is where a new user looks for how to log in, so its
+/// description says how: there is no `auth login`, the token comes from
+/// Asana's own page and goes in an environment variable or the config file.
+/// `AUTH_ABOUT` plus a period, then the how-to, wrapped short of 90 columns
+/// like gh's heredoc descriptions.
+pub const AUTH_LONG_ABOUT: &str = "\
+Authenticate with Asana.
+
+asana authenticates with a personal access token. Create one at
+<https://app.asana.com/0/my-apps>, then either set the ASANA_TOKEN environment variable
+to it or put `token = \"...\"` in ~/.config/asana/config.toml. Run `asana auth status` to
+check which account the token belongs to; `asana help environment` has the details.";
+
+pub const AUTH_EXAMPLES: &str = "$ export ASANA_TOKEN=<token>\n$ asana auth status";
 
 pub const MANUAL_URL: &str = "https://github.com/davediv/asana-cli#readme";
 
@@ -278,6 +312,38 @@ mod tests {
             })
         ));
         assert!(topic("nope").is_none());
+    }
+
+    /// The auth prose and the root examples follow the same rules as the
+    /// topics: a summary with no period, a description that opens with that
+    /// summary and a period, lines short of 90 columns, no trailing space,
+    /// and examples made of `$ ` invocations, `# ` comments and blank lines.
+    #[test]
+    fn auth_prose_and_root_examples_are_well_formed() {
+        assert!(!AUTH_ABOUT.ends_with('.'));
+        assert!(AUTH_LONG_ABOUT.starts_with(&format!("{AUTH_ABOUT}.\n\n")));
+        assert!(!AUTH_LONG_ABOUT.ends_with('\n'));
+        assert!(AUTH_LONG_ABOUT.contains("ASANA_TOKEN"));
+        assert!(AUTH_LONG_ABOUT.contains("<https://app.asana.com/0/my-apps>"));
+        assert!(AUTH_LONG_ABOUT.contains("`asana help environment`"));
+        for line in AUTH_LONG_ABOUT.lines() {
+            assert!(line.len() < 90, "auth line too long: {line}");
+            assert!(line.is_empty() || !line.ends_with(' '), "{line:?}");
+        }
+        for ex in [ROOT_EXAMPLES, AUTH_EXAMPLES] {
+            assert!(ex.contains("$ export ASANA_TOKEN=<token>\n$ asana auth status"));
+            assert!(!ex.ends_with('\n'));
+            for line in ex.lines() {
+                assert!(
+                    line.is_empty() || line.starts_with("$ ") || line.starts_with("# "),
+                    "not an example line: {line:?}"
+                );
+                assert!(line.len() < 90, "example line too long: {line}");
+                assert!(line.is_empty() || !line.ends_with(' '), "{line:?}");
+            }
+        }
+        assert!(ROOT_EXAMPLES.starts_with("# "));
+        assert!(ROOT_EXAMPLES.contains("https://app.asana.com/0/my-apps"));
     }
 
     #[test]

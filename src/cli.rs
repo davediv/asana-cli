@@ -59,9 +59,9 @@ pub struct Cli {
 pub enum Commands {
     #[command(
         subcommand,
-        about = "Check authentication with Asana",
-        long_about = "Check which Asana account and workspace the CLI is using.",
-        after_help = "$ asana auth status"
+        about = help::AUTH_ABOUT,
+        long_about = help::AUTH_LONG_ABOUT,
+        after_help = help::AUTH_EXAMPLES
     )]
     Auth(AuthCmd),
     #[command(
@@ -252,9 +252,11 @@ pub fn command_path(root: &Command, argv: &[OsString]) -> Vec<String> {
 /// version`, which gh supports and clap reports as unknown subcommands.
 /// `help` follows the command tree as far as it matches, like cobra's; a
 /// first word that is neither a command nor a topic is `Unknown help
-/// topic`. gh registers its topics as hidden commands, so `gh formatting`
-/// and `gh formatting --help` print the topic too; a topic given with any
-/// flag but `--help`/`--no-color` is left to clap's unknown-command report.
+/// topic`, cobra's words, with the usage block after a blank line as under
+/// every other usage error. gh registers its topics as hidden commands, so
+/// `gh formatting` and `gh formatting --help` print the topic too; a topic
+/// given with any flag but `--help`/`--no-color` is left to clap's
+/// unknown-command report.
 pub(crate) fn builtin_request(
     root: &Command,
     argv: &[OsString],
@@ -297,7 +299,7 @@ pub(crate) fn builtin_request(
                 return Some(Rendered {
                     stdout: String::new(),
                     stderr: format!(
-                        "Unknown help topic [`{first}`]\n{}",
+                        "Unknown help topic [`{first}`]\n\n{}",
                         crate::error::usage_block(&[])
                     ),
                     code: 1,
@@ -754,7 +756,7 @@ USAGE
   asana <command> <subcommand> [flags]
 
 CORE COMMANDS
-  auth:          Check authentication with Asana
+  auth:          Authenticate with Asana
   project:       Manage projects
   task:          Manage tasks
   workspace:     Manage workspaces
@@ -772,6 +774,11 @@ FLAGS
   --workspace NAME   Select the workspace by name or gid
 
 EXAMPLES
+  # Get started with a personal access token from https://app.asana.com/0/my-apps
+  $ export ASANA_TOKEN=<token>
+  $ asana auth status
+  
+  # Work with tasks
   $ asana task list
   $ asana task create --title \"Fix the login page\"
   $ asana task view 1211234567890123 --web
@@ -888,6 +895,61 @@ TARGETED COMMANDS
             ws.contains("\nAVAILABLE COMMANDS\n  list:          "),
             "{ws}"
         );
+    }
+
+    /// `asana auth --help` is the screen a new user opens to log in, so it
+    /// says how: the token page, the environment variable, the config file,
+    /// and the topic with the details. Its first line is the root screen's
+    /// `auth:` summary, as gh's is, and the root EXAMPLES show the same
+    /// first-run path before anything else.
+    #[test]
+    fn auth_screens_say_how_to_authenticate() {
+        let p = Palette::off();
+        let auth = render_help(&["auth".to_string()], &p);
+        let expected_head = "\
+Authenticate with Asana.
+
+asana authenticates with a personal access token. Create one at
+<https://app.asana.com/0/my-apps>, then either set the ASANA_TOKEN environment variable
+to it or put `token = \"...\"` in ~/.config/asana/config.toml. Run `asana auth status` to
+check which account the token belongs to; `asana help environment` has the details.
+
+USAGE
+  asana auth <command> [flags]
+
+AVAILABLE COMMANDS
+  status:        ";
+        assert!(auth.starts_with(expected_head), "{auth}");
+        assert!(
+            auth.contains("\nEXAMPLES\n  $ export ASANA_TOKEN=<token>\n  $ asana auth status\n\n"),
+            "{auth}"
+        );
+        for line in auth.lines() {
+            assert!(line.len() <= 90, "auth line too long: {line}");
+        }
+        let root = render_help(&[], &p);
+        assert!(
+            root.contains(&format!("\n  auth:          {}\n", help::AUTH_ABOUT)),
+            "{root}"
+        );
+        assert!(help::AUTH_LONG_ABOUT.starts_with(&format!("{}.\n", help::AUTH_ABOUT)));
+        let examples = root
+            .split("\nEXAMPLES\n")
+            .nth(1)
+            .and_then(|s| s.split("\nLEARN MORE\n").next())
+            .expect("root EXAMPLES");
+        assert!(
+            examples.starts_with(
+                "  # Get started with a personal access token from https://app.asana.com/0/my-apps\n  $ export ASANA_TOKEN=<token>\n  $ asana auth status\n  \n  # Work with tasks\n"
+            ),
+            "{examples}"
+        );
+        for line in examples.lines() {
+            assert!(
+                line == "  " || line.starts_with("  $ ") || line.starts_with("  # "),
+                "not an example line: {line:?}"
+            );
+        }
     }
 
     /// The flag gutter follows gh: on a screen where some flag has a short
@@ -1030,7 +1092,7 @@ TARGETED COMMANDS
 
         let r = run(&["asana", "help", "reference"]).expect("reference");
         assert_eq!(r.code, 0);
-        assert!(r.stdout.starts_with("# asana reference\n\n## `asana auth <command> [flags]`\n\nCheck authentication with Asana\n\n### `asana auth status [flags]`\n\n"), "{}", r.stdout);
+        assert!(r.stdout.starts_with("# asana reference\n\n## `asana auth <command> [flags]`\n\nAuthenticate with Asana\n\n### `asana auth status [flags]`\n\n"), "{}", r.stdout);
         assert!(r.stdout.contains("\n## `asana task <command> [flags]`\n\nManage tasks\n\n### `asana task assign {<gid> | <url>} [<assignee>] [flags]`\n"), "{}", r.stdout);
         assert!(
             r.stdout.contains(
@@ -1045,12 +1107,18 @@ TARGETED COMMANDS
         assert!(!r.stdout.contains("--workspace"), "{}", r.stdout);
         assert!(r.stdout.ends_with("```\n\n"), "{}", r.stdout);
 
+        // Cobra's words, then the usage block after a blank line like every
+        // other usage error (`gh-errors/unknown-flag.txt`).
         let r = run(&["asana", "help", "nope"]).expect("unknown topic");
         assert_eq!(r.code, 1);
         assert!(r.stdout.is_empty());
-        assert!(r.stderr.starts_with(
-            "Unknown help topic [`nope`]\nUsage:  asana <command> <subcommand> [flags]\n"
-        ));
+        assert!(
+            r.stderr.starts_with(
+                "Unknown help topic [`nope`]\n\nUsage:  asana <command> <subcommand> [flags]\n\nAvailable commands:\n  auth\n"
+            ),
+            "{}",
+            r.stderr
+        );
 
         let r = run(&["asana", "version"]).expect("version");
         assert_eq!(r.code, 0);
