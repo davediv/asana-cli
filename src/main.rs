@@ -101,6 +101,9 @@ async fn run() -> i32 {
             return rendered.code;
         }
     };
+    // The command as typed (`["task", "view"]`), so an argument error can
+    // print that command's synopsis under itself.
+    let path = cli::command_path(&cli::command(), &argv);
 
     let Some(command) = cli.command else {
         print!("{}", cli::render_help(&[], &palette));
@@ -111,7 +114,7 @@ async fn run() -> i32 {
     // missing `--title` exits 1 whether or not it is authenticated.
     let interactive = is_tty && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     if let Err(err) = command.prevalidate(interactive) {
-        return emit(error::report(&err, None, &stderr_palette));
+        return emit(error::report(&err, &path, None, &stderr_palette));
     }
 
     // Commands that manage the token itself must run without one.
@@ -119,19 +122,19 @@ async fn run() -> i32 {
         Commands::Auth(AuthCmd::Login(args)) => {
             return match cmd::auth_login::run_login(args, &stderr_palette).await {
                 Ok(()) => EXIT_OK,
-                Err(err) => emit(error::report(&err, None, &stderr_palette)),
+                Err(err) => emit(error::report(&err, &path, None, &stderr_palette)),
             }
         }
         Commands::Auth(AuthCmd::Logout(args)) => {
             return match cmd::auth_login::run_logout(args, &stderr_palette).await {
                 Ok(()) => EXIT_OK,
-                Err(err) => emit(error::report(&err, None, &stderr_palette)),
+                Err(err) => emit(error::report(&err, &path, None, &stderr_palette)),
             }
         }
         Commands::Auth(AuthCmd::Token(args)) => {
             return match cmd::auth_login::run_token(args, &stderr_palette).await {
                 Ok(()) => EXIT_OK,
-                Err(err) => emit(error::report(&err, None, &stderr_palette)),
+                Err(err) => emit(error::report(&err, &path, None, &stderr_palette)),
             }
         }
         other => other,
@@ -167,6 +170,7 @@ async fn run() -> i32 {
         Ok(()) => EXIT_OK,
         Err(err) => emit(error::report(
             &err,
+            &path,
             Some(&ctx.config.token_source),
             &stderr_palette,
         )),
