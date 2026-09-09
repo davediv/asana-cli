@@ -22,8 +22,9 @@ use std::ffi::OsString;
 use clap::{ArgAction, Command, CommandFactory, Parser, Subcommand};
 
 use crate::cmd::{
-    auth_status, help, project_list, project_view, task_assign, task_comment, task_complete,
-    task_create, task_delete, task_list, task_view, workspace_list, Prevalidate as _,
+    auth_login, auth_status, help, project_list, project_view, task_assign, task_comment,
+    task_complete, task_create, task_delete, task_list, task_view, workspace_list,
+    Prevalidate as _,
 };
 use crate::render::Palette;
 
@@ -221,7 +222,10 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCmd {
+    Login(auth_login::LoginArgs),
+    Logout(auth_login::LogoutArgs),
     Status(auth_status::Args),
+    Token(auth_login::TokenArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -289,7 +293,10 @@ impl Commands {
             _ => {}
         }
         match self {
+            Commands::Auth(AuthCmd::Login(a)) => a.prevalidate(interactive),
+            Commands::Auth(AuthCmd::Logout(a)) => a.prevalidate(interactive),
             Commands::Auth(AuthCmd::Status(a)) => a.prevalidate(interactive),
+            Commands::Auth(AuthCmd::Token(a)) => a.prevalidate(interactive),
             Commands::Workspace(WorkspaceCmd::List(a)) => a.prevalidate(interactive),
             Commands::Project(ProjectCmd::List(a)) => a.prevalidate(interactive),
             Commands::Project(ProjectCmd::View(a)) => a.prevalidate(interactive),
@@ -1065,7 +1072,7 @@ TARGETED COMMANDS
         let auth = help(&["auth"], &p);
         assert!(
             auth.contains(
-                "\nUSAGE\n  asana auth <command> [flags]\n\nAVAILABLE COMMANDS\n  status:        "
+                "\nUSAGE\n  asana auth <command> [flags]\n\nAVAILABLE COMMANDS\n  login:         "
             ),
             "{auth}"
         );
@@ -1102,7 +1109,7 @@ USAGE
   asana auth <command> [flags]
 
 AVAILABLE COMMANDS
-  status:        ";
+  login:         ";
         assert!(auth.starts_with(expected_head), "{auth}");
         assert_eq!(render_help_at(&["auth".to_string()], &p, 80), auth);
         assert!(
@@ -1450,7 +1457,7 @@ EXAMPLES
 
         let r = run(&["asana", "help", "reference"]).expect("reference");
         assert_eq!(r.code, 0);
-        assert!(r.stdout.starts_with("# asana reference\n\n## `asana auth <command> [flags]`\n\nAuthenticate with Asana\n\n### `asana auth status [flags]`\n\n"), "{}", r.stdout);
+        assert!(r.stdout.starts_with("# asana reference\n\n## `asana auth <command> [flags]`\n\nAuthenticate with Asana\n\n### `asana auth login [flags]`\n\n"), "{}", r.stdout);
         assert!(r.stdout.contains("\n## `asana task <command> [flags]`\n\nManage tasks\n\n### `asana task assign {<gid> | <url>} [<assignee>] [flags]`\n"), "{}", r.stdout);
         assert!(
             r.stdout.contains(

@@ -138,7 +138,11 @@ impl View {
         self.current_status_update
             .as_ref()
             .and_then(|s| s.title.as_deref())
-            .or_else(|| self.current_status.as_ref().and_then(|s| s.title.as_deref()))
+            .or_else(|| {
+                self.current_status
+                    .as_ref()
+                    .and_then(|s| s.title.as_deref())
+            })
             .map(str::trim)
             .filter(|t| !t.is_empty())
     }
@@ -252,7 +256,10 @@ fn parse_project_gid(input: &str) -> Option<String> {
         .map(|it| it.filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
     if let Some(pos) = segs.iter().position(|s| *s == "project") {
-        return segs.get(pos + 1).filter(|g| is_gid(g)).map(|g| g.to_string());
+        return segs
+            .get(pos + 1)
+            .filter(|g| is_gid(g))
+            .map(|g| g.to_string());
     }
     if segs.first() == Some(&"0") {
         return segs
@@ -317,7 +324,10 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let counts = counts.unwrap_or_default();
 
     if ctx.is_tty {
-        print!("{}", render_tty(&view, &counts, ctx.width, ctx.color, now()));
+        print!(
+            "{}",
+            render_tty(&view, &counts, ctx.width, ctx.color, now())
+        );
     } else {
         print!("{}", render_piped(&view, &counts));
     }
@@ -392,14 +402,20 @@ fn render_tty(v: &View, counts: &Counts, width: usize, color: bool, now: DateTim
         line(&mut out, &format!("{}{}", p.bold("Team: "), team.display()));
     }
     if !v.members.is_empty() {
-        line(&mut out, &format!("{}{}", p.bold("Members: "), member_list(&v.members)));
+        line(
+            &mut out,
+            &format!("{}{}", p.bold("Members: "), member_list(&v.members)),
+        );
     }
 
     out.push('\n');
     out.push('\n');
     let body = notes::render(v.html_notes.as_deref(), v.notes.as_deref(), width, color);
     if body.is_empty() {
-        line(&mut out, &format!("  {}", p.muted("No description provided")));
+        line(
+            &mut out,
+            &format!("  {}", p.muted("No description provided")),
+        );
     } else {
         line(&mut out, &body);
     }
@@ -439,11 +455,19 @@ fn render_piped(v: &View, counts: &Counts) -> String {
     kv("state", state(v).0.to_uppercase());
     kv(
         "owner",
-        v.owner.as_ref().map(|o| o.display()).unwrap_or("").to_string(),
+        v.owner
+            .as_ref()
+            .map(|o| o.display())
+            .unwrap_or("")
+            .to_string(),
     );
     kv(
         "team",
-        v.team.as_ref().map(|t| t.display()).unwrap_or("").to_string(),
+        v.team
+            .as_ref()
+            .map(|t| t.display())
+            .unwrap_or("")
+            .to_string(),
     );
     kv(
         "members",
@@ -515,7 +539,9 @@ mod tests {
     }
 
     fn at() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 9, 9, 10, 0, 0).single().expect("time")
+        Utc.with_ymd_and_hms(2026, 9, 9, 10, 0, 0)
+            .single()
+            .expect("time")
     }
 
     #[test]
@@ -532,7 +558,10 @@ mod tests {
             lines[1],
             "Active • owned by Div • updated about 2 hours ago • 10 of 12 tasks open"
         );
-        assert_eq!(lines[2], "Status: On track — Status Update - Sep 5 (about 4 days ago)");
+        assert_eq!(
+            lines[2],
+            "Status: On track — Status Update - Sep 5 (about 4 days ago)"
+        );
         assert!(lines[3].starts_with("Due: "), "{}", lines[3]);
         assert_eq!(lines[4], "Team: Engineering");
         assert_eq!(lines[5], "Members: Div, Alice");
@@ -569,10 +598,25 @@ mod tests {
         let counts = Counts::default();
         let out = render_tty(&sample(), &counts, 80, true, at());
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[0].starts_with("\x1b[0;1;39mRoadmap\x1b[0m"), "{:?}", lines[0]);
-        assert!(lines[1].starts_with("\x1b[0;32mActive\x1b[0m • owned by Div"), "{:?}", lines[1]);
-        assert!(lines[2].starts_with("\x1b[0;1;39mStatus: \x1b[0m\x1b[0;32mOn track\x1b[0m"), "{:?}", lines[2]);
-        assert!(lines.last().unwrap().starts_with("\x1b[38;5;242mView this project in Asana:"));
+        assert!(
+            lines[0].starts_with("\x1b[0;1;39mRoadmap\x1b[0m"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("\x1b[0;32mActive\x1b[0m • owned by Div"),
+            "{:?}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with("\x1b[0;1;39mStatus: \x1b[0m\x1b[0;32mOn track\x1b[0m"),
+            "{:?}",
+            lines[2]
+        );
+        assert!(lines
+            .last()
+            .unwrap()
+            .starts_with("\x1b[38;5;242mView this project in Asana:"));
     }
 
     #[test]
@@ -665,7 +709,10 @@ mod tests {
         );
         assert_eq!(parse_project_gid("Roadmap"), None);
         assert_eq!(parse_project_gid("12a"), None);
-        assert_eq!(parse_project_gid("https://app.asana.com/0/0/1211234567890123"), None);
+        assert_eq!(
+            parse_project_gid("https://app.asana.com/0/0/1211234567890123"),
+            None
+        );
         assert_eq!(parse_project_gid("ftp://app.asana.com/0/123/list"), None);
     }
 }

@@ -2,6 +2,7 @@
 //! its help text, implementing `Prevalidate`) and `run(ctx, args)`. Shared
 //! little helpers live here: the spinner, prompts, browser, JSON, permalinks.
 
+pub mod auth_login;
 pub mod auth_status;
 pub mod help;
 pub mod project_list;

@@ -114,6 +114,29 @@ async fn run() -> i32 {
         return emit(error::report(&err, None, &stderr_palette));
     }
 
+    // Commands that manage the token itself must run without one.
+    let command = match command {
+        Commands::Auth(AuthCmd::Login(args)) => {
+            return match cmd::auth_login::run_login(args, &stderr_palette).await {
+                Ok(()) => EXIT_OK,
+                Err(err) => emit(error::report(&err, None, &stderr_palette)),
+            }
+        }
+        Commands::Auth(AuthCmd::Logout(args)) => {
+            return match cmd::auth_login::run_logout(args, &stderr_palette).await {
+                Ok(()) => EXIT_OK,
+                Err(err) => emit(error::report(&err, None, &stderr_palette)),
+            }
+        }
+        Commands::Auth(AuthCmd::Token(args)) => {
+            return match cmd::auth_login::run_token(args, &stderr_palette).await {
+                Ok(()) => EXIT_OK,
+                Err(err) => emit(error::report(&err, None, &stderr_palette)),
+            }
+        }
+        other => other,
+    };
+
     let config = match config::load(cli.workspace.clone()) {
         Ok(c) => c,
         Err(err) => return emit(error::report_config(&err)),
@@ -153,6 +176,9 @@ async fn run() -> i32 {
 async fn dispatch(ctx: &Ctx, command: Commands) -> anyhow::Result<()> {
     match command {
         Commands::Auth(AuthCmd::Status(args)) => cmd::auth_status::run(ctx, args).await,
+        Commands::Auth(AuthCmd::Login(_) | AuthCmd::Logout(_) | AuthCmd::Token(_)) => {
+            unreachable!("handled before the token is loaded")
+        }
         Commands::Workspace(WorkspaceCmd::List(args)) => cmd::workspace_list::run(ctx, args).await,
         Commands::Project(ProjectCmd::List(args)) => cmd::project_list::run(ctx, args).await,
         Commands::Project(ProjectCmd::View(args)) => cmd::project_view::run(ctx, args).await,

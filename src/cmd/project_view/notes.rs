@@ -73,9 +73,9 @@ fn decode_entities(s: &str) -> String {
             "quot" => Some('"'),
             "apos" => Some('\''),
             "nbsp" => Some('\u{a0}'),
-            e if e.starts_with("#x") || e.starts_with("#X") => {
-                u32::from_str_radix(&e[2..], 16).ok().and_then(char::from_u32)
-            }
+            e if e.starts_with("#x") || e.starts_with("#X") => u32::from_str_radix(&e[2..], 16)
+                .ok()
+                .and_then(char::from_u32),
             e if e.starts_with('#') => e[1..].parse::<u32>().ok().and_then(char::from_u32),
             _ => None,
         };
@@ -186,7 +186,10 @@ struct Builder {
 enum Container {
     Root(Vec<Block>),
     Item(Vec<Block>),
-    List { ordered: bool, items: Vec<Vec<Block>> },
+    List {
+        ordered: bool,
+        items: Vec<Vec<Block>>,
+    },
     Quote(Vec<Block>),
     Heading(u8),
     Table(Vec<Vec<Vec<Inline>>>),
@@ -379,7 +382,8 @@ impl Builder {
                 };
                 self.inline.push(Inline::Text(label, style));
                 if let Some(src) = src {
-                    self.inline.push(Inline::Text(" ".to_string(), Style::default()));
+                    self.inline
+                        .push(Inline::Text(" ".to_string(), Style::default()));
                     self.inline.push(Inline::Text(
                         src,
                         Style {
@@ -536,7 +540,10 @@ impl Builder {
         let text = text.trim();
         let same = text == href
             || text == href.trim_end_matches('/')
-            || text == href.trim_start_matches("https://").trim_start_matches("http://")
+            || text
+                == href
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
             || format!("{text}/") == href;
         if same {
             // Show it as a URL, not as link text.
@@ -674,7 +681,9 @@ fn words(line: &[&Inline], theme: &Theme) -> Vec<Vec<Frag>> {
     let mut out: Vec<Vec<Frag>> = Vec::new();
     let mut open = false; // the last word can still grow
     for item in line {
-        let Inline::Text(text, style) = item else { continue };
+        let Inline::Text(text, style) = item else {
+            continue;
+        };
         if style.code {
             let chip = if theme.color {
                 format!(" {} ", text.trim())
@@ -1001,12 +1010,16 @@ mod tests {
             assert!(UnicodeWidthStr::width(line) <= 22, "{line:?}");
             assert!(line.starts_with("  "));
         }
-        assert_eq!(out, "  one two three four\n  five six seven eight\n  nine ten");
+        assert_eq!(
+            out,
+            "  one two three four\n  five six seven eight\n  nine ten"
+        );
     }
 
     #[test]
     fn long_words_are_cut() {
-        let html = "<body>see https://example.com/a/very/long/path/that/never/ends/at/all ok</body>";
+        let html =
+            "<body>see https://example.com/a/very/long/path/that/never/ends/at/all ok</body>";
         let out = plain(html, 30);
         for line in out.lines() {
             assert!(UnicodeWidthStr::width(line) <= 30, "{line:?}");
@@ -1016,7 +1029,8 @@ mod tests {
 
     #[test]
     fn urls_as_link_text_are_not_doubled() {
-        let html = "<body>See <a href=\"https://example.com/x\">https://example.com/x</a> now</body>";
+        let html =
+            "<body>See <a href=\"https://example.com/x\">https://example.com/x</a> now</body>";
         assert_eq!(plain(html, 80), "  See https://example.com/x now");
         let mention = "<body>Ask <a data-asana-gid=\"1\" data-asana-type=\"user\" href=\"https://app.asana.com/0/1\">Div</a> today</body>";
         assert_eq!(plain(mention, 80), "  Ask Div today");
@@ -1034,8 +1048,14 @@ mod tests {
 
     #[test]
     fn entities_and_plain_fallback() {
-        assert_eq!(plain("<body>a &amp; b &lt;c&gt; &#39;d&#39;</body>", 80), "  a & b <c> 'd'");
-        assert_eq!(render(None, Some("hello\nworld\n\nagain"), 80, false), "  hello\n  world\n\n  again");
+        assert_eq!(
+            plain("<body>a &amp; b &lt;c&gt; &#39;d&#39;</body>", 80),
+            "  a & b <c> 'd'"
+        );
+        assert_eq!(
+            render(None, Some("hello\nworld\n\nagain"), 80, false),
+            "  hello\n  world\n\n  again"
+        );
         assert_eq!(render(None, None, 80, false), "");
         assert_eq!(render(Some("<body></body>"), Some("  "), 80, false), "");
         assert_eq!(render(Some("<body>\n\n</body>"), None, 80, false), "");
@@ -1051,7 +1071,10 @@ mod tests {
     fn colour_uses_glamour_sequences() {
         let html = "<body>use <code>gh</code> and <strong>bold</strong> <a href=\"https://x.y\">link</a></body>";
         let out = render(Some(html), None, 80, true);
-        assert!(out.contains("\x1b[38;5;203;48;5;236m gh \x1b[0m"), "{out:?}");
+        assert!(
+            out.contains("\x1b[38;5;203;48;5;236m gh \x1b[0m"),
+            "{out:?}"
+        );
         assert!(out.contains("\x1b[38;5;252;1mbold\x1b[0m"), "{out:?}");
         assert!(out.contains("\x1b[38;5;35;1mlink\x1b[0m"), "{out:?}");
         assert!(out.contains("\x1b[38;5;30;4mhttps://x.y\x1b[0m"), "{out:?}");
@@ -1082,7 +1105,10 @@ mod tests {
     fn list_continuations_hang_under_the_text() {
         let html = "<body><ul><li>alpha beta gamma delta epsilon zeta eta theta</li></ul></body>";
         let out = render(Some(html), None, 30, false);
-        assert_eq!(out, "  • alpha beta gamma delta\n    epsilon zeta eta theta");
+        assert_eq!(
+            out,
+            "  • alpha beta gamma delta\n    epsilon zeta eta theta"
+        );
         for line in out.lines() {
             assert!(UnicodeWidthStr::width(line) <= 30, "{line:?}");
         }
@@ -1091,6 +1117,9 @@ mod tests {
     #[test]
     fn images_and_breaks() {
         let html = "<body>Look:<br><img alt=\"diagram\" src=\"https://img/1.png\"></body>";
-        assert_eq!(plain(html, 80), "  Look:\n  Image: diagram → https://img/1.png");
+        assert_eq!(
+            plain(html, 80),
+            "  Look:\n  Image: diagram → https://img/1.png"
+        );
     }
 }
