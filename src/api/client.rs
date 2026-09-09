@@ -26,8 +26,9 @@ pub enum ApiError {
     /// 403: the token works but may not touch this object.
     #[error("HTTP 403: {message} ({url})")]
     Forbidden { message: String, url: String },
-    /// 404: Asana's own message, e.g. `task: Unknown object: 123`.
-    #[error("{message}")]
+    /// 404: Asana's own message, e.g. `task: Unknown object: 123`, in the
+    /// same `HTTP <status>: <message> (<url>)` shape gh gives REST errors.
+    #[error("HTTP 404: {message} ({url})")]
     NotFound { message: String, url: String },
     /// 400, 402, 5xx and anything else: Asana's message with the status.
     #[error("HTTP {status}: {message} ({url})")]
@@ -36,10 +37,12 @@ pub enum ApiError {
         message: String,
         url: String,
     },
-    /// 429 twice in a row.
-    #[error("HTTP 429: rate limited by Asana; try again in {retry_after}s")]
+    /// 429 twice in a row (the first one was retried after `Retry-After`).
+    #[error("HTTP 429: Rate Limit Enforced; try again in {retry_after}s")]
     RateLimited { retry_after: u64 },
-    /// Could not reach app.asana.com at all.
+    /// Could not reach app.asana.com at all (DNS, connect, TLS, timeout, or
+    /// the connection dropped mid-response). `main` prints the host and the
+    /// innermost reason.
     #[error("error connecting to app.asana.com")]
     Network(#[from] reqwest::Error),
     /// The body was not the JSON we expected.
@@ -286,7 +289,11 @@ fn error_message(body: &str, status: StatusCode) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
     use super::*;
+    use crate::api::types::{Named, Task};
 
     #[test]
     fn error_message_prefers_asana_text() {
@@ -298,6 +305,10 @@ mod tests {
         assert_eq!(
             error_message("<html>", StatusCode::BAD_GATEWAY),
             "Bad Gateway"
+        );
+        assert_eq!(
+            error_message(r#"{"errors":[{"message":"  "}]}"#, StatusCode::IM_A_TEAPOT),
+            "I'm a teapot"
         );
     }
 
@@ -312,5 +323,310 @@ mod tests {
             shown_url("https://x/api/1.0/tasks", &[]),
             "https://x/api/1.0/tasks"
         );
+    }
+
+    #[test]
+    fn errors_display_like_gh() {
+        let e = ApiError::NotFound {
+            message: "task: Unknown object: 1".into(),
+            url: "https://app.asana.com/api/1.0/tasks/1".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "HTTP 404: task: Unknown object: 1 (https://app.asana.com/api/1.0/tasks/1)"
+        );
+        let e = ApiError::Unauthorized {
+            message: "Not Authorized".into(),
+            url: "https://app.asana.com/api/1.0/users/me".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "HTTP 401: Not Authorized (https://app.asana.com/api/1.0/users/me)"
+        );
+        let e = ApiError::Status {
+            status: 402,
+            message: "Payment Required".into(),
+            url: "u".into(),
+        };
+        assert_eq!(e.to_string(), "HTTP 402: Payment Required (u)");
+    }
+
+    /// One canned HTTP response.
+    struct Canned {
+        status: u16,
+        headers: Vec<(&'static str, String)>,
+        body: String,
+    }
+
+    fn canned(status: u16, body: &str) -> Canned {
+        Canned {
+            status,
+            headers: Vec::new(),
+            body: body.to_string(),
+        }
+    }
+
+    fn asana_error(status: u16, message: &str) -> Canned {
+        canned(
+            status,
+            &serde_json::json!({ "errors": [{ "message": message, "help": "see the docs" }] })
+                .to_string(),
+        )
+    }
+
+    /// A one-thread HTTP/1.1 server that answers each connection with the
+    /// next canned response and records the request lines it saw.
+    fn serve(responses: Vec<Canned>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for resp in responses {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let head_end = loop {
+                    let n = stream.read(&mut chunk).expect("read");
+                    if n == 0 {
+                        break buf.len();
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let content_length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buf.len() < head_end + content_length {
+                    let n = stream.read(&mut chunk).expect("read body");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let request_line = head.lines().next().unwrap_or("").to_string();
+                let auth = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default();
+                let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
+                seen.push(format!("{request_line} | {auth} | {body}"));
+                let mut out = format!(
+                    "HTTP/1.1 {} Whatever\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    resp.status,
+                    resp.body.len()
+                );
+                for (k, v) in &resp.headers {
+                    out.push_str(&format!("{k}: {v}\r\n"));
+                }
+                out.push_str("\r\n");
+                out.push_str(&resp.body);
+                stream.write_all(out.as_bytes()).expect("write");
+                stream.flush().expect("flush");
+            }
+            seen
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn get_unwraps_data_and_sends_bearer_token() {
+        let (base, server) = serve(vec![canned(200, r#"{"data":{"gid":"7","name":"Seven"}}"#)]);
+        let client = Client::with_base(&base, "tok").unwrap();
+        let task: Task = client
+            .get("/tasks/7", &[("opt_fields", "name")])
+            .await
+            .unwrap();
+        assert_eq!(task.gid, "7");
+        assert_eq!(task.name.as_deref(), Some("Seven"));
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0]
+                .starts_with("GET /tasks/7?opt_fields=name HTTP/1.1 | authorization: Bearer tok |"),
+            "{}",
+            seen[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn statuses_map_to_variants_with_asana_message() {
+        let cases: Vec<(u16, &str)> = vec![
+            (401, "Not Authorized"),
+            (403, "Forbidden"),
+            (404, "task: Unknown object: 1"),
+            (400, "Not a recognized ID: x"),
+            (500, "Server Error"),
+        ];
+        let (base, server) = serve(cases.iter().map(|(s, m)| asana_error(*s, m)).collect());
+        let client = Client::with_base(&base, "tok").unwrap();
+        for (status, message) in &cases {
+            let err = client
+                .get::<Value>("/tasks/1", &[("opt_fields", "name"), ("workspace", "9")])
+                .await
+                .unwrap_err();
+            let url = format!("{base}/tasks/1?workspace=9");
+            match (status, &err) {
+                (401, ApiError::Unauthorized { message: m, url: u })
+                | (403, ApiError::Forbidden { message: m, url: u })
+                | (404, ApiError::NotFound { message: m, url: u }) => {
+                    assert_eq!(m, message);
+                    assert_eq!(u, &url);
+                }
+                (
+                    s,
+                    ApiError::Status {
+                        status,
+                        message: m,
+                        url: u,
+                    },
+                ) => {
+                    assert_eq!(status, s);
+                    assert_eq!(m, message);
+                    assert_eq!(u, &url);
+                }
+                other => panic!("unexpected mapping: {other:?}"),
+            }
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_json_error_body_falls_back_to_reason_phrase() {
+        let (base, server) = serve(vec![canned(502, "<html>bad gateway</html>")]);
+        let client = Client::with_base(&base, "tok").unwrap();
+        let err = client.get::<Value>("/tasks", &[]).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("HTTP 502: Bad Gateway ({base}/tasks)")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn success_with_bad_json_is_a_decode_error() {
+        let (base, server) = serve(vec![canned(200, "{not json")]);
+        let client = Client::with_base(&base, "tok").unwrap();
+        let err = client.get::<Value>("/tasks", &[]).await.unwrap_err();
+        assert!(matches!(err, ApiError::Decode { .. }), "{err:?}");
+        assert!(err
+            .to_string()
+            .starts_with(&format!("could not parse the response from {base}/tasks: ")));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_is_retried_once() {
+        let mut first = asana_error(429, "Rate Limit Enforced");
+        first.headers.push(("Retry-After", "0".to_string()));
+        let (base, server) = serve(vec![first, canned(200, r#"{"data":{"gid":"1"}}"#)]);
+        let client = Client::with_base(&base, "tok").unwrap();
+        let task: Task = client.get("/tasks/1", &[]).await.unwrap();
+        assert_eq!(task.gid, "1");
+        assert_eq!(server.join().unwrap().len(), 2);
+
+        let mut a = asana_error(429, "Rate Limit Enforced");
+        a.headers.push(("Retry-After", "0".to_string()));
+        let mut b = asana_error(429, "Rate Limit Enforced");
+        b.headers.push(("Retry-After", "42".to_string()));
+        let (base, server) = serve(vec![a, b]);
+        let client = Client::with_base(&base, "tok").unwrap();
+        let err = client.get::<Value>("/tasks/1", &[]).await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::RateLimited { retry_after: 42 }),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "HTTP 429: Rate Limit Enforced; try again in 42s"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_all_follows_next_page_and_honours_limit() {
+        let (base, server) = serve(vec![
+            canned(
+                200,
+                r#"{"data":[{"gid":"1"},{"gid":"2"}],"next_page":{"offset":"tok2","path":"/x","uri":"u"}}"#,
+            ),
+            canned(200, r#"{"data":[{"gid":"3"}],"next_page":null}"#),
+        ]);
+        let client = Client::with_base(&base, "tok").unwrap();
+        let all: Vec<Named> = client
+            .get_all("/tasks", &[("project", "9")], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|n| n.gid.as_str()).collect::<Vec<_>>(),
+            ["1", "2", "3"]
+        );
+        let seen = server.join().unwrap();
+        assert!(
+            seen[0].starts_with("GET /tasks?project=9&limit=100 HTTP/1.1"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[1].starts_with("GET /tasks?project=9&limit=100&offset=tok2 HTTP/1.1"),
+            "{}",
+            seen[1]
+        );
+
+        // A limit smaller than the first page stops after one request.
+        let (base, server) = serve(vec![canned(
+            200,
+            r#"{"data":[{"gid":"1"},{"gid":"2"}],"next_page":{"offset":"more"}}"#,
+        )]);
+        let client = Client::with_base(&base, "tok").unwrap();
+        let two: Vec<Named> = client.get_all("/tasks", &[], Some(2)).await.unwrap();
+        assert_eq!(two.len(), 2);
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].starts_with("GET /tasks?limit=2 HTTP/1.1"),
+            "{}",
+            seen[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn post_wraps_body_in_data() {
+        let (base, server) = serve(vec![canned(201, r#"{"data":{"gid":"5","name":"New"}}"#)]);
+        let client = Client::with_base(&base, "tok").unwrap();
+        let task: Task = client
+            .post("/tasks", serde_json::json!({ "name": "New" }))
+            .await
+            .unwrap();
+        assert_eq!(task.gid, "5");
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /tasks HTTP/1.1"), "{}", seen[0]);
+        assert!(
+            seen[0].ends_with(r#"| {"data":{"name":"New"}}"#),
+            "{}",
+            seen[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_refused_is_a_network_error() {
+        // Bind and drop so the port is (almost certainly) closed.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = Client::with_base(&format!("http://127.0.0.1:{port}"), "tok").unwrap();
+        let err = client.get::<Value>("/tasks", &[]).await.unwrap_err();
+        assert!(matches!(err, ApiError::Network(_)), "{err:?}");
     }
 }

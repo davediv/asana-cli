@@ -1,11 +1,17 @@
 //! `asana`: parse the command line, dispatch, and turn errors into gh-style
 //! messages and exit codes (0 ok, 1 error, 2 cancelled, 4 auth).
+//!
+//! The wording of every error lives in `error.rs`; this file only decides
+//! the order things happen in: clap first (so `--help`, typos and missing
+//! arguments never need a token), then the cheap identifier checks, then the
+//! token and workspace, then the command itself.
 
 mod api;
 mod cli;
 mod cmd;
 mod config;
 mod ctx;
+mod error;
 mod render;
 mod resolve;
 
@@ -14,19 +20,11 @@ use std::io::{IsTerminal, Write};
 
 use clap::Parser;
 
-use crate::api::ApiError;
-use crate::cli::{
-    AuthCmd, Cancelled, Cli, Commands, ProjectCmd, SilentExit, TaskCmd, UsageError, WorkspaceCmd,
-};
-use crate::config::ConfigError;
+use crate::cli::{AuthCmd, Cli, Commands, ProjectCmd, TaskCmd, WorkspaceCmd};
 use crate::ctx::Ctx;
+use crate::error::{Report, EXIT_ERROR, EXIT_OK};
 use crate::render::color::should_color;
 use crate::render::Palette;
-
-const EXIT_OK: i32 = 0;
-const EXIT_ERROR: i32 = 1;
-const EXIT_CANCELLED: i32 = 2;
-const EXIT_AUTH: i32 = 4;
 
 fn terminal_width() -> usize {
     if let Some((terminal_size::Width(w), _)) = terminal_size::terminal_size() {
@@ -41,7 +39,28 @@ fn terminal_width() -> usize {
         .unwrap_or(80)
 }
 
+/// Rust ignores SIGPIPE and turns a closed pipe into a panic in `println!`
+/// ("failed printing to stdout: Broken pipe"). Restore the default so
+/// `asana task list | head -1` ends quietly, the way gh does.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    // SAFETY: `signal(2)` with the default disposition has no preconditions;
+    // it is called once, before any other thread exists.
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() {
+    reset_sigpipe();
     let code = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -54,6 +73,13 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Print a report on stderr and hand back its exit code.
+fn emit(report: Report) -> i32 {
+    eprint!("{}", report.stderr);
+    let _ = std::io::stderr().flush();
+    report.code
+}
+
 async fn run() -> i32 {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let is_tty = std::io::stdout().is_terminal();
@@ -63,8 +89,9 @@ async fn run() -> i32 {
     let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
         Err(err) => {
-            let rendered = cli::render_clap_error(&err, &argv, &palette);
+            let rendered = error::render_clap_error(&err, &argv, &palette);
             print!("{}", rendered.stdout);
+            let _ = std::io::stdout().flush();
             eprint!("{}", rendered.stderr);
             return rendered.code;
         }
@@ -75,18 +102,12 @@ async fn run() -> i32 {
         return EXIT_OK;
     };
     if let Err(err) = command.prevalidate() {
-        return report(&err);
+        return emit(error::report(&err, None));
     }
 
     let config = match config::load(cli.workspace.clone()) {
         Ok(c) => c,
-        Err(err) => {
-            eprintln!("{err}");
-            return match err {
-                ConfigError::MissingToken(_) => EXIT_AUTH,
-                _ => EXIT_ERROR,
-            };
-        }
+        Err(err) => return emit(error::report_config(&err)),
     };
     let base = std::env::var("ASANA_BASE_URL")
         .ok()
@@ -112,7 +133,7 @@ async fn run() -> i32 {
 
     match dispatch(&ctx, command).await {
         Ok(()) => EXIT_OK,
-        Err(err) => report(&err),
+        Err(err) => emit(error::report(&err, Some(&ctx.config.token_source))),
     }
 }
 
@@ -130,72 +151,5 @@ async fn dispatch(ctx: &Ctx, command: Commands) -> anyhow::Result<()> {
         Commands::Task(TaskCmd::Assign(args)) => cmd::task_assign::run(ctx, args).await,
         Commands::Task(TaskCmd::Comment(args)) => cmd::task_comment::run(ctx, args).await,
         Commands::Task(TaskCmd::Delete(args)) => cmd::task_delete::run(ctx, args).await,
-    }
-}
-
-/// Print a runtime error the way gh does: one or two lines, no usage dump
-/// (except for usage errors), and pick the exit code.
-fn report(err: &anyhow::Error) -> i32 {
-    if let Some(usage) = err.downcast_ref::<UsageError>() {
-        eprintln!("{}\n", usage.message);
-        eprint!("{}", cli::usage_block(&usage.path));
-        return EXIT_ERROR;
-    }
-    if err.downcast_ref::<Cancelled>().is_some() {
-        return EXIT_CANCELLED;
-    }
-    if let Some(silent) = err.downcast_ref::<SilentExit>() {
-        return silent.0;
-    }
-    if let Some(api) = err.downcast_ref::<ApiError>() {
-        return report_api(api);
-    }
-    if let Some(cfg) = err.downcast_ref::<ConfigError>() {
-        eprintln!("{cfg}");
-        return match cfg {
-            ConfigError::MissingToken(_) => EXIT_AUTH,
-            _ => EXIT_ERROR,
-        };
-    }
-    eprintln!("{err:#}");
-    EXIT_ERROR
-}
-
-fn report_api(err: &ApiError) -> i32 {
-    match err {
-        ApiError::Unauthorized { .. } => {
-            eprintln!("{err}");
-            eprintln!(
-                "Try setting {} to a valid personal access token from {}",
-                config::TOKEN_ENV,
-                config::PAT_URL
-            );
-            EXIT_AUTH
-        }
-        ApiError::Network(source) => {
-            eprintln!(
-                "error connecting to app.asana.com: {}",
-                network_reason(source)
-            );
-            eprintln!("check your internet connection or https://status.asana.com");
-            EXIT_ERROR
-        }
-        other => {
-            eprintln!("{other}");
-            EXIT_ERROR
-        }
-    }
-}
-
-/// The innermost reason of a reqwest error, without the "error sending request for url" wrapper.
-fn network_reason(err: &reqwest::Error) -> String {
-    let mut cur: &dyn std::error::Error = err;
-    while let Some(next) = cur.source() {
-        cur = next;
-    }
-    if err.is_timeout() {
-        "timed out".to_string()
-    } else {
-        cur.to_string()
     }
 }
