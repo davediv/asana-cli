@@ -4,9 +4,10 @@
 //! All three run before a token is required, so they never fail with the
 //! "set ASANA_TOKEN" error. `login` takes a personal access token from a
 //! prompt or, with `--with-token`, from standard input, checks it against
-//! `/users/me`, and stores it in the config file (mode 600, other keys and
-//! comments kept); `logout` removes it; `token` prints whichever token every
-//! other command would use.
+//! `/users/me`, and stores it through `config::save_login` (mode 600, other
+//! keys and comments kept); `logout` removes it through
+//! `config::remove_token`; `token` prints whichever token every other
+//! command would use.
 //!
 //! What each prints, and the references it is judged against:
 //!
@@ -26,8 +27,11 @@
 //! ...
 //! [exit 1]
 //!
+//! $ asana auth logout
+//! ✓ Logged out of app.asana.com account Dave Div
+//!
 //! $ asana auth logout                                       (gh-errors/auth-logout-none)
-//! not logged in to app.asana.com
+//! You are not logged in to app.asana.com. To log in, run: asana auth login
 //! [exit 1]
 //!
 //! $ asana auth token                                        (gh-errors/auth-status-none)
@@ -35,32 +39,33 @@
 //! [exit 1]
 //! ```
 //!
+//! The not-logged-in state speaks with one voice: `logout` and `token`
+//! print the same sentence, the one `gh auth status` uses, next step
+//! included, rather than gh's bare `not logged in to any hosts` for one and
+//! the sentence for the other. Both exit 1, as gh does: a logout that
+//! removed nothing did not do what was asked, and a script that wants a
+//! no-op logout writes `asana auth logout 2>/dev/null || true`, the way it
+//! would for `rm`.
+//!
 //! The account name is kept beside the token (`user = "..."`) so `logout`
 //! can say whose token it removed, the way `gh auth logout` names the
 //! account, without a network call.
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
 use crate::api::{self, ApiError, User, USER_FIELDS};
 use crate::cli::{usage_error, Cancelled, SilentExit};
 use crate::cmd::{confirm, Prevalidate};
-use crate::config::{config_path, load, tilde, ConfigError, PAT_URL, TOKEN_ENV, TOKEN_ENV_ALT};
+use crate::config::{
+    base_url, host, load, remove_token, save_login, stored_login, tilde, ConfigError, PAT_URL,
+    TOKEN_ENV, TOKEN_ENV_ALT,
+};
 use crate::render::Palette;
 
 const EXIT_ERROR: i32 = 1;
 const EXIT_AUTH: i32 = 4;
-
-/// The host named in every line, as `gh` names `github.com`.
-const HOST: &str = "app.asana.com";
-
-/// The config keys `login` writes and `logout` removes. `config::load` reads
-/// `token`; `user` is the account name, for `logout`'s message and the
-/// "already logged in" question.
-const TOKEN_KEY: &str = "token";
-const USER_KEY: &str = "user";
 
 // ------------------------------------------------------------------- help
 
@@ -182,11 +187,10 @@ impl Prevalidate for TokenArgs {}
 
 /// `asana auth login`: take the token, check it, store it, say who it is.
 pub async fn run_login(args: LoginArgs, palette: &Palette) -> Result<()> {
-    let path = config_path();
     let token = if args.with_token {
         read_token_from_stdin()?
     } else {
-        match prompt_for_token(&path)? {
+        match prompt_for_token()? {
             Some(token) => token,
             // Declined to replace the stored token: nothing to do, like gh.
             None => return Ok(()),
@@ -194,7 +198,7 @@ pub async fn run_login(args: LoginArgs, palette: &Palette) -> Result<()> {
     };
     let user = validate(&token).await?;
     let name = account_name(&user);
-    write_token(&path, &token, Some(name.as_str()))?;
+    let path = save_login(&token, Some(name.as_str()))?;
     eprintln!(
         "{} Logged in to {} account {} ({})",
         palette.success_icon(),
@@ -212,43 +216,38 @@ pub async fn run_login(args: LoginArgs, palette: &Palette) -> Result<()> {
 }
 
 /// `asana auth logout`: remove the stored token, naming the account it
-/// belonged to; one line and exit 1 when there is none, like gh's `not
-/// logged in to any hosts`.
+/// belonged to. With nothing stored there is nothing to do: the
+/// not-logged-in line (or, when a variable is the login, what to unset)
+/// and exit 1, like gh.
 pub async fn run_logout(_args: LogoutArgs, palette: &Palette) -> Result<()> {
-    let path = config_path();
-    let host = host();
-    match remove_token(&path)? {
-        Some(removed) => {
-            match removed.user {
-                Some(user) => eprintln!(
-                    "{} Logged out of {host} account {}",
-                    palette.success_icon(),
-                    palette.bold(&user)
-                ),
-                None => eprintln!("{} Logged out of {host}", palette.success_icon()),
-            }
-            if let Some(var) = env_token_var() {
-                eprintln!(
-                    "{} The {var} environment variable is still set and will be used for authentication",
-                    palette.warning_icon()
-                );
-            }
-            Ok(())
-        }
-        None => {
-            eprintln!("not logged in to {host}");
-            if let Some(var) = env_token_var() {
-                eprintln!(
-                    "The {var} environment variable is being used for authentication; unset it to stop using it."
-                );
-            }
-            Err(SilentExit(EXIT_ERROR).into())
-        }
+    let Some(stored) = stored_login()? else {
+        return Err(nothing_to_log_out(palette));
+    };
+    if !remove_token()? {
+        // Gone between the read and the write: nothing to remove after all.
+        return Err(nothing_to_log_out(palette));
     }
+    let host = host();
+    match stored.user {
+        Some(user) => eprintln!(
+            "{} Logged out of {host} account {}",
+            palette.success_icon(),
+            palette.bold(&user)
+        ),
+        None => eprintln!("{} Logged out of {host}", palette.success_icon()),
+    }
+    if let Some(var) = env_token_var() {
+        eprintln!(
+            "{} The {var} environment variable is still set and will be used for authentication",
+            palette.warning_icon()
+        );
+    }
+    Ok(())
 }
 
 /// `asana auth token`: the token every other command uses, alone on stdout
-/// so it can be substituted into another command.
+/// so it can be substituted into another command. Without one, the same
+/// not-logged-in line as `logout`, exit 1.
 pub async fn run_token(_args: TokenArgs, palette: &Palette) -> Result<()> {
     match load(None) {
         Ok(cfg) => {
@@ -256,15 +255,39 @@ pub async fn run_token(_args: TokenArgs, palette: &Palette) -> Result<()> {
             Ok(())
         }
         Err(ConfigError::MissingToken(_)) => {
-            eprintln!(
-                "You are not logged in to {}. To log in, run: {}",
-                host(),
-                palette.bold("asana auth login")
-            );
+            eprintln!("{}", not_logged_in(palette));
             Err(SilentExit(EXIT_ERROR).into())
         }
         Err(err) => Err(err.into()),
     }
+}
+
+// --------------------------------------------------------------- messages
+
+/// The one sentence for the not-logged-in state, shared by `logout` and
+/// `token`: gh's `You are not logged into any GitHub hosts. To log in, run:
+/// gh auth login`, naming the host we would have asked, with the command in
+/// bold as gh paints it.
+fn not_logged_in(palette: &Palette) -> String {
+    format!(
+        "You are not logged in to {}. To log in, run: {}",
+        host(),
+        palette.bold("asana auth login")
+    )
+}
+
+/// `logout` found no stored token. Nothing was removed, so this is an
+/// error (exit 1, gh's `not logged in to any hosts`): the not-logged-in
+/// line, or, when an environment variable is what every command
+/// authenticates with, the variable to unset instead of a login to run.
+fn nothing_to_log_out(palette: &Palette) -> anyhow::Error {
+    match env_token_var() {
+        Some(var) => eprintln!(
+            "The {var} environment variable is being used for authentication; unset it to log out"
+        ),
+        None => eprintln!("{}", not_logged_in(palette)),
+    }
+    SilentExit(EXIT_ERROR).into()
 }
 
 // ------------------------------------------------------------- validation
@@ -290,23 +313,6 @@ async fn validate(token: &str) -> Result<User> {
         }
         Err(err) => Err(err.into()),
     }
-}
-
-/// `ASANA_BASE_URL` when set (a mock server), else the production API.
-fn base_url() -> Option<String> {
-    std::env::var("ASANA_BASE_URL")
-        .ok()
-        .map(|b| b.trim().to_string())
-        .filter(|b| !b.is_empty())
-}
-
-/// `app.asana.com`, or the host of `ASANA_BASE_URL` when one is set, so the
-/// messages name the server that was actually asked.
-fn host() -> String {
-    base_url()
-        .and_then(|b| url::Url::parse(&b).ok())
-        .and_then(|u| u.host_str().map(str::to_string))
-        .unwrap_or_else(|| HOST.to_string())
 }
 
 /// The name to call the account by: the display name, else the email, else
@@ -351,8 +357,8 @@ fn read_token_from_stdin() -> Result<String> {
 /// flow: an "already logged in" question when a token is stored, the tip
 /// with the token page, then the hidden prompt. `None` when the user keeps
 /// the stored token.
-fn prompt_for_token(path: &Path) -> Result<Option<String>> {
-    if let Some(stored) = read_stored(path)? {
+fn prompt_for_token() -> Result<Option<String>> {
+    if let Some(stored) = stored_login()? {
         let who = stored.user.map(|u| format!(" as {u}")).unwrap_or_default();
         let question = format!(
             "You're already logged in to {}{who}. Do you want to re-authenticate?",
@@ -446,189 +452,6 @@ fn read_plain_line() -> Result<Option<String>> {
     Ok((n > 0).then_some(line))
 }
 
-// ------------------------------------------------------------ config file
-
-/// What `login` left in the config file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Stored {
-    /// The account name written beside the token, when there was one.
-    user: Option<String>,
-}
-
-/// The stored login, if the file holds a non-empty `token`.
-fn read_stored(path: &Path) -> Result<Option<Stored>> {
-    let Some(text) = read_config(path)? else {
-        return Ok(None);
-    };
-    let doc = parse(path, &text)?;
-    let has_token = doc
-        .get(TOKEN_KEY)
-        .and_then(toml::Value::as_str)
-        .is_some_and(|t| !t.trim().is_empty());
-    Ok(has_token.then(|| Stored {
-        user: user_of(&doc),
-    }))
-}
-
-fn user_of(doc: &toml::Table) -> Option<String> {
-    doc.get(USER_KEY)
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .map(str::to_string)
-}
-
-/// The file's text, or `None` when there is no file yet.
-fn read_config(path: &Path) -> Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("could not read {}", tilde(path))),
-    }
-}
-
-fn parse(path: &Path, text: &str) -> Result<toml::Table> {
-    text.parse()
-        .with_context(|| format!("could not parse {}", tilde(path)))
-}
-
-/// Store `token` (and the account name) in the config file, creating it
-/// readable only by the owner, and keeping every other key, comment and
-/// blank line where it was.
-fn write_token(path: &Path, token: &str, user: Option<&str>) -> Result<()> {
-    let text = read_config(path)?.unwrap_or_default();
-    let mut doc = parse(path, &text)?;
-    let edited = edit_top_level(&text, &[(TOKEN_KEY, Some(token)), (USER_KEY, user)]);
-    // A file the line editor cannot handle (a key spread over several
-    // lines) is rewritten from the parsed document instead, which keeps the
-    // keys but not the comments.
-    let text = match edited.parse::<toml::Table>() {
-        Ok(_) => edited,
-        Err(_) => {
-            doc.insert(TOKEN_KEY.into(), toml::Value::String(token.to_string()));
-            match user {
-                Some(u) => doc.insert(USER_KEY.into(), toml::Value::String(u.to_string())),
-                None => doc.remove(USER_KEY),
-            };
-            doc.to_string()
-        }
-    };
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", tilde(dir)))?;
-    }
-    write_private(path, &text).with_context(|| format!("could not write {}", tilde(path)))?;
-    Ok(())
-}
-
-/// Remove `token` and `user` from the config file. What was there, or
-/// `None` when no token was stored (the file is left alone then). A file
-/// with nothing else in it, which `login` created, is removed.
-fn remove_token(path: &Path) -> Result<Option<Stored>> {
-    let Some(text) = read_config(path)? else {
-        return Ok(None);
-    };
-    let mut doc = parse(path, &text)?;
-    let had_token = doc
-        .get(TOKEN_KEY)
-        .and_then(toml::Value::as_str)
-        .is_some_and(|t| !t.trim().is_empty());
-    if !had_token {
-        return Ok(None);
-    }
-    let stored = Stored {
-        user: user_of(&doc),
-    };
-    doc.remove(TOKEN_KEY);
-    doc.remove(USER_KEY);
-    let edited = edit_top_level(&text, &[(TOKEN_KEY, None), (USER_KEY, None)]);
-    let text = match edited.parse::<toml::Table>() {
-        Ok(_) => edited,
-        Err(_) => doc.to_string(),
-    };
-    if text.trim().is_empty() {
-        std::fs::remove_file(path).with_context(|| format!("could not remove {}", tilde(path)))?;
-    } else {
-        write_private(path, &text).with_context(|| format!("could not write {}", tilde(path)))?;
-    }
-    Ok(Some(stored))
-}
-
-/// Write the file so that only the owner can read it: created with mode
-/// 600, and set to 600 when it already existed with something wider.
-fn write_private(path: &Path, text: &str) -> io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(text.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-/// Set (or, with `None`, remove) top-level keys in a TOML document by
-/// editing its lines, so comments, blank lines and every other key stay as
-/// the user wrote them. A key's line is replaced in place (duplicates are
-/// dropped); a new key goes after the last top-level line, before the first
-/// `[table]` header. The result is not guaranteed to parse for exotic files;
-/// callers check it and fall back to a full rewrite.
-fn edit_top_level(text: &str, changes: &[(&str, Option<&str>)]) -> String {
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    for (key, value) in changes {
-        let mut in_root = true;
-        let mut end_of_root = 0;
-        let mut found = None;
-        let mut kept = Vec::with_capacity(lines.len());
-        for line in lines.drain(..) {
-            let trimmed = line.trim_start();
-            if in_root && trimmed.starts_with('[') {
-                in_root = false;
-            }
-            if in_root && is_key_line(trimmed, key) {
-                if found.is_none() {
-                    found = Some(kept.len());
-                    kept.push(String::new()); // placeholder, filled below
-                    end_of_root = kept.len();
-                }
-                continue;
-            }
-            if in_root && !trimmed.is_empty() {
-                end_of_root = kept.len() + 1;
-            }
-            kept.push(line);
-        }
-        lines = kept;
-        let assignment = value.map(|v| format!("{key} = {}", toml::Value::String(v.to_string())));
-        match (found, assignment) {
-            (Some(i), Some(line)) => lines[i] = line,
-            (Some(i), None) => {
-                lines.remove(i);
-            }
-            (None, Some(line)) => lines.insert(end_of_root.min(lines.len()), line),
-            (None, None) => {}
-        }
-    }
-    let mut out = lines.join("\n");
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out
-}
-
-/// `key = ...` (or `key=...`), and not `key_other = ...`.
-fn is_key_line(trimmed: &str, key: &str) -> bool {
-    trimmed
-        .strip_prefix(key)
-        .is_some_and(|rest| rest.trim_start().starts_with('='))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,142 +510,27 @@ mod tests {
         assert_eq!(account_name(&user(None, None)), "12345");
     }
 
+    /// gh's `auth status` sentence, naming our host, with only the command
+    /// painted (bold, like `reference/gh-errors/auth-status-none.ansi.txt`).
+    /// One line, no trailing period after the command, under 80 columns.
     #[test]
-    fn key_lines_match_the_key_only() {
-        assert!(is_key_line("token = \"x\"", "token"));
-        assert!(is_key_line("token=\"x\"", "token"));
-        assert!(!is_key_line("token_alt = \"x\"", "token"));
-        assert!(!is_key_line("# token = \"x\"", "token"));
-        assert!(!is_key_line("mytoken = 1", "token"));
-    }
-
-    #[test]
-    fn editing_keeps_comments_and_other_keys() {
-        let text = "# asana config\nworkspace = \"Personal\"\n\n[other]\ntoken = \"not ours\"\n";
-        let out = edit_top_level(text, &[("token", Some("2/1/abc")), ("user", Some("Dave"))]);
-        assert_eq!(
-            out,
-            "# asana config\nworkspace = \"Personal\"\ntoken = \"2/1/abc\"\nuser = \"Dave\"\n\n[other]\ntoken = \"not ours\"\n"
+    fn not_logged_in_is_one_sentence_with_the_next_step() {
+        let plain = not_logged_in(&Palette::off());
+        assert!(plain.starts_with("You are not logged in to "), "{plain}");
+        assert!(
+            plain.ends_with(". To log in, run: asana auth login"),
+            "{plain}"
         );
-        // Replace in place, dropping a duplicate.
-        let text = "token = \"old\"\nworkspace = \"P\"\ntoken=\"older\"\n";
-        let out = edit_top_level(text, &[("token", Some("new"))]);
-        assert_eq!(out, "token = \"new\"\nworkspace = \"P\"\n");
-        // Remove, leaving the rest untouched.
-        let out = edit_top_level(&out, &[("token", None), ("user", None)]);
-        assert_eq!(out, "workspace = \"P\"\n");
-        // From nothing.
-        assert_eq!(
-            edit_top_level("", &[("token", Some("t"))]),
-            "token = \"t\"\n"
+        assert!(!plain.contains('\n'), "{plain}");
+        assert!(plain.chars().count() < 80, "{plain}");
+        let painted = not_logged_in(&Palette::new(true));
+        assert!(
+            painted.ends_with("To log in, run: \x1b[0;1;39masana auth login\x1b[0m"),
+            "{painted}"
         );
-        assert_eq!(edit_top_level("", &[("token", None)]), "");
-        // Quotes and backslashes come out as TOML needs them (toml picks a
-        // literal string when that is simpler).
-        let out = edit_top_level("", &[("user", Some("Dave \"D\" \\ Div"))]);
-        assert!(out.starts_with("user = ") && out.ends_with('\n'), "{out}");
-        assert_eq!(
-            out.parse::<toml::Table>().unwrap()["user"].as_str(),
-            Some("Dave \"D\" \\ Div")
+        assert!(
+            !painted.starts_with('\x1b'),
+            "only the command is painted: {painted}"
         );
-    }
-
-    #[test]
-    fn write_creates_a_private_file_and_remove_deletes_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("asana").join("config.toml");
-        write_token(&path, "2/1/secret", Some("Dave Div")).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text, "token = \"2/1/secret\"\nuser = \"Dave Div\"\n");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "mode {mode:o}");
-        }
-        assert_eq!(
-            read_stored(&path).unwrap(),
-            Some(Stored {
-                user: Some("Dave Div".to_string())
-            })
-        );
-        assert_eq!(
-            remove_token(&path).unwrap(),
-            Some(Stored {
-                user: Some("Dave Div".to_string())
-            })
-        );
-        assert!(!path.exists(), "a file login created is removed with it");
-        assert_eq!(remove_token(&path).unwrap(), None);
-        assert_eq!(read_stored(&path).unwrap(), None);
-    }
-
-    #[test]
-    fn write_merges_with_existing_keys_and_fixes_permissions() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "# mine\nworkspace = \"Personal\"\ntoken = \"old\"\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        write_token(&path, "new", None).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "# mine\nworkspace = \"Personal\"\ntoken = \"new\"\n"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "mode {mode:o}");
-        }
-        // The stored login has no name; logout still succeeds.
-        assert_eq!(read_stored(&path).unwrap(), Some(Stored { user: None }));
-        assert_eq!(remove_token(&path).unwrap(), Some(Stored { user: None }));
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "# mine\nworkspace = \"Personal\"\n"
-        );
-    }
-
-    #[test]
-    fn remove_leaves_a_missing_or_tokenless_file_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        assert_eq!(remove_token(&path).unwrap(), None);
-        assert!(!path.exists());
-        std::fs::write(&path, "workspace = \"P\"\n").unwrap();
-        assert_eq!(remove_token(&path).unwrap(), None);
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "workspace = \"P\"\n"
-        );
-    }
-
-    #[test]
-    fn malformed_config_is_an_error_naming_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "token = \n").unwrap();
-        let err = write_token(&path, "t", None).unwrap_err();
-        assert!(err.to_string().starts_with("could not parse "), "{err}");
-        let err = remove_token(&path).unwrap_err();
-        assert!(err.to_string().starts_with("could not parse "), "{err}");
-    }
-
-    /// A file the line editor cannot follow (a multi-line value) is rewritten
-    /// from the parsed document, so the keys survive even if comments do not.
-    #[test]
-    fn exotic_files_fall_back_to_a_full_rewrite() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "token = \"\"\"\nold\n\"\"\"\nworkspace = \"P\"\n").unwrap();
-        write_token(&path, "new", Some("Dave")).unwrap();
-        let doc: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(doc["token"].as_str(), Some("new"));
-        assert_eq!(doc["user"].as_str(), Some("Dave"));
-        assert_eq!(doc["workspace"].as_str(), Some("P"));
     }
 }
