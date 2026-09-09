@@ -25,20 +25,8 @@ use crate::cli::{AuthCmd, Cli, Commands, ProjectCmd, TaskCmd, WorkspaceCmd};
 use crate::ctx::Ctx;
 use crate::error::{Report, EXIT_ERROR, EXIT_OK};
 use crate::render::color::should_color;
+use crate::render::text::terminal_width;
 use crate::render::Palette;
-
-fn terminal_width() -> usize {
-    if let Some((terminal_size::Width(w), _)) = terminal_size::terminal_size() {
-        if w > 0 {
-            return w as usize;
-        }
-    }
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|c| c.trim().parse::<usize>().ok())
-        .filter(|w| *w > 0)
-        .unwrap_or(80)
-}
 
 /// Rust ignores SIGPIPE and turns a closed pipe into a panic in `println!`
 /// ("failed printing to stdout: Broken pipe"). Restore the default so
@@ -86,9 +74,11 @@ async fn run() -> i32 {
     let is_tty = std::io::stdout().is_terminal();
     let no_color_flag = argv.iter().any(|a| a == "--no-color");
     let palette = Palette::for_stream(is_tty, no_color_flag);
-    // Errors go to stderr, so they are styled by stderr's own terminal-ness
-    // (never by stdout's): `asana task list 2>err.log` keeps the log clean,
-    // and `NO_COLOR`, `TERM=dumb` and `--no-color` switch it off as usual.
+    // Error reports are plain text like gh's; the status lines the auth
+    // commands print on stderr are styled by stderr's own terminal-ness
+    // (never by stdout's): `asana auth login 2>err.log` keeps the log
+    // clean, and `NO_COLOR`, `TERM=dumb` and `--no-color` switch it off as
+    // usual.
     let stderr_palette = Palette::for_stream(std::io::stderr().is_terminal(), no_color_flag);
 
     let cli = match Cli::try_parse_from(&argv) {
@@ -114,7 +104,7 @@ async fn run() -> i32 {
     // missing `--title` exits 1 whether or not it is authenticated.
     let interactive = is_tty && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     if let Err(err) = command.prevalidate(interactive) {
-        return emit(error::report(&err, &path, None, &stderr_palette));
+        return emit(error::report(&err, &path, None));
     }
 
     // Commands that manage the token itself must run without one.
@@ -122,19 +112,19 @@ async fn run() -> i32 {
         Commands::Auth(AuthCmd::Login(args)) => {
             return match cmd::auth_login::run_login(args, &stderr_palette).await {
                 Ok(()) => EXIT_OK,
-                Err(err) => emit(error::report(&err, &path, None, &stderr_palette)),
+                Err(err) => emit(error::report(&err, &path, None)),
             }
         }
         Commands::Auth(AuthCmd::Logout(args)) => {
             return match cmd::auth_login::run_logout(args, &stderr_palette).await {
                 Ok(()) => EXIT_OK,
-                Err(err) => emit(error::report(&err, &path, None, &stderr_palette)),
+                Err(err) => emit(error::report(&err, &path, None)),
             }
         }
         Commands::Auth(AuthCmd::Token(args)) => {
             return match cmd::auth_login::run_token(args, &stderr_palette).await {
                 Ok(()) => EXIT_OK,
-                Err(err) => emit(error::report(&err, &path, None, &stderr_palette)),
+                Err(err) => emit(error::report(&err, &path, None)),
             }
         }
         other => other,
@@ -167,12 +157,7 @@ async fn run() -> i32 {
 
     match dispatch(&ctx, command).await {
         Ok(()) => EXIT_OK,
-        Err(err) => emit(error::report(
-            &err,
-            &path,
-            Some(&ctx.config.token_source),
-            &stderr_palette,
-        )),
+        Err(err) => emit(error::report(&err, &path, Some(&ctx.config.token_source))),
     }
 }
 
