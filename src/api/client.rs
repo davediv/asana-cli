@@ -16,8 +16,11 @@ pub const USER_AGENT: &str = concat!("asana-cli/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT: Duration = Duration::from_secs(30);
 const PAGE_SIZE: usize = 100;
 
-/// Everything that can go wrong talking to Asana. `main` maps these to
-/// gh-style messages and exit codes (401 exits 4, everything else 1).
+/// Everything that can go wrong talking to Asana. `error::report` turns
+/// each into a human sentence with the `Display` text (gh's `HTTP <status>:
+/// <message> (<url>)`) muted under it, and picks the exit code (401 exits
+/// 4, everything else 1). The variants are matched on by other pieces, so
+/// their shapes stay put.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     /// 401: the token is missing, expired or wrong.
@@ -38,7 +41,8 @@ pub enum ApiError {
         url: String,
     },
     /// 429 twice in a row (the first one was retried after `Retry-After`).
-    #[error("HTTP 429: Rate Limit Enforced; try again in {retry_after}s")]
+    /// `error::report` says when to try again; this is the transport line.
+    #[error("HTTP 429: Rate Limit Enforced (Retry-After: {retry_after})")]
     RateLimited { retry_after: u64 },
     /// Could not reach app.asana.com at all (DNS, connect, TLS, timeout, or
     /// the connection dropped mid-response). `main` prints the host and the
@@ -556,7 +560,7 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "HTTP 429: Rate Limit Enforced; try again in 42s"
+            "HTTP 429: Rate Limit Enforced (Retry-After: 42)"
         );
         server.join().unwrap();
     }
