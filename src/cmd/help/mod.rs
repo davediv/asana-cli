@@ -1,9 +1,8 @@
 //! The prose pieces of the help screens that clap cannot express: the root
 //! description and examples, usage lines, command groupings, the ARGUMENTS
 //! sections, the help topics (`asana help exit-codes`), and the LEARN MORE
-//! footer. `cli.rs` renders them.
-
-use crate::render::Palette;
+//! footer. `cli.rs` renders them; headings are painted with the shared
+//! `Palette::bold`, which emits gh's `\e[0;1;39m`.
 
 pub const ROOT_ABOUT: &str = "Work with an Asana workspace from the command line.";
 
@@ -12,17 +11,6 @@ pub const ROOT_EXAMPLES: &str = "$ asana task list\n$ asana task create --title 
 pub const MANUAL_URL: &str = "https://github.com/davediv/asana-cli#readme";
 
 pub const RELEASES_URL: &str = "https://github.com/davediv/asana-cli/releases/tag";
-
-/// A section heading, styled exactly as gh does it: `\e[0;1;39m` (reset,
-/// bold, default foreground) and `\e[0m` after. The shared `Palette::bold`
-/// emits plain `\e[1m`, which reads the same but is not byte-identical.
-pub fn heading(palette: &Palette, text: &str) -> String {
-    if palette.enabled && !text.is_empty() {
-        format!("\x1b[0;1;39m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
 
 /// The `LEARN MORE` footer printed on every help screen.
 pub fn learn_more() -> Vec<String> {
@@ -35,8 +23,8 @@ pub fn learn_more() -> Vec<String> {
     ]
 }
 
-/// The usage line for a command path (without the leading `asana`), when it
-/// differs from the default `asana <path> [flags]`.
+/// The usage line for a command path, when it differs from the default
+/// `asana <path> [<command>] [flags]`.
 pub fn usage(path: &[&str]) -> Option<&'static str> {
     Some(match path {
         [] => "asana <command> <subcommand> [flags]",
@@ -45,7 +33,7 @@ pub fn usage(path: &[&str]) -> Option<&'static str> {
         ["task", "view"] => "asana task view {<gid> | <url>} [flags]",
         ["task", "complete"] => "asana task complete {<gids> | <urls>} [flags]",
         ["task", "reopen"] => "asana task reopen {<gids> | <urls>} [flags]",
-        ["task", "assign"] => "asana task assign {<gid> | <url>} <assignee> [flags]",
+        ["task", "assign"] => "asana task assign {<gid> | <url>} [<assignee>] [flags]",
         ["task", "comment"] => "asana task comment {<gid> | <url>} [flags]",
         ["task", "delete"] => "asana task delete {<gid> | <url>} [flags]",
         _ => return None,
@@ -90,19 +78,26 @@ pub fn arguments(path: &[&str]) -> Option<&'static str> {
     }
 }
 
-/// A help topic: `asana help <name>` prints `long`; the root screen lists
+/// A help topic: `asana help <name>` prints its body; the root screen lists
 /// `name: short` under `HELP TOPICS`, like gh.
 pub struct Topic {
     pub name: &'static str,
     pub short: &'static str,
-    pub long: &'static str,
+    pub body: Body,
+}
+
+/// What a topic prints: fixed prose, or the command reference gh generates
+/// from its command tree (`gh help reference`).
+pub enum Body {
+    Text(&'static str),
+    Reference,
 }
 
 pub const TOPICS: &[Topic] = &[
     Topic {
         name: "environment",
         short: "Environment variables that can be used with asana",
-        long: "ASANA_TOKEN, ASANA_ACCESS_TOKEN (in order of precedence): a personal access token used to authenticate\n\
+        body: Body::Text("ASANA_TOKEN, ASANA_ACCESS_TOKEN (in order of precedence): a personal access token used to authenticate\n\
                with Asana. Setting either overrides `token` in the config file. Create one at\n\
                https://app.asana.com/0/my-apps.\n\
                \n\
@@ -121,12 +116,12 @@ pub const TOPICS: &[Topic] = &[
                \n\
                TERM: set to \"dumb\" to disable color output.\n\
                \n\
-               COLUMNS: the width to lay tables out for when the terminal size cannot be detected (default 80).\n",
+               COLUMNS: the width to lay tables out for when the terminal size cannot be detected (default 80).\n"),
     },
     Topic {
         name: "exit-codes",
         short: "Exit codes used by asana",
-        long: "asana follows normal conventions regarding exit codes.\n\
+        body: Body::Text("asana follows normal conventions regarding exit codes.\n\
                \n\
                - If a command completes successfully, the exit code will be 0\n\
                - If a command fails for any reason, the exit code will be 1\n\
@@ -134,7 +129,12 @@ pub const TOPICS: &[Topic] = &[
                - If a command encounters an authentication issue, the exit code will be 4\n\
                \n\
                NOTE: Usage errors, such as an unknown flag or a missing argument, exit with 1 like any other\n\
-               failure. Completing a task that is already complete counts as success and exits with 0.\n",
+               failure. Completing a task that is already complete counts as success and exits with 0.\n"),
+    },
+    Topic {
+        name: "reference",
+        short: "A comprehensive reference of all asana commands",
+        body: Body::Reference,
     },
 ];
 
@@ -147,34 +147,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn heading_uses_gh_bold_sequence() {
-        assert_eq!(
-            heading(&Palette::new(true), "USAGE"),
-            "\x1b[0;1;39mUSAGE\x1b[0m"
-        );
-        assert_eq!(heading(&Palette::off(), "USAGE"), "USAGE");
-        assert_eq!(heading(&Palette::new(true), ""), "");
-    }
-
-    #[test]
     fn topics_are_well_formed() {
+        assert!(TOPICS.windows(2).all(|w| w[0].name < w[1].name), "sorted");
         for t in TOPICS {
-            assert!(t.long.ends_with('\n'), "{} must end with a newline", t.name);
-            assert!(
-                !t.long.ends_with("\n\n"),
-                "{} ends with a blank line",
-                t.name
-            );
             assert!(
                 !t.short.ends_with('.'),
                 "{} short ends with a period",
                 t.name
             );
-            for line in t.long.lines() {
+            let Body::Text(long) = t.body else {
+                continue;
+            };
+            assert!(long.ends_with('\n'), "{} must end with a newline", t.name);
+            assert!(!long.ends_with("\n\n"), "{} ends with a blank line", t.name);
+            for line in long.lines() {
                 assert!(line.len() <= 110, "{}: line too long: {line}", t.name);
             }
         }
         assert!(topic("exit-codes").is_some());
+        assert!(matches!(
+            topic("reference"),
+            Some(Topic {
+                body: Body::Reference,
+                ..
+            })
+        ));
         assert!(topic("nope").is_none());
     }
 
@@ -182,7 +179,7 @@ mod tests {
     fn learn_more_points_at_the_topics() {
         let lines = learn_more();
         assert_eq!(lines.len(), 4);
-        for t in TOPICS {
+        for t in TOPICS.iter().filter(|t| matches!(t.body, Body::Text(_))) {
             assert!(lines
                 .iter()
                 .any(|l| l.contains(&format!("asana help {}", t.name))));

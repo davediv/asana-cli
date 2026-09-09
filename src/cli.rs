@@ -36,7 +36,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 )]
 pub struct Cli {
     /// Select the workspace by name or gid
-    #[arg(long, global = true, value_name = "name")]
+    #[arg(long, global = true, value_name = "NAME")]
     pub workspace: Option<String>,
 
     /// Disable color output
@@ -326,19 +326,36 @@ pub(crate) struct FlagLine {
     help: String,
 }
 
+/// gh lists `--help` without its `-h` shorthand.
+fn short_of(a: &clap::Arg) -> Option<char> {
+    a.get_short().filter(|_| a.get_long() != Some("help"))
+}
+
+/// One flag table, laid out as pflag does and then dedented as gh does: a
+/// long-only flag sits in a four-space gutter (`    --json`) so its `--`
+/// lines up under `-s, --long`, and the gutter collapses when no flag in
+/// the table has a short form (`gh issue delete --help` prints `  --yes`).
+/// Usage errors print one table, so the gutter is decided here; help
+/// screens print FLAGS and INHERITED FLAGS together and decide it once for
+/// both with `flag_lines_with_gutter`.
 pub(crate) fn flag_lines(args: Vec<&clap::Arg>) -> Vec<FlagLine> {
+    let gutter = args.iter().any(|a| short_of(a).is_some());
+    flag_lines_with_gutter(args, gutter)
+}
+
+/// `flag_lines` with the gutter decided by the caller. The value placeholder
+/// is the flag's `value_name` verbatim (gh's `int`, `string`, `file`, and
+/// `[HOST/]OWNER/REPO` for its inherited flag), else `string`.
+pub(crate) fn flag_lines_with_gutter(args: Vec<&clap::Arg>, gutter: bool) -> Vec<FlagLine> {
     let mut args = args;
     args.sort_by_key(|a| a.get_long().unwrap_or("").to_string());
-    // gh lists `--help` without its `-h` shorthand.
-    let short_of = |a: &clap::Arg| a.get_short().filter(|_| a.get_long() != Some("help"));
-    let any_short = args.iter().any(|a| short_of(a).is_some());
     args.iter()
         .map(|a| {
             let mut left = String::new();
-            match (short_of(a), any_short) {
-                (Some(s), _) => left.push_str(&format!("-{s}, ")),
-                (None, true) => left.push_str("    "),
-                (None, false) => {}
+            match short_of(a) {
+                Some(s) => left.push_str(&format!("-{s}, ")),
+                None if gutter => left.push_str("    "),
+                None => {}
             }
             left.push_str(&format!("--{}", a.get_long().unwrap_or("")));
             let takes_value = a.get_num_args().is_some_and(|n| n.takes_values());
@@ -346,7 +363,7 @@ pub(crate) fn flag_lines(args: Vec<&clap::Arg>) -> Vec<FlagLine> {
                 let name = a
                     .get_value_names()
                     .and_then(|v| v.first())
-                    .map(|v| v.to_string().to_lowercase())
+                    .map(|v| v.to_string())
                     .unwrap_or_else(|| "string".to_string());
                 left.push(' ');
                 left.push_str(&name);
@@ -365,7 +382,13 @@ pub(crate) fn flag_lines(args: Vec<&clap::Arg>) -> Vec<FlagLine> {
         .collect()
 }
 
+/// The flag table as it sits under a help heading: two-space indent, the
+/// descriptions aligned three spaces past the longest flag.
 pub(crate) fn render_flag_table(lines: &[FlagLine]) -> String {
+    flag_table(lines, "  ")
+}
+
+fn flag_table(lines: &[FlagLine], indent: &str) -> String {
     let max = lines
         .iter()
         .map(|l| l.left.chars().count())
@@ -374,7 +397,7 @@ pub(crate) fn render_flag_table(lines: &[FlagLine]) -> String {
     let mut out = String::new();
     for l in lines {
         let pad = " ".repeat(max - l.left.chars().count());
-        out.push_str(&format!("  {}{}   {}\n", l.left, pad, l.help));
+        out.push_str(&format!("{indent}{}{}   {}\n", l.left, pad, l.help));
     }
     out
 }
@@ -407,27 +430,77 @@ pub fn render_version() -> String {
 
 /// `asana help <topic>`: the topic text alone, like gh's help topics.
 pub fn render_topic(topic: &help::Topic) -> String {
-    topic.long.to_string()
+    match topic.body {
+        help::Body::Text(text) => text.to_string(),
+        help::Body::Reference => render_reference(&command()),
+    }
+}
+
+/// `asana help reference`: every command with its usage line, description
+/// and flags, in the markdown `gh help reference` prints: a `#` heading per
+/// level, the flags in a code fence, commands in name order.
+pub fn render_reference(root: &Command) -> String {
+    fn walk(out: &mut String, cmd: &Command, path: &mut Vec<String>, depth: usize) {
+        out.push_str(&format!("{} `{}`\n\n", "#".repeat(depth), usage_line(path)));
+        let about = cmd.get_about().map(|s| s.to_string()).unwrap_or_default();
+        out.push_str(&format!("{about}\n\n"));
+        let lines = flag_lines(local_flags(cmd));
+        if !lines.is_empty() {
+            out.push_str("```\n");
+            out.push_str(&flag_table(&lines, ""));
+            out.push_str("```\n\n");
+        }
+        for sub in sorted_subcommands(cmd) {
+            path.push(sub.get_name().to_string());
+            walk(out, sub, path, depth + 1);
+            path.pop();
+        }
+    }
+    let mut out = String::from("# asana reference\n\n");
+    let mut path = Vec::new();
+    for sub in sorted_subcommands(root) {
+        path.push(sub.get_name().to_string());
+        walk(&mut out, sub, &mut path, 2);
+        path.pop();
+    }
+    out
+}
+
+/// The visible subcommands in name order, as cobra lists them.
+fn sorted_subcommands(cmd: &Command) -> Vec<&Command> {
+    let mut subs: Vec<&Command> = cmd.get_subcommands().filter(|c| !c.is_hide_set()).collect();
+    subs.sort_by_key(|c| c.get_name().to_string());
+    subs
 }
 
 /// Render the gh-shaped help screen for a command path.
 pub fn render_help(path: &[String], palette: &Palette) -> String {
     let root = command();
-    let Some(cmd) = find(&root, path) else {
-        return render_help(&[], palette);
-    };
-    let heading = |s: &str| help::heading(palette, s);
+    if find(&root, path).is_none() {
+        return render_help_for(&root, &[], palette);
+    }
+    render_help_for(&root, path, palette)
+}
+
+/// `render_help` over a given tree; `path` must exist in it.
+fn render_help_for(root: &Command, path: &[String], palette: &Palette) -> String {
+    let cmd = find(root, path).expect("path exists in the tree");
+    let heading = |s: &str| palette.bold(s);
     let mut out = String::new();
 
+    // gh prints the description as written and then a blank line, so a
+    // `long_about` that ends with a newline (as gh's heredoc ones do) leaves
+    // two blank lines before USAGE, and a one-liner leaves one.
     let about = if path.is_empty() {
         help::ROOT_ABOUT.to_string()
     } else {
         cmd.get_long_about()
-            .or(cmd.get_about())
             .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| cmd.get_about().map(|s| s.to_string()))
             .unwrap_or_default()
     };
-    out.push_str(about.trim_end());
+    out.push_str(&about);
     out.push_str("\n\n");
 
     out.push_str(&heading("USAGE"));
@@ -450,7 +523,9 @@ pub fn render_help(path: &[String], palette: &Palette) -> String {
 
     let subs: Vec<&Command> = cmd.get_subcommands().filter(|c| !c.is_hide_set()).collect();
     if !subs.is_empty() {
-        // cobra pads `name:` to the longest name plus one, never under 15.
+        // cobra pads `name:` to the longest name (never under 11) plus four,
+        // so the column is 15 wide until a name passes eleven characters.
+        // gh's help topics are commands too, so they count at the root.
         let topic_names = help::TOPICS
             .iter()
             .filter(|_| path.is_empty())
@@ -459,10 +534,11 @@ pub fn render_help(path: &[String], palette: &Palette) -> String {
             .iter()
             .map(|c| c.get_name())
             .chain(topic_names)
-            .map(|n| n.len() + 2)
+            .map(str::len)
             .max()
             .unwrap_or(0)
-            .max(15);
+            .max(11)
+            + 4;
         let groups = help::groups(&strs(path));
         let mut placed: Vec<&str> = Vec::new();
         let mut sections: Vec<(&str, Vec<&Command>)> = Vec::new();
@@ -484,9 +560,11 @@ pub fn render_help(path: &[String], palette: &Palette) -> String {
             .copied()
             .collect();
         rest.sort_by_key(|c| c.get_name().to_string());
+        // gh: `AVAILABLE COMMANDS` when a command has no groups, otherwise
+        // the ungrouped ones go under `ADDITIONAL COMMANDS`.
         if !rest.is_empty() {
             let title = if sections.is_empty() {
-                "COMMANDS"
+                "AVAILABLE COMMANDS"
             } else {
                 "ADDITIONAL COMMANDS"
             };
@@ -526,14 +604,23 @@ pub fn render_help(path: &[String], palette: &Palette) -> String {
     } else {
         (local_flags(cmd), inherited_flags(cmd))
     };
-    let local_lines = flag_lines(local);
+    // One gutter for both tables: on every gh leaf screen the `--` of FLAGS
+    // and INHERITED FLAGS line up (its inherited `-R, --repo` sees to that),
+    // while its root and group screens, with no short flag anywhere, print
+    // `  --help` flush left. Our inherited flags have no short forms, so the
+    // decision is taken over the whole screen rather than per table.
+    let gutter = local
+        .iter()
+        .chain(inherited.iter())
+        .any(|a| short_of(a).is_some());
+    let local_lines = flag_lines_with_gutter(local, gutter);
     if !local_lines.is_empty() {
         out.push_str(&heading("FLAGS"));
         out.push('\n');
         out.push_str(&render_flag_table(&local_lines));
         out.push('\n');
     }
-    let inherited_lines = flag_lines(inherited);
+    let inherited_lines = flag_lines_with_gutter(inherited, gutter);
     if !inherited_lines.is_empty() {
         out.push_str(&heading("INHERITED FLAGS"));
         out.push('\n');
@@ -645,12 +732,13 @@ CORE COMMANDS
 HELP TOPICS
   environment:   Environment variables that can be used with asana
   exit-codes:    Exit codes used by asana
+  reference:     A comprehensive reference of all asana commands
 
 FLAGS
   --help             Show help for command
   --no-color         Disable color output
   --version          Show asana version
-  --workspace name   Select the workspace by name or gid
+  --workspace NAME   Select the workspace by name or gid
 
 EXAMPLES
   $ asana task list
@@ -686,7 +774,7 @@ LEARN MORE
 INHERITED FLAGS
   --help             Show help for command
   --no-color         Disable color output
-  --workspace name   Select the workspace by name or gid
+  --workspace NAME   Select the workspace by name or gid
 
 ARGUMENTS
   A project can be supplied as argument in any of the following formats:
@@ -695,6 +783,117 @@ ARGUMENTS
         assert!(!project.contains("\nFLAGS\n"));
         assert!(!project.contains("HELP TOPICS"));
         assert!(project.ends_with("`asana help environment`\n\n"));
+    }
+
+    /// A group without groupings of its own lists `AVAILABLE COMMANDS`, as
+    /// `gh auth --help` does; `asana auth --help` is judged against it.
+    #[test]
+    fn ungrouped_commands_are_available_commands() {
+        let p = Palette::off();
+        let auth = render_help(&["auth".to_string()], &p);
+        assert!(
+            auth.contains(
+                "\nUSAGE\n  asana auth <command> [flags]\n\nAVAILABLE COMMANDS\n  status:        "
+            ),
+            "{auth}"
+        );
+        assert!(!auth.contains("\nCOMMANDS\n"));
+        assert!(!auth.contains("ADDITIONAL COMMANDS"));
+        let ws = render_help(&["workspace".to_string()], &p);
+        assert!(
+            ws.contains("\nAVAILABLE COMMANDS\n  list:          "),
+            "{ws}"
+        );
+    }
+
+    /// The flag gutter follows gh: on a screen where some flag has a short
+    /// form, every long-only flag in FLAGS and INHERITED FLAGS sits four
+    /// spaces in so the `--` columns line up; on a screen with none (the
+    /// root, the groups) the tables print flush against the indent.
+    #[test]
+    fn flag_gutter_is_decided_per_screen() {
+        let p = Palette::off();
+        let list = render_help(&["task".to_string(), "list".to_string()], &p);
+        assert!(list.contains("\n  -L, --limit int"), "{list}");
+        assert!(
+            list.contains(
+                "\nINHERITED FLAGS\n      --help             Show help for command\n      --no-color         Disable color output\n      --workspace NAME   Select the workspace by name or gid\n"
+            ),
+            "{list}"
+        );
+        let task = render_help(&["task".to_string()], &p);
+        assert!(
+            task.contains("\nINHERITED FLAGS\n  --help             Show help for command\n"),
+            "{task}"
+        );
+        let root = render_help(&[], &p);
+        assert!(
+            root.contains("\nFLAGS\n  --help             Show help for command\n"),
+            "{root}"
+        );
+    }
+
+    /// Usage errors print one table, so its gutter depends on that table
+    /// alone, like gh's dedent of `LocalFlags().FlagUsages()`.
+    #[test]
+    fn flag_table_alone_collapses_its_gutter() {
+        let root = command();
+        let lines = flag_lines(root_flags(&root));
+        let table = render_flag_table(&lines);
+        assert!(
+            table.starts_with("  --help             Show help for command\n"),
+            "{table}"
+        );
+        let list = find(&root, &["task".to_string(), "list".to_string()]).unwrap();
+        let table = render_flag_table(&flag_lines(local_flags(list)));
+        assert!(table.contains("\n      --json"), "{table}");
+        assert!(table.contains("\n  -L, --limit int"), "{table}");
+    }
+
+    /// gh prints the description exactly as written and then a blank line:
+    /// a one-line `about` leaves one blank line before USAGE, and a
+    /// heredoc-style `long_about` ending in a newline leaves two, the way
+    /// `gh issue create --help` does. Value names print verbatim.
+    #[test]
+    fn description_is_printed_verbatim() {
+        let p = Palette::off();
+        let mut root = Command::new("asana")
+            .subcommand(
+                Command::new("one")
+                    .about("One line")
+                    .long_about("First paragraph.\n\nSecond paragraph.\n"),
+            )
+            .subcommand(
+                Command::new("two").about("Two").arg(
+                    clap::Arg::new("workspace")
+                        .long("workspace")
+                        .value_name("NAME"),
+                ),
+            );
+        root.build();
+        let one = render_help_for(&root, &["one".to_string()], &p);
+        assert!(
+            one.starts_with(
+                "First paragraph.\n\nSecond paragraph.\n\n\nUSAGE\n  asana one [flags]\n"
+            ),
+            "{one}"
+        );
+        let two = render_help_for(&root, &["two".to_string()], &p);
+        assert!(two.starts_with("Two\n\nUSAGE\n"), "{two}");
+        assert!(two.contains("\n  --workspace NAME   \n"), "{two}");
+    }
+
+    #[test]
+    fn usage_lines_name_optional_arguments() {
+        assert_eq!(
+            usage_line(&["task".to_string(), "assign".to_string()]),
+            "asana task assign {<gid> | <url>} [<assignee>] [flags]"
+        );
+        assert_eq!(
+            usage_line(&["task".to_string()]),
+            "asana task <command> [flags]"
+        );
+        assert_eq!(usage_line(&[]), "asana <command> <subcommand> [flags]");
     }
 
     #[test]
@@ -725,6 +924,16 @@ ARGUMENTS
             .starts_with("asana follows normal conventions regarding exit codes.\n"));
         assert!(r.stdout.ends_with("exits with 0.\n"));
         assert!(!r.stdout.contains("USAGE"));
+
+        let r = run(&["asana", "help", "reference"]).expect("reference");
+        assert_eq!(r.code, 0);
+        assert!(r.stdout.starts_with("# asana reference\n\n## `asana auth <command> [flags]`\n\nCheck authentication with Asana\n\n### `asana auth status [flags]`\n\n"), "{}", r.stdout);
+        assert!(r.stdout.contains("\n## `asana task <command> [flags]`\n\nManage tasks\n\n### `asana task assign {<gid> | <url>} [<assignee>] [flags]`\n"), "{}", r.stdout);
+        assert!(r.stdout.contains("\n```\n    --json"), "{}", r.stdout);
+        assert!(r.stdout.contains("\n-L, --limit int"), "{}", r.stdout);
+        assert!(!r.stdout.contains("--help"), "{}", r.stdout);
+        assert!(!r.stdout.contains("--workspace"), "{}", r.stdout);
+        assert!(r.stdout.ends_with("```\n\n"), "{}", r.stdout);
 
         let r = run(&["asana", "help", "nope"]).expect("unknown topic");
         assert_eq!(r.code, 1);
