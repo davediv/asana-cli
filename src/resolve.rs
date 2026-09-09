@@ -3,12 +3,61 @@
 //! - tasks: a gid or any app.asana.com task URL
 //! - projects: a gid, a URL, or a (case-insensitive, prefix-tolerant) name
 //! - assignees: `me`/`@me`, an email, a gid, or a name via typeahead
+//!
+//! Something that cannot be an identifier at all is an [`InvalidIdentifier`]
+//! (`invalid task format: "abc"`, gh's wording), a typed error `error.rs`
+//! recognises wherever it sits in an anyhow chain.
 
-use anyhow::{anyhow, bail, Result};
+use std::fmt;
+
+use anyhow::{bail, Result};
 use url::Url;
 
 use crate::api::{Named, Project, PROJECT_FIELDS};
 use crate::ctx::Ctx;
+
+/// What an identifier was meant to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // `Workspace` waits for a workspace-format check
+pub enum IdKind {
+    Task,
+    Project,
+    Assignee,
+    Workspace,
+}
+
+/// Input that cannot be an identifier of `kind`: not a gid, not a URL of
+/// the right shape, and (for the kinds that take one) not a name either.
+/// Displays as gh does (`invalid task format: "abc"`); `error.rs` adds what
+/// would have been accepted and the command's synopsis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidIdentifier {
+    pub kind: IdKind,
+    /// As typed, untrimmed.
+    pub input: String,
+}
+
+impl InvalidIdentifier {
+    pub fn new(kind: IdKind, input: &str) -> Self {
+        Self {
+            kind,
+            input: input.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for InvalidIdentifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            IdKind::Task => write!(f, "invalid task format: \"{}\"", self.input),
+            IdKind::Project => write!(f, "invalid project format: \"{}\"", self.input),
+            IdKind::Assignee => write!(f, "invalid assignee: \"{}\"", self.input),
+            IdKind::Workspace => write!(f, "invalid workspace format: \"{}\"", self.input),
+        }
+    }
+}
+
+impl std::error::Error for InvalidIdentifier {}
 
 fn is_gid(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
@@ -28,7 +77,7 @@ pub fn parse_task_id(input: &str) -> Result<String> {
     if is_gid(s) {
         return Ok(s.to_string());
     }
-    let invalid = || anyhow!("invalid task format: \"{input}\"");
+    let invalid = || anyhow::Error::new(InvalidIdentifier::new(IdKind::Task, input));
     let url = Url::parse(s).map_err(|_| invalid())?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(invalid());
@@ -88,7 +137,7 @@ pub async fn resolve_project(ctx: &Ctx, input: &str) -> Result<Project> {
     }
     let name = input.trim();
     if name.is_empty() {
-        bail!("invalid project format: \"{input}\"");
+        return Err(InvalidIdentifier::new(IdKind::Project, input).into());
     }
     let ws = ctx.workspace().await?;
     let projects: Vec<Project> = ctx
@@ -171,7 +220,7 @@ pub async fn resolve_assignee_value(ctx: &Ctx, input: &str) -> Result<String> {
 pub async fn resolve_assignee(ctx: &Ctx, input: &str) -> Result<Assignee> {
     let s = input.trim();
     if s.is_empty() {
-        bail!("invalid assignee: \"{input}\"");
+        return Err(InvalidIdentifier::new(IdKind::Assignee, input).into());
     }
     if is_me(s) {
         let me = ctx.me().await?;
@@ -288,13 +337,38 @@ mod tests {
             "ftp://x/task/1",
             "https://app.asana.com/1/11/task/abc",
         ] {
-            let err = parse_task_id(bad).unwrap_err().to_string();
+            let err = parse_task_id(bad).unwrap_err();
             assert_eq!(
-                err,
+                err.to_string(),
                 format!("invalid task format: \"{bad}\""),
                 "input {bad:?}"
             );
+            assert_eq!(
+                err.downcast_ref::<InvalidIdentifier>(),
+                Some(&InvalidIdentifier::new(IdKind::Task, bad)),
+                "input {bad:?}"
+            );
         }
+    }
+
+    #[test]
+    fn invalid_identifiers_read_like_gh() {
+        assert_eq!(
+            InvalidIdentifier::new(IdKind::Task, "abc").to_string(),
+            "invalid task format: \"abc\""
+        );
+        assert_eq!(
+            InvalidIdentifier::new(IdKind::Project, "").to_string(),
+            "invalid project format: \"\""
+        );
+        assert_eq!(
+            InvalidIdentifier::new(IdKind::Assignee, " ").to_string(),
+            "invalid assignee: \" \""
+        );
+        assert_eq!(
+            InvalidIdentifier::new(IdKind::Workspace, "?").to_string(),
+            "invalid workspace format: \"?\""
+        );
     }
 
     #[test]

@@ -13,8 +13,9 @@
 //! line would break it mid-word, the renderer also breaks any line wider
 //! than the terminal (capped at [`MAX_HELP_WIDTH`]) at a space, keeping the
 //! column the text started in: prose keeps its indent, a bullet hangs, a
-//! flag or command description continues under itself. Examples are
-//! commands and print verbatim. Every piece's help gets this without
+//! flag or command description continues under itself (the shared
+//! `render::text::wrap_prose` and `wrap_line` do the breaking). Examples
+//! are commands and print verbatim. Every piece's help gets this without
 //! touching its text; only the width of the terminal decides.
 
 use std::ffi::OsString;
@@ -26,6 +27,7 @@ use crate::cmd::{
     task_complete, task_create, task_delete, task_list, task_view, workspace_list,
     Prevalidate as _,
 };
+use crate::render::text::{self, unbracket_urls, wrap_line, wrap_prose};
 use crate::render::Palette;
 
 // The error types command modules raise live in `error.rs`; these names are
@@ -44,95 +46,21 @@ pub const MAX_HELP_WIDTH: usize = 100;
 /// `asana --help | less` still sees the screen it is read on), else
 /// `COLUMNS`, else 80, capped at [`MAX_HELP_WIDTH`].
 fn help_width() -> usize {
-    let detected = terminal_size::terminal_size()
-        .map(|(terminal_size::Width(w), _)| w as usize)
-        .filter(|w| *w > 0)
-        .or_else(|| {
-            std::env::var("COLUMNS")
-                .ok()
-                .and_then(|c| c.trim().parse::<usize>().ok())
-                .filter(|w| *w > 0)
-        })
-        .unwrap_or(80);
-    detected.min(MAX_HELP_WIDTH)
-}
-
-/// Break one logical line into lines no wider than `limit`, the first
-/// prefixed with `first` and the rest with `rest`. Greedy, at ASCII spaces
-/// only, like a terminal would if it broke at words: no hyphenation, and a
-/// word wider than the limit (a URL) stays whole on a line of its own. A
-/// line that already fits comes back as it is.
-fn wrap_line(text: &str, limit: usize, first: &str, rest: &str) -> Vec<String> {
-    let text = text.trim_end();
-    if text.is_empty() {
-        return vec![first.trim_end().to_string()];
-    }
-    if crate::render::text::width(first) + crate::render::text::width(text) <= limit {
-        return vec![format!("{first}{text}")];
-    }
-    let opts = textwrap::Options::new(limit)
-        .initial_indent(first)
-        .subsequent_indent(rest)
-        .break_words(false)
-        .word_separator(textwrap::WordSeparator::AsciiSpace)
-        .word_splitter(textwrap::WordSplitter::NoHyphenation)
-        .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
-    textwrap::wrap(text, &opts)
-        .into_iter()
-        .map(|l| l.into_owned())
-        .collect()
-}
-
-/// `<https://...>` written as a bare URL: the angle brackets are markdown's
-/// autolink syntax and mean nothing on a terminal.
-fn unbracket_urls(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(i) = rest.find("<http") {
-        let after = &rest[i + 1..];
-        match after.find('>') {
-            Some(j)
-                if (after.starts_with("http://") || after.starts_with("https://"))
-                    && !after[..j].contains(char::is_whitespace) =>
-            {
-                out.push_str(&rest[..i]);
-                out.push_str(&after[..j]);
-                rest = &after[j + 1..];
-            }
-            _ => {
-                out.push_str(&rest[..i + 1]);
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    text::terminal_width().min(MAX_HELP_WIDTH)
 }
 
 /// A block of prose (a description, ARGUMENTS, LEARN MORE) laid out under
 /// `indent` and wrapped to `limit`: each line is broken at spaces if it must
 /// be, a `- ` bullet's continuation hangs under its text, blank lines stay
 /// empty (never indent-only), and URLs are bare.
-fn prose(out: &mut String, text: &str, indent: &str, limit: usize) {
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            out.push('\n');
-            continue;
+fn prose(out: &mut String, body: &str, indent: &str, limit: usize) {
+    let room = limit.saturating_sub(text::width(indent));
+    for line in wrap_prose(&unbracket_urls(body), room).lines() {
+        if !line.is_empty() {
+            out.push_str(indent);
+            out.push_str(line);
         }
-        let line = unbracket_urls(line);
-        let body = line.trim_start();
-        let lead = &line[..line.len() - body.len()];
-        let hang = if body.starts_with("- ") || body.starts_with("* ") {
-            "  "
-        } else {
-            ""
-        };
-        let first = format!("{indent}{lead}");
-        let rest = format!("{indent}{lead}{hang}");
-        for l in wrap_line(body, limit, &first, &rest) {
-            out.push_str(&l);
-            out.push('\n');
-        }
+        out.push('\n');
     }
 }
 
@@ -141,7 +69,7 @@ fn prose(out: &mut String, text: &str, indent: &str, limit: usize) {
 /// as pflag's `FlagUsagesWrapped` does, unless the column leaves it fewer
 /// than 24 cells, when it prints whole.
 fn columns(out: &mut String, left: &str, desc: &str, limit: Option<usize>) {
-    let col = crate::render::text::width(left);
+    let col = text::width(left);
     let room = limit.map(|l| l.saturating_sub(col));
     if desc.is_empty() || room.is_some_and(|r| r < 24) {
         out.push_str(left);
@@ -308,18 +236,6 @@ impl Commands {
             Commands::Task(TaskCmd::Assign(a)) => a.prevalidate(interactive),
             Commands::Task(TaskCmd::Comment(a)) => a.prevalidate(interactive),
             Commands::Task(TaskCmd::Delete(a)) => a.prevalidate(interactive),
-        }
-    }
-
-    /// Whether the invoked leaf asked for `--json`.
-    pub fn wants_json(&self) -> bool {
-        match self {
-            Commands::Workspace(WorkspaceCmd::List(a)) => a.json,
-            Commands::Project(ProjectCmd::List(a)) => a.json,
-            Commands::Project(ProjectCmd::View(a)) => a.json,
-            Commands::Task(TaskCmd::List(a)) => a.json,
-            Commands::Task(TaskCmd::View(a)) => a.json,
-            _ => false,
         }
     }
 }
@@ -1200,31 +1116,11 @@ LEARN MORE
         }
     }
 
-    /// The wrapper is greedy, breaks only at spaces, hangs bullets and
-    /// flag descriptions under their column, and leaves a lone long word (a
-    /// URL) whole.
+    /// Prose keeps its section indent, hangs bullets and bares URLs; a flag
+    /// description wraps under its column (the word breaking itself is
+    /// `render::text`'s, tested there).
     #[test]
     fn wrapping_keeps_columns_and_words() {
-        assert_eq!(wrap_line("short", 20, "  ", "  "), vec!["  short"]);
-        assert_eq!(
-            wrap_line("one two three four five", 14, "  ", "    "),
-            vec!["  one two", "    three four", "    five"]
-        );
-        assert_eq!(
-            wrap_line(
-                "see https://example.com/a/very/long/path/indeed now",
-                20,
-                "",
-                ""
-            ),
-            vec!["see", "https://example.com/a/very/long/path/indeed", "now"]
-        );
-        // No hyphenation: `case-insensitive` never splits at its hyphen.
-        assert_eq!(
-            wrap_line("a case-insensitive name", 17, "", ""),
-            vec!["a", "case-insensitive", "name"]
-        );
-
         let mut out = String::new();
         prose(
             &mut out,
@@ -1236,6 +1132,12 @@ LEARN MORE
             out,
             "  - by gid, e.g.\n    \"1211234567890123\";\n    or\n\n  plain https://x.y/z\n  end\n"
         );
+        let mut out = String::new();
+        prose(&mut out, "", "  ", 24);
+        assert_eq!(out, "");
+        let mut out = String::new();
+        prose(&mut out, "one\n", "  ", 24);
+        assert_eq!(out, "  one\n");
 
         let mut out = String::new();
         columns(
@@ -1260,18 +1162,6 @@ LEARN MORE
         let mut out = String::new();
         columns(&mut out, "  --workspace NAME   ", "", Some(80));
         assert_eq!(out, "  --workspace NAME   \n");
-
-        assert_eq!(
-            unbracket_urls("at <https://a.b/c>, then"),
-            "at https://a.b/c, then"
-        );
-        assert_eq!(unbracket_urls("<https://a.b/c>"), "https://a.b/c");
-        assert_eq!(
-            unbracket_urls("key:<TAB>value <not a url>"),
-            "key:<TAB>value <not a url>"
-        );
-        assert_eq!(unbracket_urls("<https://a.b/c d>"), "<https://a.b/c d>");
-        assert_eq!(unbracket_urls("<http"), "<http");
     }
 
     /// The flag gutter follows gh: on a screen where some flag has a short
@@ -1492,7 +1382,7 @@ EXAMPLES
         assert!(r.stdout.is_empty());
         assert!(
             r.stderr.starts_with(
-                "Unknown help topic [`nope`]\n\nUsage:  asana <command> <subcommand> [flags]\n\nAvailable commands:\n  auth\n"
+                "Unknown help topic [`nope`]\n\nUsage:  asana <command> <subcommand> [flags]\n\nAvailable commands:\n  auth:          Authenticate with Asana\n"
             ),
             "{}",
             r.stderr

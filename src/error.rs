@@ -35,11 +35,12 @@
 //!   list; the `Available commands:` list, when it is printed, gives each
 //!   command its one-line summary in the help screen's layout
 //!
-//! Every sentence written here is kept inside [`LINE_WIDTH`] columns, the
-//! way the help prose is hand-wrapped, so nothing breaks mid-word (or
-//! mid-URL) on an 80-column terminal: a message wider than that is broken
-//! between its sentences first, then at spaces. Flag tables and the muted
-//! transport line print as they are.
+//! Every sentence written here is kept inside `render::text::PROSE_WIDTH`
+//! columns, the way the help prose is hand-wrapped, so nothing breaks
+//! mid-word (or mid-URL) on an 80-column terminal: a message wider than
+//! that is broken between its sentences first, then at spaces (the shared
+//! `render::text::wrap_sentences`). Flag tables and the muted transport
+//! line print as they are.
 //!
 //! `cli.rs` (the help piece) owns the command tree and the help screens;
 //! this file borrows its flag-table formatting and usage lines for the
@@ -58,7 +59,9 @@ use clap::Command;
 use crate::api::ApiError;
 use crate::cli;
 use crate::config::{ConfigError, TokenSource, PAT_URL, TOKEN_ENV};
+use crate::render::text::{self, PROSE_WIDTH};
 use crate::render::Palette;
+use crate::resolve::{IdKind, InvalidIdentifier};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
@@ -67,11 +70,6 @@ pub const EXIT_AUTH: i32 = 4;
 
 /// Where to look when Asana itself is down.
 const STATUS_URL: &str = "https://status.asana.com";
-
-/// The widest a line of our own prose may be: under 80 columns, like the
-/// hand-wrapped help prose (`cmd::help::PROSE_WIDTH`), so an 80-column
-/// terminal never breaks a sentence mid-word or a URL mid-path.
-const LINE_WIDTH: usize = 79;
 
 /// What goes to stderr (already newline-terminated, possibly empty) and the
 /// process exit code.
@@ -82,7 +80,7 @@ pub struct Report {
 }
 
 impl Report {
-    /// Prose: wrapped to [`LINE_WIDTH`], newline-terminated.
+    /// Prose: wrapped to [`PROSE_WIDTH`], newline-terminated.
     fn line(text: impl Into<String>, code: i32) -> Self {
         Self::raw(wrap(&text.into()), code)
     }
@@ -111,103 +109,13 @@ impl Report {
     }
 }
 
-/// Keep every line of `text` inside [`LINE_WIDTH`] columns, the way a
-/// person hand-wraps prose. A line that fits is left alone, spacing and
-/// all. One that does not is broken at its strongest punctuation first:
-/// between sentences and `;`-joined clauses, so `what happened. what to
-/// do` becomes two whole lines rather than a line and an orphan; then
-/// after a `:`, so a message keeps its label (`invalid argument "..." for
-/// "--limit" flag:` over `number is too large`); and only then at spaces,
-/// never inside a word, so a URL wider than the limit stays whole on a
-/// line of its own. Lines are trimmed of trailing spaces; blank lines
-/// survive.
+/// Keep every line of `text` inside [`PROSE_WIDTH`] columns, the way a
+/// person hand-wraps prose: a line that fits is left alone, spacing and
+/// all; one that does not is broken between sentences first, then after a
+/// colon, then at spaces, never inside a word or a URL
+/// (`render::text::wrap_sentences`).
 fn wrap(text: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end();
-        if width(line) <= LINE_WIDTH {
-            out.push(line.to_string());
-        } else {
-            out.extend(break_at(line, 0));
-        }
-    }
-    if text.ends_with('\n') {
-        out.push(String::new());
-    }
-    out.join("\n")
-}
-
-/// The marks a wide line is broken after, strongest first: each mark is
-/// kept on the line it ends, and the pieces are packed back onto lines
-/// greedily, so nothing is broken that did not have to be.
-const BREAKS: [&[u8]; 2] = [b".;", b":"];
-
-fn break_at(text: &str, level: usize) -> Vec<String> {
-    let Some(marks) = BREAKS.get(level) else {
-        return at_spaces(text);
-    };
-    let pieces = split_after(text, marks);
-    if pieces.len() < 2 {
-        return break_at(text, level + 1);
-    }
-    let mut packed: Vec<String> = Vec::new();
-    for piece in pieces {
-        match packed.last_mut() {
-            Some(last) if width(last) + 1 + width(piece) <= LINE_WIDTH => {
-                last.push(' ');
-                last.push_str(piece);
-            }
-            _ => packed.push(piece.to_string()),
-        }
-    }
-    packed
-        .into_iter()
-        .flat_map(|line| {
-            if width(&line) <= LINE_WIDTH {
-                vec![line]
-            } else {
-                break_at(&line, level + 1)
-            }
-        })
-        .collect()
-}
-
-/// `text` split after each of `marks` that is followed by a space (the
-/// mark stays with its piece; `app.asana.com` has no space after its dots
-/// and is never split). Empty pieces are dropped.
-fn split_after<'a>(text: &'a str, marks: &[u8]) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let bytes = text.as_bytes();
-    for i in 0..bytes.len().saturating_sub(1) {
-        if i >= start && marks.contains(&bytes[i]) && bytes[i + 1] == b' ' {
-            out.push(text[start..=i].trim());
-            start = i + 2;
-        }
-    }
-    let rest = text[start.min(text.len())..].trim();
-    if !rest.is_empty() {
-        out.push(rest);
-    }
-    out.retain(|s| !s.is_empty());
-    out
-}
-
-/// Greedy at ASCII spaces, no hyphenation, no breaking inside a word.
-fn at_spaces(text: &str) -> Vec<String> {
-    let opts = textwrap::Options::new(LINE_WIDTH)
-        .break_words(false)
-        .word_separator(textwrap::WordSeparator::AsciiSpace)
-        .word_splitter(textwrap::WordSplitter::NoHyphenation)
-        .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
-    textwrap::wrap(text, &opts)
-        .iter()
-        .map(|l| l.trim_end().to_string())
-        .collect()
-}
-
-fn width(s: &str) -> usize {
-    crate::render::text::width(s)
+    text::wrap_sentences(text, PROSE_WIDTH)
 }
 
 /// The first error of type `T` anywhere in the chain, so a typed error still
@@ -230,11 +138,7 @@ pub fn report(
 ) -> Report {
     if let Some(usage) = find::<UsageError>(err) {
         return Report::raw(
-            format!(
-                "{}\n\n{}",
-                wrap(&usage.message),
-                usage_block_with_summaries(&usage.path)
-            ),
+            format!("{}\n\n{}", wrap(&usage.message), usage_block(&usage.path)),
             EXIT_ERROR,
         );
     }
@@ -251,7 +155,7 @@ pub fn report(
         return report_config(cfg);
     }
     let text = format!("{err:#}");
-    match expected_identifier(&text) {
+    match find::<InvalidIdentifier>(err).and_then(|bad| expected_identifier(bad.kind)) {
         Some(expected) => Report::raw(
             format!(
                 "{}\n\n{}",
@@ -273,19 +177,16 @@ fn synopsis(path: &[String]) -> String {
 
 /// What a rejected identifier should have looked like. gh stops at `invalid
 /// issue format: "abc"`; we add what would have been accepted, since a name
-/// is the usual thing to type by mistake. The message itself comes from the
-/// shared `resolve::parse_task_id` / `resolve_project`, so it is recognised
-/// by its text.
-fn expected_identifier(text: &str) -> Option<&'static str> {
-    if !text.ends_with('"') {
-        return None;
-    }
-    if text.contains("invalid task format: \"") {
-        Some("expected a numeric gid or an app.asana.com task URL")
-    } else if text.contains("invalid project format: \"") {
-        Some("expected a numeric gid, an app.asana.com project URL or a project name")
-    } else {
-        None
+/// is the usual thing to type by mistake. The message itself is the shared
+/// `resolve::InvalidIdentifier`'s, found by type wherever it sits in the
+/// chain.
+fn expected_identifier(kind: IdKind) -> Option<&'static str> {
+    match kind {
+        IdKind::Task => Some("expected a numeric gid or an app.asana.com task URL"),
+        IdKind::Project => {
+            Some("expected a numeric gid, an app.asana.com project URL or a project name")
+        }
+        IdKind::Assignee | IdKind::Workspace => None,
     }
 }
 
@@ -686,33 +587,20 @@ pub struct Rendered {
 }
 
 /// The `Usage:` + `Flags:` (or `Available commands:`) block cobra prints
-/// under usage errors, for the command at `path`, with the command list as
-/// gh prints it: bare names. Every usage error rendered here uses
-/// `usage_block_with_summaries` instead; this one is kept for `cli.rs`,
-/// whose `Unknown help topic` report calls it and whose test pins the bare
-/// list, until the two are consolidated.
+/// under usage errors, for the command at `path`. The command list gives
+/// each command its one-line summary beside its name, laid out as the help
+/// screen lays out its command groups, so the list says what the commands
+/// do rather than only that they exist (gh's has fifteen bare names under
+/// `gh issue lsit`). cobra ends the flag table with a line holding two
+/// spaces (`gh-errors/unknown-flag.txt` has it); that is a leftover from
+/// its template, not layout, so it is not copied.
 pub fn usage_block(path: &[String]) -> String {
-    usage_block_for(path, false)
-}
-
-/// `usage_block` with each command's one-line summary beside its name, laid
-/// out as the help screen lays out its command groups, so the list says
-/// what the commands do rather than only that they exist (gh's has fifteen
-/// bare names under `gh issue lsit`).
-fn usage_block_with_summaries(path: &[String]) -> String {
-    usage_block_for(path, true)
-}
-
-/// cobra ends the flag table with a line holding two spaces
-/// (`gh-errors/unknown-flag.txt` has it); that is a leftover from its
-/// template, not layout, so it is not copied.
-fn usage_block_for(path: &[String], summaries: bool) -> String {
     let root = cli::command();
     let mut out = format!("Usage:  {}\n", cli::usage_line(path));
     if let Some(cmd) = cli::find(&root, path) {
         if cmd.get_subcommands().next().is_some() {
             out.push_str("\nAvailable commands:\n");
-            out.push_str(&command_list(cmd, summaries));
+            out.push_str(&command_list(cmd));
         } else {
             let flags = if path.is_empty() {
                 cli::root_flags(cmd)
@@ -985,7 +873,7 @@ fn extra_positionals(
         }
         return Rendered {
             stdout: String::new(),
-            stderr: format!("{}\n\n{}", wrap(&message), usage_block_with_summaries(path)),
+            stderr: format!("{}\n\n{}", wrap(&message), usage_block(path)),
             code: EXIT_ERROR,
         };
     }
@@ -1039,12 +927,12 @@ fn suggestions(typed: &str, names: &[String]) -> Vec<String> {
     out
 }
 
-/// The visible subcommands of `cmd` in name order, two-space indented. With
-/// `summaries`, each carries its one-line summary in the help screen's
-/// layout: `name:` padded to the longest name (never under eleven) plus
-/// four, so the column is fifteen wide until a name passes eleven
-/// characters, exactly as `asana task --help` lists them.
-fn command_list(cmd: &Command, summaries: bool) -> String {
+/// The visible subcommands of `cmd` in name order, two-space indented, each
+/// with its one-line summary in the help screen's layout: `name:` padded to
+/// the longest name (never under eleven) plus four, so the column is
+/// fifteen wide until a name passes eleven characters, exactly as `asana
+/// task --help` lists them. A command without a summary is its bare name.
+fn command_list(cmd: &Command) -> String {
     let mut subs: Vec<&Command> = cmd.get_subcommands().filter(|c| !c.is_hide_set()).collect();
     subs.sort_by_key(|c| c.get_name());
     let pad = subs
@@ -1056,11 +944,7 @@ fn command_list(cmd: &Command, summaries: bool) -> String {
         + 4;
     let mut out = String::new();
     for c in subs {
-        let about = c
-            .get_about()
-            .map(|s| s.to_string())
-            .filter(|_| summaries)
-            .unwrap_or_default();
+        let about = c.get_about().map(|s| s.to_string()).unwrap_or_default();
         if about.is_empty() {
             out.push_str(&format!("  {}\n", c.get_name()));
         } else {
@@ -1112,13 +996,13 @@ fn unknown_command(typed: &str, root: &Command, path: &[String]) -> Rendered {
                 "{head}. Did you mean \"{one}\"?\nIf not, see `{parent} --help` for a list of available commands."
             ))
         ),
-        [] => format!("{}\n\n{}", wrap(&head), usage_block_with_summaries(path)),
+        [] => format!("{}\n\n{}", wrap(&head), usage_block(path)),
         many => {
             let mut msg = format!("{}\n\nDid you mean this?\n", wrap(&head));
             for s in many {
                 msg.push_str(&format!("  {s}\n"));
             }
-            format!("{msg}\n{}", usage_block_with_summaries(path))
+            format!("{msg}\n{}", usage_block(path))
         }
     };
     Rendered {
@@ -1163,7 +1047,7 @@ pub fn render_clap_error(err: &clap::Error, argv: &[OsString], palette: &Palette
     };
     let usage = |message: String, path: &[String]| Rendered {
         stdout: String::new(),
-        stderr: format!("{}\n\n{}", wrap(&message), usage_block_with_summaries(path)),
+        stderr: format!("{}\n\n{}", wrap(&message), usage_block(path)),
         code: EXIT_ERROR,
     };
     // One line, no usage block: the flag was right, only its value was not,
@@ -1296,12 +1180,16 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
+    fn width(s: &str) -> usize {
+        text::width(s)
+    }
+
     /// Every line of a report's prose stays under 80 columns (the muted
     /// transport line and flag tables are laid out elsewhere and exempt).
     fn assert_wrapped(stderr: &str) {
         for line in stderr.lines() {
             assert!(
-                line.starts_with("HTTP ") || line.starts_with("  ") || width(line) <= LINE_WIDTH,
+                line.starts_with("HTTP ") || line.starts_with("  ") || width(line) <= PROSE_WIDTH,
                 "{} columns: {line}",
                 width(line)
             );
@@ -1338,7 +1226,8 @@ mod tests {
     /// Prose is wrapped under 80 columns: a line that fits is untouched
     /// (double spaces and all), a wide one breaks between sentences or
     /// clauses before it breaks at spaces, and a word wider than the limit
-    /// (a URL) is never split.
+    /// (a URL) is never split (the shared `render::text::wrap_sentences`,
+    /// pinned here at the width this file uses).
     #[test]
     fn prose_wraps_between_sentences_then_at_spaces() {
         let short = "To get started, please run:  asana auth login";
@@ -1398,13 +1287,6 @@ mod tests {
             wrap(&url),
             format!("see\nhttps://example.com/{}", "p".repeat(90))
         );
-        assert_eq!(
-            split_after("Task 1 was not found. Check the gid. app.asana.com", b".;"),
-            vec!["Task 1 was not found.", "Check the gid.", "app.asana.com"]
-        );
-        assert_eq!(split_after("one; two", b".;"), vec!["one;", "two"]);
-        assert_eq!(split_after("a: b", b".;"), vec!["a: b"]);
-        assert_eq!(split_after("", b".;"), Vec::<&str>::new());
         assert_eq!(wrap(""), "");
     }
 
@@ -1509,7 +1391,11 @@ mod tests {
         );
         for hint in [hint, auth_hint(Some(&env_source()))] {
             for line in hint.lines() {
-                assert!(width(line) <= LINE_WIDTH, "{} columns: {line}", width(line));
+                assert!(
+                    width(line) <= PROSE_WIDTH,
+                    "{} columns: {line}",
+                    width(line)
+                );
             }
         }
     }
@@ -1824,12 +1710,11 @@ mod tests {
     #[test]
     fn usage_blocks_have_no_whitespace_only_lines() {
         fn walk(cmd: &Command, path: &mut Vec<String>, seen: &mut usize) {
-            for block in [usage_block(path), usage_block_with_summaries(path)] {
-                assert!(block.starts_with("Usage:  asana"), "{block}");
-                assert!(!block.ends_with("\n\n"), "{block:?}");
-                for line in block.lines() {
-                    assert_eq!(line.trim_end(), line, "trailing whitespace in {block:?}");
-                }
+            let block = usage_block(path);
+            assert!(block.starts_with("Usage:  asana"), "{block}");
+            assert!(!block.ends_with("\n\n"), "{block:?}");
+            for line in block.lines() {
+                assert_eq!(line.trim_end(), line, "trailing whitespace in {block:?}");
             }
             *seen += 1;
             for sub in cmd.get_subcommands().filter(|c| !c.is_hide_set()) {
@@ -1858,22 +1743,28 @@ mod tests {
              access token from https://app.asana.com/0/my-apps.\n"
         );
         assert_wrapped(&r.stderr);
+        // `ConfigError::MissingToken` says the same thing wherever it is
+        // printed, so a path that displays it raw reads no differently.
+        assert_eq!(r.stderr, format!("{err}\n"));
         let r = report(&anyhow::Error::new(err), &no_path(), None, &off());
         assert_eq!(r.code, EXIT_AUTH);
     }
 
     /// A rejected identifier: gh's line, what would have been accepted,
     /// and the synopsis of the command it was typed for (the loop-5 judge
-    /// wanted every argument error to recover the same way).
+    /// wanted every argument error to recover the same way). The error is
+    /// recognised by its type, `resolve::InvalidIdentifier`, wherever it
+    /// sits in the chain.
     #[test]
     fn bad_identifiers_say_what_was_expected() {
+        let bad = |kind: IdKind, input: &str| {
+            anyhow::Error::new(InvalidIdentifier {
+                kind,
+                input: input.to_string(),
+            })
+        };
         let view = path(&["task", "view"]);
-        let r = report(
-            &anyhow::anyhow!("invalid task format: \"abc\""),
-            &view,
-            None,
-            &off(),
-        );
+        let r = report(&bad(IdKind::Task, "abc"), &view, None, &off());
         assert_eq!(
             r.stderr,
             "invalid task format: \"abc\"; expected a numeric gid or an app.asana.com task URL\n\
@@ -1883,7 +1774,7 @@ mod tests {
         assert_eq!(r.code, EXIT_ERROR);
         assert_wrapped(&r.stderr);
         // Wrapped in context, the explanation still lands after the message.
-        let err = anyhow::anyhow!("invalid task format: \"x\"").context("could not view task");
+        let err = bad(IdKind::Task, "x").context("could not view task");
         assert_eq!(
             report(&err, &view, None, &off()).stderr,
             "could not view task: invalid task format: \"x\";\n\
@@ -1891,10 +1782,16 @@ mod tests {
              \n\
              Usage:  asana task view {<gid> | <url>} [flags]\n"
         );
+        // The shared parser raises the same type.
+        let err = crate::resolve::parse_task_id("abc").unwrap_err();
+        assert_eq!(
+            report(&err, &view, None, &off()).stderr,
+            report(&bad(IdKind::Task, "abc"), &view, None, &off()).stderr
+        );
         // A long one breaks before the explanation, never inside the input.
         let long = "Fix the login page before the release on Friday, please";
         let r = report(
-            &anyhow::anyhow!("invalid task format: \"{long}\""),
+            &bad(IdKind::Task, long),
             &path(&["task", "complete"]),
             None,
             &off(),
@@ -1909,7 +1806,7 @@ mod tests {
             )
         );
         let r = report(
-            &anyhow::anyhow!("invalid project format: \"\""),
+            &bad(IdKind::Project, ""),
             &path(&["project", "view"]),
             None,
             &off(),
@@ -1921,7 +1818,22 @@ mod tests {
              \n\
              Usage:  asana project view {<gid> | <url> | <name>} [flags]\n"
         );
-        // Anything else is left alone, including a message that merely mentions the phrase.
+        // Kinds with no expected form, and plain messages that merely
+        // mention the phrase, are left alone.
+        assert_eq!(
+            report(&bad(IdKind::Assignee, ""), &view, None, &off()).stderr,
+            "invalid assignee: \"\"\n"
+        );
+        assert_eq!(
+            report(
+                &anyhow::anyhow!("invalid task format: \"abc\""),
+                &view,
+                None,
+                &off()
+            )
+            .stderr,
+            "invalid task format: \"abc\"\n"
+        );
         assert_eq!(
             report(
                 &anyhow::anyhow!("no project named \"abc\" in Acme"),
@@ -1931,16 +1843,6 @@ mod tests {
             )
             .stderr,
             "no project named \"abc\" in Acme\n"
-        );
-        assert_eq!(
-            report(
-                &anyhow::anyhow!("invalid task format: \"abc\" (extra)"),
-                &view,
-                None,
-                &off()
-            )
-            .stderr,
-            "invalid task format: \"abc\" (extra)\n"
         );
     }
 
@@ -2414,7 +2316,7 @@ mod tests {
         // The list under a usage error matches the help screen's columns:
         // every command on `asana task --help` appears with the same text.
         let help = cli::render_help(&["task".to_string()], &Palette::off());
-        let block = usage_block_with_summaries(&["task".to_string()]);
+        let block = usage_block(&["task".to_string()]);
         let listed: Vec<&str> = block
             .lines()
             .filter(|l| l.starts_with("  ") && l.contains(':'))
@@ -2423,11 +2325,5 @@ mod tests {
         for line in listed {
             assert!(help.contains(line), "{line:?} not on the help screen");
         }
-        // The bare list `cli.rs` still calls for its `Unknown help topic`
-        // report has the same commands in the same order, names only.
-        assert_eq!(
-            usage_block(&["task".to_string()]),
-            "Usage:  asana task <command> [flags]\n\nAvailable commands:\n  assign\n  comment\n  complete\n  create\n  delete\n  list\n  reopen\n  view\n"
-        );
     }
 }

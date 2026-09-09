@@ -38,6 +38,16 @@ impl Palette {
         Self { enabled }
     }
 
+    /// The palette for one stream, from that stream's own terminal-ness:
+    /// colour when it is a terminal, `NO_COLOR` is unset, `TERM` is not
+    /// `dumb` and `--no-color` is absent (see [`should_color`]). `main`
+    /// builds stdout's and stderr's this way; a piece writing status lines
+    /// to stderr can build stderr's with
+    /// `Palette::for_stream(std::io::stderr().is_terminal(), no_color)`.
+    pub fn for_stream(is_terminal: bool, no_color_flag: bool) -> Self {
+        Self::new(should_color(is_terminal, no_color_flag))
+    }
+
     #[cfg(test)]
     pub fn off() -> Self {
         Self { enabled: false }
@@ -142,6 +152,16 @@ pub fn should_color(is_tty: bool, no_color_flag: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn for_stream_follows_the_stream_and_the_flag() {
+        assert!(!Palette::for_stream(false, false).enabled);
+        assert!(!Palette::for_stream(true, true).enabled);
+        assert_eq!(
+            Palette::for_stream(true, false).enabled,
+            should_color(true, false)
+        );
+    }
 
     #[test]
     fn no_ops_when_off() {

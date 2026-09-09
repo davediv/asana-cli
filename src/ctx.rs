@@ -19,21 +19,10 @@ pub struct Ctx {
     pub width: usize,
     /// stdout is a terminal.
     pub is_tty: bool,
-    /// The invoked subcommand asked for `--json` (commands also get it in
-    /// their own `Args`; this is for shared helpers).
-    #[allow(dead_code)]
-    pub json: bool,
 }
 
 impl Ctx {
-    pub fn new(
-        api: Client,
-        config: Config,
-        color: bool,
-        width: usize,
-        is_tty: bool,
-        json: bool,
-    ) -> Self {
+    pub fn new(api: Client, config: Config, color: bool, width: usize, is_tty: bool) -> Self {
         Self {
             api,
             config,
@@ -42,7 +31,6 @@ impl Ctx {
             color,
             width,
             is_tty,
-            json,
         }
     }
 

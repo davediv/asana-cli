@@ -85,11 +85,11 @@ async fn run() -> i32 {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let is_tty = std::io::stdout().is_terminal();
     let no_color_flag = argv.iter().any(|a| a == "--no-color");
-    let palette = Palette::new(should_color(is_tty, no_color_flag));
+    let palette = Palette::for_stream(is_tty, no_color_flag);
     // Errors go to stderr, so they are styled by stderr's own terminal-ness
     // (never by stdout's): `asana task list 2>err.log` keeps the log clean,
     // and `NO_COLOR`, `TERM=dumb` and `--no-color` switch it off as usual.
-    let stderr_palette = Palette::new(should_color(std::io::stderr().is_terminal(), no_color_flag));
+    let stderr_palette = Palette::for_stream(std::io::stderr().is_terminal(), no_color_flag);
 
     let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
@@ -163,7 +163,6 @@ async fn run() -> i32 {
         should_color(is_tty, cli.no_color),
         terminal_width(),
         is_tty,
-        command.wants_json(),
     );
 
     match dispatch(&ctx, command).await {
