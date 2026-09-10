@@ -8,6 +8,8 @@
 //! them, and a muted footer with the permalink. Piped: `key:\tvalue` lines,
 //! `--`, the raw notes; piped with `--comments`, each comment as its own
 //! `key:\tvalue` record, as `gh issue view --comments | cat` prints them.
+//! `--json [fields]` prints the raw task (plus `comments` when asked for)
+//! and `--jq` filters it, through `render::json`.
 
 use std::io::Write;
 
@@ -16,12 +18,43 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::api::{Story, Task, STORY_FIELDS, SUBTASK_FIELDS, TASK_VIEW_FIELDS};
-use crate::cmd::{comment_url, finish, open_in_browser, print_json, spinner, task_url};
+use crate::cmd::{comment_url, finish, open_in_browser, spinner, task_url};
 use crate::ctx::Ctx;
+use crate::render::json::{self, JsonArgs};
 use crate::render::notes::render_body;
 use crate::render::time::{due_phrase, fuzzy_ago, fuzzy_ago_abbr, iso, now, today, DueState};
 use crate::render::Palette;
 use crate::resolve::parse_task_id;
+
+/// The top-level keys `--json` can select: the task as `TASK_VIEW_FIELDS`
+/// returns it, plus `comments` (the comment stories, oldest first), which
+/// `--comments` adds and `--json comments` asks for on its own.
+const JSON_FIELDS: &[&str] = &[
+    "gid",
+    "name",
+    "notes",
+    "html_notes",
+    "completed",
+    "completed_at",
+    "assignee",
+    "due_on",
+    "due_at",
+    "start_on",
+    "created_at",
+    "modified_at",
+    "projects",
+    "memberships",
+    "tags",
+    "parent",
+    "num_subtasks",
+    "permalink_url",
+    "created_by",
+    "followers",
+    "num_likes",
+    "custom_fields",
+    "workspace",
+    "comments",
+];
 
 #[derive(clap::Args, Debug)]
 #[command(
@@ -38,7 +71,10 @@ use crate::resolve::parse_task_id;
         $ asana task view 1211234567890123 --comments\n\
         \n\
         # Open the task in the browser\n\
-        $ asana task view 1211234567890123 --web"
+        $ asana task view 1211234567890123 --web\n\
+        \n\
+        # Print the name and due date as JSON\n\
+        $ asana task view 1211234567890123 --json name,due_on"
 )]
 pub struct Args {
     /// Task gid or URL
@@ -49,9 +85,8 @@ pub struct Args {
     #[arg(short = 'c', long)]
     pub comments: bool,
 
-    /// Output the task as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub json: JsonArgs,
 
     /// Open a task in the browser
     #[arg(short = 'w', long)]
@@ -119,13 +154,51 @@ fn body_lines(html: Option<&str>, text: Option<&str>, width: usize, ink: &Palett
         .collect()
 }
 
-/// Nothing to check before the token is read; see `cmd::Prevalidate`.
-impl crate::cmd::Prevalidate for Args {}
+/// Whether `--json` output carries the comments: `--comments` asks for
+/// them, and so does naming the field (`--json comments`, or a dotted
+/// `comments.text`). Otherwise the stories are not even fetched.
+fn wants_json_comments(comments_flag: bool, fields: &[&str]) -> bool {
+    comments_flag
+        || fields
+            .iter()
+            .any(|f| f.split('.').next() == Some("comments"))
+}
+
+/// Asana's own link to a comment (`permalink_url`, asked for in
+/// `STORY_FIELDS`), or one composed from the task's when the API sent none.
+fn comment_link(task: &Task, story: &Story) -> String {
+    story
+        .permalink_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| comment_url(task, &story.gid))
+}
+
+/// `Mar 31, 2026`: the due date of a finished task, which is history rather
+/// than a deadline, so it always carries its year, the way gh dates
+/// anything older than a month.
+fn full_date(date: chrono::NaiveDate) -> String {
+    date.format("%b %-d, %Y").to_string()
+}
+
+/// Only the `--json` flags need checking before the token is read: a lone
+/// `--jq` or an unknown field is a usage error, as in gh.
+impl crate::cmd::Prevalidate for Args {
+    const JSON_FIELDS: &'static [&'static str] = JSON_FIELDS;
+
+    fn prevalidate(&self, _interactive: bool) -> Result<()> {
+        self.json.check(Self::JSON_FIELDS)
+    }
+}
 
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let gid = parse_task_id(&args.task)?;
     let sp = spinner(ctx);
-    let need_stories = !args.web && (!args.json || args.comments);
+    let as_json = args.json.is_json();
+    let json_comments = as_json && wants_json_comments(args.comments, &args.json.fields());
+    let need_stories = !args.web && (!as_json || json_comments);
     let task_path = format!("/tasks/{gid}");
     let stories_path = format!("/tasks/{gid}/stories");
     let task_req = ctx
@@ -166,7 +239,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
         }
     };
     let (comments, comments_raw) = comments_of(stories);
-    let subtasks: Vec<Task> = if task.num_subtasks.unwrap_or(0) > 0 && !args.json {
+    let subtasks: Vec<Task> = if task.num_subtasks.unwrap_or(0) > 0 && !as_json {
         ctx.api
             .get_all(
                 &format!("/tasks/{gid}/subtasks"),
@@ -180,15 +253,14 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     };
     finish(sp);
 
-    if args.json {
-        if args.comments {
-            let mut obj = raw;
+    if as_json {
+        let mut obj = raw;
+        if json_comments {
             if let Value::Object(map) = &mut obj {
                 map.insert("comments".to_string(), Value::Array(comments_raw));
             }
-            return print_json(&obj);
         }
-        return print_json(&raw);
+        return json::print(&obj, &args.json, JSON_FIELDS);
     }
 
     let view = View {
@@ -384,11 +456,18 @@ impl View<'_> {
             w!(out, "{}{projects}", ink.bold("Projects: "));
         }
         if let Some(d) = self.due_date() {
-            let (phrase, state) = due_phrase(d, today());
-            let painted = match state {
-                DueState::Overdue => ink.red(&phrase),
-                DueState::Today => ink.yellow(&phrase),
-                DueState::Upcoming => phrase,
+            // A finished task is never overdue: its due date is history, so
+            // it prints as an absolute date (`Mar 31, 2026`). An open task's
+            // reads against today (`today`, `3 days overdue`, `Sep 13`).
+            let painted = if task.is_completed() {
+                full_date(d)
+            } else {
+                let (phrase, state) = due_phrase(d, today());
+                match state {
+                    DueState::Overdue => ink.red(&phrase),
+                    DueState::Today => ink.yellow(&phrase),
+                    DueState::Upcoming => phrase,
+                }
             };
             w!(out, "{}{painted}", ink.bold("Due: "));
         }
@@ -511,7 +590,7 @@ impl View<'_> {
                         "{}",
                         ink.muted(&format!(
                             "View this comment in Asana: {}\n\n",
-                            comment_url(task, &c.gid)
+                            comment_link(task, c)
                         ))
                     );
                 }
@@ -607,5 +686,79 @@ mod tests {
         assert_eq!(plural(1, "comment"), "1 comment");
         assert_eq!(plural(0, "comment"), "0 comments");
         assert_eq!(plural(3, "comment"), "3 comments");
+    }
+
+    /// A finished task's due date is an absolute date with its year, never
+    /// `163 days overdue` (last loop's gap).
+    #[test]
+    fn completed_due_dates_are_absolute() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 3, 31).expect("date");
+        assert_eq!(full_date(d), "Mar 31, 2026");
+        let d = chrono::NaiveDate::from_ymd_opt(2027, 1, 5).expect("date");
+        assert_eq!(full_date(d), "Jan 5, 2027");
+    }
+
+    /// The link under a comment is Asana's own permalink; only when the API
+    /// sent none is it composed from the task's.
+    #[test]
+    fn comment_links_prefer_the_story_permalink() {
+        let task = Task {
+            gid: "34".to_string(),
+            permalink_url: Some("https://app.asana.com/1/11/project/12/task/34".to_string()),
+            ..Task::default()
+        };
+        let sent = Story {
+            gid: "56".to_string(),
+            permalink_url: Some("https://app.asana.com/0/34/34/56".to_string()),
+            ..Story::default()
+        };
+        assert_eq!(
+            comment_link(&task, &sent),
+            "https://app.asana.com/0/34/34/56"
+        );
+        for missing in [None, Some(String::new()), Some("  ".to_string())] {
+            let story = Story {
+                gid: "56".to_string(),
+                permalink_url: missing,
+                ..Story::default()
+            };
+            assert_eq!(
+                comment_link(&task, &story),
+                "https://app.asana.com/1/11/project/12/task/34/comment/56"
+            );
+        }
+    }
+
+    /// `--json` carries the comments only when `--comments` or the field
+    /// list asks for them, so a plain `--json` stays the raw task.
+    #[test]
+    fn json_comments_are_fetched_only_when_asked() {
+        assert!(!wants_json_comments(false, &[]));
+        assert!(!wants_json_comments(false, &["gid", "name"]));
+        assert!(wants_json_comments(true, &[]));
+        assert!(wants_json_comments(false, &["gid", "comments"]));
+        assert!(wants_json_comments(false, &["comments.text"]));
+    }
+
+    /// Every key the raw task can carry is selectable, `comments` included,
+    /// and the list has no duplicates (the help prints it sorted).
+    #[test]
+    fn json_fields_cover_the_requested_opt_fields() {
+        let mut seen: Vec<&str> = Vec::new();
+        for f in JSON_FIELDS {
+            assert!(!seen.contains(f), "duplicate {f}");
+            seen.push(f);
+        }
+        for opt in TASK_VIEW_FIELDS.split(',') {
+            let head = opt.split('.').next().expect("field");
+            assert!(
+                JSON_FIELDS.contains(&head),
+                "{head} missing from JSON_FIELDS"
+            );
+        }
+        assert!(JSON_FIELDS.contains(&"gid"));
+        assert!(JSON_FIELDS.contains(&"comments"));
+        use crate::cmd::Prevalidate as _;
+        assert_eq!(Args::JSON_FIELDS, JSON_FIELDS);
     }
 }
