@@ -12,12 +12,16 @@ use clap::ValueEnum;
 use serde_json::Value;
 
 use crate::api::{Named, Project, Task, Workspace, TASK_FIELDS};
-use crate::cmd::{finish, open_in_browser, print_json, spinner};
+use crate::cli::usage_error;
+use crate::cmd::{open_in_browser, print_json, with_spinner};
 use crate::ctx::Ctx;
 use crate::render::table::Cell;
-use crate::render::time::{due_phrase, fuzzy_ago, iso, now, today, DueState};
+use crate::render::time::{due_phrase, fuzzy_ago, iso, now, short_date, today, DueState};
 use crate::render::{Palette, Table};
-use crate::resolve::{resolve_assignee, resolve_project};
+use crate::resolve::{resolve_assignee_value, resolve_project};
+
+/// The command's path, for usage errors.
+const PATH: &[&str] = &["task", "list"];
 
 /// `--state`: which tasks to show. `closed` is accepted quietly for people
 /// with `gh` muscle memory.
@@ -32,11 +36,14 @@ pub enum State {
 #[derive(clap::Args, Debug)]
 #[command(
     about = "List tasks assigned to you or in a project",
-    long_about = "List tasks in an Asana workspace. By default, this only lists open tasks assigned to you.\n\n\
-        Use `--project` to list the tasks of a project instead. A project can be given by\n\
-        gid, by URL, or by name (case-insensitive; a unique prefix is enough).\n\n\
-        When stdout is not a terminal the output is tab-separated with no header, one\n\
-        task per line, with ISO-8601 dates.",
+    long_about = "List tasks in an Asana workspace. By default, this only lists open tasks\n\
+        assigned to you.\n\n\
+        Use `--project` to list the tasks of a project instead. A project can be\n\
+        given by gid, by URL, or by name (case-insensitive; a unique prefix is\n\
+        enough). Tasks are shown newest first.\n\n\
+        When stdout is not a terminal the output is tab-separated with no header,\n\
+        one task per line, with ISO-8601 dates.\n\n\
+        For more information about output formatting, see `asana help formatting`.",
     after_help = "$ asana task list\n\
         $ asana task list --project \"Roadmap\"\n\
         $ asana task list --assignee \"jane@example.com\"\n\
@@ -45,12 +52,12 @@ pub enum State {
         $ asana task list --project Roadmap --json"
 )]
 pub struct Args {
-    /// Filter by project (a gid, a URL or a name)
+    /// List the tasks of a project (a gid, a URL or a name)
     #[arg(short = 'p', long, value_name = "string")]
     pub project: Option<String>,
 
     /// Filter by assignee (@me, an email, a name or a gid)
-    #[arg(short = 'a', long, value_name = "string")]
+    #[arg(short = 'a', long, value_name = "user")]
     pub assignee: Option<String>,
 
     /// Filter by state: {open|completed|all}
@@ -205,19 +212,19 @@ async fn fetch(ctx: &Ctx, args: &Args) -> Result<Listing> {
         None => Some(ctx.workspace().await?),
     };
     // Who are we filtering by? Default: you, unless a project is given.
-    let assignee = match (&args.assignee, &project) {
-        (Some(a), _) => Some(resolve_assignee(ctx, a).await?),
-        (None, None) => Some(resolve_assignee(ctx, "me").await?),
+    // `me` is sent as is (Asana accepts it), so it costs no request.
+    let assignee: Option<String> = match (&args.assignee, &project) {
+        (Some(a), _) => Some(resolve_assignee_value(ctx, a).await?),
+        (None, None) => Some("me".to_string()),
         (None, Some(_)) => None,
     };
 
     let mut query: Vec<(&str, &str)> = vec![("opt_fields", TASK_FIELDS)];
-    let assignee_gid = assignee.as_ref().map(|a| a.gid.clone());
     match (&project, &workspace) {
         (Some(p), _) => query.push(("project", p.gid.as_str())),
         (None, Some(ws)) => {
-            if let Some(ag) = assignee_gid.as_deref() {
-                query.push(("assignee", ag));
+            if let Some(a) = assignee.as_deref() {
+                query.push(("assignee", a));
             }
             query.push(("workspace", ws.gid.as_str()));
         }
@@ -242,10 +249,10 @@ async fn fetch(ctx: &Ctx, args: &Args) -> Result<Listing> {
     // completed-only state.
     if project.is_some() {
         if let Some(a) = &assignee {
-            let wanted = if a.gid == "me" {
+            let wanted = if a == "me" {
                 ctx.me().await?.gid
             } else {
-                a.gid.clone()
+                a.clone()
             };
             items.retain(|(_, t)| t.assignee.as_ref().is_some_and(|x| x.gid == wanted));
         }
@@ -289,21 +296,25 @@ async fn web_url(ctx: &Ctx, args: &Args) -> Result<String> {
     })
 }
 
-/// Nothing to check before the token is read; see `cmd::Prevalidate`.
-impl crate::cmd::Prevalidate for Args {}
+/// gh's own check, before the token is read: `invalid limit: 0`, a flag
+/// error, so the usage block follows it. (`cli::Commands::prevalidate`
+/// currently bails on the same case first, without the block.)
+impl crate::cmd::Prevalidate for Args {
+    fn prevalidate(&self, _interactive: bool) -> Result<()> {
+        if self.limit < 1 {
+            return Err(usage_error(PATH, format!("invalid limit: {}", self.limit)));
+        }
+        Ok(())
+    }
+}
 
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     if args.web {
-        let sp = spinner(ctx);
-        let url = web_url(ctx, &args).await;
-        finish(sp);
-        return open_in_browser(&url?);
+        let url = with_spinner(ctx, "", web_url(ctx, &args)).await?;
+        return open_in_browser(&url);
     }
 
-    let sp = spinner(ctx);
-    let listing = fetch(ctx, &args).await;
-    finish(sp);
-    let listing = listing?;
+    let listing = with_spinner(ctx, "", fetch(ctx, &args)).await?;
 
     if args.json {
         let values: Vec<Value> = listing.items.into_iter().map(|(v, _)| v).collect();
@@ -367,9 +378,12 @@ fn render_table(
     for (_, task) in &listing.items {
         let title = one_line(task.display());
         let context = one_line(&context_column(task, listing_project));
+        // A completed task is not overdue: it shows the date it was due,
+        // plain; an open one reads `today`, `tomorrow`, `3 days overdue`.
         let (due, due_state) = match due_date(task) {
-            Some(d) if is_tty => due_phrase(d, today),
-            Some(d) => (d.to_string(), DueState::Upcoming),
+            Some(d) if !is_tty => (d.to_string(), DueState::Upcoming),
+            Some(d) if task.is_completed() => (short_date(d, today), DueState::Upcoming),
+            Some(d) => due_phrase(d, today),
             None => (String::new(), DueState::Upcoming),
         };
         let updated = match task.modified_at {
@@ -671,6 +685,62 @@ mod tests {
             out,
             format!("1211000000000040\tCOMPLETED\tWrite the Q4 planning doc\tRoadmap\t{due}\t{updated}\n")
         );
+    }
+
+    #[test]
+    fn completed_tasks_show_the_date_they_were_due_not_overdue() {
+        let now = Utc.timestamp_opt(1_800_000_000, 0).single().expect("ts");
+        let today = now.date_naive();
+        let mut l = listing(vec![
+            full_task("1211000000000040", "Ship it", Some(-3), 60),
+            full_task("1211000000000036", "Shipped", Some(-3), 60),
+        ]);
+        l.items[1].1.completed = Some(true);
+        let out = render_table(true, 120, false, &l, now, today);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[1].contains("3 days overdue"), "{:?}", lines[1]);
+        let due = short_date(today - chrono::Duration::days(3), today);
+        assert!(lines[2].contains(&due), "{:?}", lines[2]);
+        assert!(!lines[2].contains("overdue"), "{:?}", lines[2]);
+        // piped: ISO dates whatever the state
+        let out = render_table(false, 80, false, &l, now, today);
+        let iso_due = (today - chrono::Duration::days(3)).to_string();
+        assert_eq!(out.matches(&iso_due).count(), 2);
+    }
+
+    #[test]
+    fn limit_must_be_at_least_one() {
+        use crate::cmd::Prevalidate;
+        let args = |limit: usize| Args {
+            project: None,
+            assignee: None,
+            state: State::Open,
+            limit,
+            json: false,
+            web: false,
+        };
+        let err = args(0).prevalidate(true).expect_err("zero");
+        assert_eq!(err.to_string(), "invalid limit: 0");
+        assert!(args(1).prevalidate(false).is_ok());
+    }
+
+    /// The help prose is hand-wrapped short of 78 columns like gh's, and
+    /// says where the output formats are documented.
+    #[test]
+    fn help_prose_is_hand_wrapped_like_gh() {
+        use clap::Args as _;
+        let cmd = Args::augment_args(clap::Command::new("list"));
+        let about = cmd.get_long_about().expect("long_about").to_string();
+        for line in about.lines() {
+            assert!(line.chars().count() <= 78, "wider than 78: {line}");
+            assert!(line.trim_end() == line, "trailing space: {line:?}");
+        }
+        assert!(about.contains("see `asana help formatting`."));
+        let examples = cmd.get_after_help().expect("examples").to_string();
+        for line in examples.lines() {
+            assert!(line.starts_with("$ asana task list"), "{line}");
+            assert!(line.chars().count() + 2 <= 78, "wider than 78: {line}");
+        }
     }
 
     #[test]
