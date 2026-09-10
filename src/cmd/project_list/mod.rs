@@ -12,8 +12,11 @@
 //!
 //! NAME is bold, UPDATED is muted, INFO is muted (yellow when the project is
 //! private, as gh paints private repositories), rows are newest-modified
-//! first, and the widest column gives way to `...` first. Piped: `gid  name
-//! description  info  modified` separated by tabs, no header, ISO-8601 time.
+//! first, and the widest column gives way to `...` first. A column that no
+//! project fills is left out: a workspace whose projects carry no notes gets
+//! `NAME  INFO  UPDATED`, not thirteen columns of blank DESCRIPTION. Piped:
+//! `gid  name  description  info  modified` separated by tabs, no header,
+//! ISO-8601 time, every field there whether or not it is empty.
 //! The table itself is the shared `render::Table`, which pads, truncates and
 //! paints in the bytes gh emits; the tests at the bottom hold it to the
 //! reference layout.
@@ -28,7 +31,7 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::api::{Project, PROJECT_FIELDS};
+use crate::api::Project;
 use crate::cli::usage_error;
 use crate::cmd::{open_in_browser, with_spinner};
 use crate::ctx::Ctx;
@@ -39,6 +42,15 @@ use crate::render::{Palette, Table};
 
 /// The command's path, for usage errors.
 const PATH: &[&str] = &["project", "list"];
+
+/// What `project list` asks Asana for. `api::PROJECT_FIELDS` with one
+/// change: `members.name` where the shared list asks for bare `members`,
+/// which comes back as `{"gid", "resource_type"}` per person and names
+/// nobody. Same size on the wire, so `--json members` answers "who is on
+/// this project?" instead of listing gids. (A wish for the shared list.)
+const PROJECT_FIELDS: &str = "name,archived,color,due_on,modified_at,owner.name,\
+    current_status.title,current_status.color,team.name,permalink_url,notes,\
+    members.name,created_at,public,privacy_setting,completed,start_on";
 
 /// Every top-level key of a project as `--json` prints it: `gid` plus the
 /// fields `PROJECT_FIELDS` asks Asana for, with the dotted ones
@@ -75,11 +87,16 @@ type ColorFn = fn(&Palette, &str) -> String;
         `--archived` flag to list the archived ones instead. Projects are shown most\n\
         recently modified first, and the INFO column carries a project's visibility\n\
         (public or private), its latest status update (on track, at risk, off track,\n\
-        on hold, complete) and whether it is archived.\n\n\
+        on hold, complete) and whether it is archived. A column that no project\n\
+        fills, such as DESCRIPTION where none of them carries notes, is left out\n\
+        of the table; piped output keeps every field, blank or not, so `cut -f2`\n\
+        is always the name.\n\n\
         A name from the NAME column is accepted by every command that takes a\n\
         project, for example `asana task list --project \"Roadmap\"`; a\n\
         case-insensitive unique prefix is enough.\n\n\
-        For more information about output formatting, see `asana help formatting`.",
+        `--json` without a field list prints every field of every project; name\n\
+        the ones you want, or filter what it prints with `--jq`. For more\n\
+        information about output formatting, see `asana help formatting`.",
     after_help = "$ asana project list\n\
         $ asana project list --archived\n\
         $ asana project list --limit 5\n\
@@ -225,27 +242,63 @@ fn sort_newest_first(items: &mut [Item]) {
     items.sort_by(|a, b| updated_at(&b.project).cmp(&updated_at(&a.project)));
 }
 
+/// The columns of the terminal table, in `gh repo list`'s order.
+const HEADERS: [&str; 4] = ["NAME", "DESCRIPTION", "INFO", "UPDATED"];
+
+/// The table gh would print of these rows, minus any column no row fills.
+///
+/// gh always prints all four, because a repository nearly always carries a
+/// description. Asana projects often carry none, and a column of nothing
+/// but its own header standing between NAME and INFO is thirteen columns
+/// of the terminal spent saying nothing, so a column every row leaves empty
+/// is left out. NAME always stays, and a table with no rows keeps them all.
+fn assemble(headers: &[&str], rows: Vec<Vec<Cell>>, width: usize, palette: Palette) -> Table {
+    let keep: Vec<bool> = (0..headers.len())
+        .map(|i| {
+            i == 0
+                || rows.is_empty()
+                || rows
+                    .iter()
+                    .any(|r| r.get(i).is_some_and(|c| !c.text.is_empty()))
+        })
+        .collect();
+    let kept: Vec<&str> = headers
+        .iter()
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .map(|(h, _)| *h)
+        .collect();
+    let mut table = Table::new(&kept, true, width, palette);
+    for row in rows {
+        table.add_row(
+            row.into_iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(c, _)| c)
+                .collect(),
+        );
+    }
+    table
+}
+
 /// The terminal table: gh's `NAME  DESCRIPTION  INFO  UPDATED`, laid out
 /// for `width` columns and painted with `palette`; UPDATED is relative to
 /// `now`.
 fn terminal_table(items: &[Item], width: usize, palette: Palette, now: DateTime<Utc>) -> Table {
-    let mut table = Table::new(
-        &["NAME", "DESCRIPTION", "INFO", "UPDATED"],
-        true,
-        width,
-        palette,
-    );
-    for item in items {
-        let p = &item.project;
-        let updated = updated_at(p).map(|t| fuzzy_ago(now, t)).unwrap_or_default();
-        table.add_row(vec![
-            Cell::colored(name(p), Palette::bold),
-            Cell::plain(description(p)),
-            Cell::colored(info(p), info_color(p)),
-            Cell::colored(updated, Palette::muted),
-        ]);
-    }
-    table
+    let rows: Vec<Vec<Cell>> = items
+        .iter()
+        .map(|item| {
+            let p = &item.project;
+            let updated = updated_at(p).map(|t| fuzzy_ago(now, t)).unwrap_or_default();
+            vec![
+                Cell::colored(name(p), Palette::bold),
+                Cell::plain(description(p)),
+                Cell::colored(info(p), info_color(p)),
+                Cell::colored(updated, Palette::muted),
+            ]
+        })
+        .collect();
+    assemble(&HEADERS, rows, width, palette)
 }
 
 /// The piped table: `gid  name  description  info  modified` per line,
@@ -473,7 +526,10 @@ mod tests {
     #[test]
     fn created_at_stands_in_for_a_missing_modified_at() {
         let mut items = vec![
-            item(json!({"gid": "old", "modified_at": "2026-09-01T00:00:00.000Z"})),
+            item(
+                json!({"gid": "old", "modified_at": "2026-09-01T00:00:00.000Z",
+                "privacy_setting": "private"}),
+            ),
             item(json!({"gid": "new", "created_at": "2026-09-09T00:00:00.000Z"})),
             item(json!({"gid": "none"})),
         ];
@@ -482,7 +538,7 @@ mod tests {
         assert_eq!(order, vec!["new", "old", "none"]);
         assert_eq!(
             piped_table(&items).render(),
-            "new\tnew\t\t\t2026-09-09T00:00:00Z\nold\told\t\t\t2026-09-01T00:00:00Z\nnone\tnone\t\t\t\n"
+            "new\tnew\t\t\t2026-09-09T00:00:00Z\nold\told\t\tprivate\t2026-09-01T00:00:00Z\nnone\tnone\t\t\t\n"
         );
         let out =
             terminal_table(&items, 120, Palette::new(true), at("2026-09-10T00:00:00Z")).render();
@@ -492,11 +548,13 @@ mod tests {
             "{:?}",
             lines[1]
         );
-        // an empty INFO is still padded and painted, as gh paints after
-        // padding; an unknown time in the last column is nothing at all
+        // DESCRIPTION is gone (no project has one), INFO stays for the one
+        // project that does; an empty INFO is still padded to the column and
+        // painted, as gh paints after padding, and an unknown time in the
+        // last column is nothing at all
         assert_eq!(
             lines[3],
-            "\x1b[0;1;39mnone\x1b[0m               \x1b[38;5;242m    \x1b[0m  "
+            "\x1b[0;1;39mnone\x1b[0m  \x1b[38;5;242m       \x1b[0m  "
         );
     }
 
@@ -547,21 +605,20 @@ mod tests {
             ("cli/shurcooL-graphql", "Package graphql provides a GraphQL client implementation.", "public, fork", "about 2 years ago"),
             ("cli/scoop-gh", "[DEPRECATED] scoop packaging for the github cli", "public, archived", "about 3 years ago"),
         ];
-        let mut t = Table::new(
-            &["NAME", "DESCRIPTION", "INFO", "UPDATED"],
-            true,
-            120,
-            Palette::new(color),
-        );
-        for (name, desc, info, updated) in rows {
-            t.add_row(vec![
-                Cell::colored(name, Palette::bold),
-                Cell::plain(desc),
-                Cell::colored(info, Palette::muted),
-                Cell::colored(updated, Palette::muted),
-            ]);
-        }
-        t
+        // through `assemble`, the same path a real listing takes: with
+        // descriptions in hand every column stays and the bytes are gh's.
+        let cells = rows
+            .into_iter()
+            .map(|(name, desc, info, updated)| {
+                vec![
+                    Cell::colored(name, Palette::bold),
+                    Cell::plain(desc),
+                    Cell::colored(info, Palette::muted),
+                    Cell::colored(updated, Palette::muted),
+                ]
+            })
+            .collect();
+        assemble(&HEADERS, cells, 120, Palette::new(color))
     }
 
     #[test]
@@ -612,10 +669,10 @@ cli/scoop-gh                 [DEPRECATED] scoop packaging for the github cli    
     /// The live workspace: names with emoji (a VS16 gear, a two-cell
     /// monster, a ZWJ judge) and no descriptions at all. Every row must end
     /// its NAME cell on the same terminal column, counting emoji as the two
-    /// cells a terminal draws them in, and the empty DESCRIPTION column must
-    /// take only its header's width, not a flexible share.
+    /// cells a terminal draws them in, and DESCRIPTION, which no project
+    /// fills, must be gone: NAME sits next to INFO.
     #[test]
-    fn emoji_names_align_and_empty_descriptions_take_no_room() {
+    fn emoji_names_align_and_the_empty_description_column_goes() {
         let mut items = Vec::new();
         for (gid, name, at) in [
             ("1", "PR", "2026-09-10T08:02:28Z"),
@@ -637,26 +694,69 @@ cli/scoop-gh                 [DEPRECATED] scoop packaging for the github cli    
         let out = terminal_table(&items, 120, Palette::new(false), now).render();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 6);
-        // NAME is 8 wide (TEMPLATE), DESCRIPTION 11 (its header), INFO 7,
+        // NAME is 8 wide (TEMPLATE and the ZWJ judge both), INFO 7,
         // UPDATED 20 (`about 57 minutes ago`).
         assert_eq!(
             lines,
             vec![
-                "NAME      DESCRIPTION  INFO     UPDATED             ",
-                "PR                     private  about 57 minutes ago",
-                "\u{2699}\u{FE0F} UTL                 private  about 17 hours ago",
-                "\u{1F47E} FUN                 private  about 21 hours ago",
-                "\u{1F468}\u{200D}\u{2696}\u{FE0F} LEGAL               private  about 22 hours ago",
-                "TEMPLATE               private  about 3 months ago",
+                "NAME      INFO     UPDATED             ",
+                "PR        private  about 57 minutes ago",
+                "\u{2699}\u{FE0F} UTL    private  about 17 hours ago",
+                "\u{1F47E} FUN    private  about 21 hours ago",
+                "\u{1F468}\u{200D}\u{2696}\u{FE0F} LEGAL  private  about 22 hours ago",
+                "TEMPLATE  private  about 3 months ago",
             ]
         );
         for line in &lines[1..] {
             let info_at = line.find("private").unwrap();
-            assert_eq!(width(&line[..info_at]), 8 + 2 + 11 + 2, "{line:?}");
+            assert_eq!(width(&line[..info_at]), 8 + 2, "{line:?}");
         }
         assert_eq!(width("\u{2699}\u{FE0F} UTL"), 6);
         assert_eq!(width("\u{1F47E} FUN"), 6);
         assert_eq!(width("\u{1F468}\u{200D}\u{2696}\u{FE0F} LEGAL"), 8);
+    }
+
+    /// One project with notes is enough to bring DESCRIPTION back, in gh's
+    /// place for it, and the projects without notes leave the cell blank as
+    /// gh's `cli/gh-webhook` row does.
+    #[test]
+    fn one_description_brings_the_column_back() {
+        let items = vec![
+            item(
+                json!({"gid": "1", "name": "Roadmap", "notes": "What we ship this quarter.",
+                "privacy_setting": "private", "modified_at": "2026-09-10T08:02:28Z"}),
+            ),
+            item(json!({"gid": "2", "name": "PR", "notes": "",
+                "privacy_setting": "private", "modified_at": "2026-09-10T08:02:28Z"})),
+        ];
+        let out =
+            terminal_table(&items, 120, Palette::new(false), at("2026-09-10T09:00:00Z")).render();
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            vec![
+                "NAME     DESCRIPTION                 INFO     UPDATED             ",
+                "Roadmap  What we ship this quarter.  private  about 57 minutes ago",
+                "PR                                   private  about 57 minutes ago",
+            ]
+        );
+    }
+
+    /// Only a column every row leaves empty goes, and never NAME: a listing
+    /// of projects that Asana told us nothing about but their gids is one
+    /// column of gids, not four columns of nothing.
+    #[test]
+    fn only_columns_no_row_fills_are_dropped() {
+        let items = vec![item(json!({"gid": "1"})), item(json!({"gid": "2"}))];
+        let out =
+            terminal_table(&items, 120, Palette::new(false), at("2026-09-10T09:00:00Z")).render();
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["NAME", "1", "2"]);
+        // and nothing is dropped from a table with no rows at all
+        assert_eq!(
+            assemble(&HEADERS, Vec::new(), 120, Palette::new(false))
+                .render()
+                .trim_end(),
+            "NAME  DESCRIPTION  INFO  UPDATED"
+        );
     }
 
     /// A private project paints INFO yellow, as gh paints private
