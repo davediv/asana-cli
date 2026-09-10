@@ -833,7 +833,7 @@ mod tests {
         parts.iter().map(OsString::from).collect()
     }
 
-    /// The screens as the critic captures them: a 120-column pty, so the
+    /// The screens as a wide terminal shows them: 120 columns, so the
     /// layout width is the cap.
     fn help(path: &[&str], palette: &Palette) -> String {
         let path: Vec<String> = path.iter().map(|s| s.to_string()).collect();
@@ -948,7 +948,7 @@ LEARN MORE
 ";
         assert_eq!(help(&[], &Palette::off()), expected);
         // Every line fits an 80-column terminal, so the screen reads the
-        // same at 80 as at the critic's 120.
+        // same at 80 as at 120.
         assert_eq!(render_help_at(&[], &Palette::off(), NARROW), expected);
         assert!(!expected.contains("\n  \n"), "whitespace-only line");
     }
@@ -1294,7 +1294,7 @@ LEARN MORE
 
     /// One rule for every screen: on an 80-column terminal no line of any
     /// help screen reaches the last column, however long a piece wrote its
-    /// text, and at the critic's 120 columns a line under the cap is left
+    /// text, and at 120 columns a line under the cap is left
     /// exactly as written. Examples are the exception: they are commands
     /// and print verbatim.
     #[test]

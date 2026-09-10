@@ -643,9 +643,9 @@ pub fn usage_block(path: &[String]) -> String {
 /// `invalid argument "abc" for "--limit" flag`, both of a conflicting
 /// pair): the `Usage:` line, then `Flags:` with only those rows, each with
 /// its placeholder, description and default, since that row is the whole
-/// answer and the other five or twelve only push it away (the loop-7 judge
-/// found the full table under `--limit abc` inconsistent with the bare
-/// synopsis under an argument error). A name that matches nothing on the
+/// answer and the other five or twelve only push it away; a full table
+/// under `--limit abc` also reads inconsistently beside the bare synopsis
+/// under an argument error. A name that matches nothing on the
 /// command (a flag nobody declared) or an empty `flags` prints the whole
 /// table, so the flag the user meant can be found in it.
 pub fn usage_block_for(path: &[String], flags: &[String]) -> String {
@@ -1386,10 +1386,10 @@ mod tests {
     }
 
     /// A rejected token: gh's `HTTP 401:` label opens the sentence that
-    /// says where the token came from (the loop-6 judge found the status
-    /// dangling after the advice, and the loop-5 judge read the endpoint
-    /// as an internal probe leaking into `task list`), then the way back
-    /// for that source and, as the alternative, `asana auth login`; every
+    /// says where the token came from, so the status never dangles as
+    /// leftover debug output and the probe endpoint never reads as an
+    /// internal detail leaking into `task list`. Then the way back for
+    /// that source and, as the alternative, `asana auth login`; every
     /// line is a whole sentence under 80 columns.
     #[test]
     fn unauthorized_exits_4_and_names_the_token_source() {
@@ -1455,7 +1455,7 @@ mod tests {
     }
 
     /// The hint fits an 80-column terminal with the default config path,
-    /// so neither the critic's pty nor a narrow one wraps it.
+    /// so neither a wide terminal nor a narrow one wraps it.
     #[test]
     fn auth_hint_fits_80_columns_with_the_default_path() {
         let Some(home) = dirs::home_dir() else {
@@ -1965,8 +1965,8 @@ mod tests {
     }
 
     /// Every usage block, for every command, ends on its last table line
-    /// and carries no whitespace-only line (the loop-2 judge counted cobra's
-    /// two-space line against us twice).
+    /// and carries no whitespace-only line. Cobra leaves a bare two-space
+    /// line there; it reads as a stray, so ours does not.
     #[test]
     fn usage_blocks_have_no_whitespace_only_lines() {
         fn walk(cmd: &Command, path: &mut Vec<String>, seen: &mut usize) {
@@ -2011,10 +2011,9 @@ mod tests {
     }
 
     /// A rejected identifier: gh's line, what would have been accepted,
-    /// and the synopsis of the command it was typed for (the loop-5 judge
-    /// wanted every argument error to recover the same way). The error is
-    /// recognised by its type, `resolve::InvalidIdentifier`, wherever it
-    /// sits in the chain.
+    /// and the synopsis of the command it was typed for, so every usage
+    /// error recovers the same way. The error is recognised by its type,
+    /// `resolve::InvalidIdentifier`, wherever it sits in the chain.
     #[test]
     fn bad_identifiers_say_what_was_expected() {
         let bad = |kind: IdKind, input: &str| {
@@ -2243,10 +2242,9 @@ mod tests {
         assert_eq!(r.code, EXIT_ERROR);
         assert!(r.stdout.is_empty());
         // The message, the usage line, then the flag's own row and nothing
-        // else (the loop-6 judge found this the one argument error without
-        // a usage block; the loop-7 judge found the whole six-row table
-        // under it too much when one row is the answer): the row is where
-        // `--limit int` and its default are shown.
+        // else: without a usage block this was the odd one out, and the
+        // whole six-row table under it is too much when one row is the
+        // answer. That row is where `--limit int` and its default show.
         assert_eq!(
             r.stderr,
             "invalid argument \"abc\" for \"--limit\" flag: expected a whole number\n\

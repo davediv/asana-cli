@@ -16,7 +16,7 @@
 //! description  info  modified` separated by tabs, no header, ISO-8601 time.
 //! The table itself is the shared `render::Table`, which pads, truncates and
 //! paints in the bytes gh emits; the tests at the bottom hold it to the
-//! reference transcript.
+//! reference layout.
 //!
 //! `--json [fields]` and `-q, --jq <expression>` are gh's (the shared
 //! `render::json`): the raw API objects as an array, only the named
