@@ -3,8 +3,7 @@
 //! counts` line, `Label: value` lines, the description rendered with a
 //! two-space margin and padded to the width the way glamour does, and a
 //! muted permalink footer. Piped: `key:\tvalue` lines, `--`, the raw notes.
-
-mod resolve;
+//! `--json [fields]` and `--jq` are gh's, through `render::json`.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -12,23 +11,55 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::api::{ApiError, Named, Project, PROJECT_FIELDS, TASK_COUNT_FIELDS};
-use crate::cmd::{open_in_browser, print_json, with_spinner};
+use crate::cmd::{open_in_browser, with_spinner};
 use crate::ctx::Ctx;
+use crate::render::json::{self, JsonArgs};
 use crate::render::notes::render_body;
 use crate::render::time::{due_phrase, fuzzy_ago, iso, now, short_date, today, DueState};
 use crate::render::Palette;
+use crate::resolve::{parse_project_gid, resolve_project};
+
+/// Every top-level key `--json` can print: what `VIEW_FIELDS` asks Asana
+/// for (plus `gid`, which always comes back) and `task_counts`, the
+/// `/task_counts` object folded in so a script gets the numbers the view
+/// shows without a second call.
+const JSON_FIELDS: &[&str] = &[
+    "gid",
+    "name",
+    "archived",
+    "color",
+    "completed",
+    "completed_at",
+    "created_at",
+    "modified_at",
+    "due_on",
+    "start_on",
+    "notes",
+    "html_notes",
+    "owner",
+    "team",
+    "members",
+    "permalink_url",
+    "public",
+    "privacy_setting",
+    "current_status",
+    "current_status_update",
+    "workspace",
+    "task_counts",
+];
 
 #[derive(clap::Args, Debug)]
 #[command(
     about = "View a project",
     long_about = "Display the name, status, owner, task counts and description of a project.\n\n\
         A project can be given by gid, by URL, or by name. Names are matched\n\
-        case-insensitively, a unique prefix is enough, and a leading emoji may be\n\
-        left out (`UTL` finds `⚙️ UTL`).\n\n\
+        case-insensitively, a unique prefix or a whole word is enough, and a leading\n\
+        emoji may be left out (`UTL` finds `⚙️ UTL`).\n\n\
         With `--web`, open the project in a web browser instead.\n\n\
         For more information about output formatting flags, see `asana help formatting`.",
     after_help = "$ asana project view Roadmap\n\
-        $ asana project view 1200000000000000 --json\n\
+        $ asana project view Roadmap --json name,owner,task_counts\n\
+        $ asana project view 1200000000000000 --json permalink_url --jq .permalink_url\n\
         $ asana project view https://app.asana.com/0/1200000000000000/list --web"
 )]
 pub struct Args {
@@ -36,9 +67,8 @@ pub struct Args {
     #[arg(value_name = "project")]
     pub project: String,
 
-    /// Output the raw API object as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub json: JsonArgs,
 
     /// Open the project in the browser
     #[arg(short = 'w', long)]
@@ -251,9 +281,9 @@ async fn fetch_view(ctx: &Ctx, gid: &str) -> Result<Value, ApiError> {
     }
 }
 
-/// The task counts, or nothing when Asana will not say (the view still
-/// prints without them).
-async fn fetch_counts(ctx: &Ctx, gid: &str) -> Option<Counts> {
+/// The raw `/task_counts` object, or nothing when Asana will not say (the
+/// view still prints without the numbers).
+async fn fetch_counts(ctx: &Ctx, gid: &str) -> Option<Value> {
     ctx.api
         .get(
             &format!("/projects/{gid}/task_counts"),
@@ -263,34 +293,57 @@ async fn fetch_counts(ctx: &Ctx, gid: &str) -> Option<Counts> {
         .ok()
 }
 
-/// Nothing to check before the token is read; see `cmd::Prevalidate`.
-impl crate::cmd::Prevalidate for Args {}
+/// The gid `input` names: a gid or URL as is, a name through the shared
+/// lookup (case-insensitive, emoji-tolerant, prefix and whole-word tiers).
+async fn resolve_gid(ctx: &Ctx, input: &str) -> Result<String> {
+    if let Some(gid) = parse_project_gid(input) {
+        return Ok(gid);
+    }
+    Ok(resolve_project(ctx, input).await?.gid)
+}
+
+/// The `--json` object: the project as Asana sent it with the task counts
+/// folded in under `task_counts` (`null` when they could not be fetched).
+fn json_object(mut raw: Value, counts: Option<Value>) -> Value {
+    if let Value::Object(map) = &mut raw {
+        map.insert("task_counts".to_string(), counts.unwrap_or(Value::Null));
+    }
+    raw
+}
+
+/// `--jq` without `--json` and unknown `--json` fields fail before the
+/// token is read, as gh's do; see `cmd::Prevalidate`.
+impl crate::cmd::Prevalidate for Args {
+    const JSON_FIELDS: &'static [&'static str] = JSON_FIELDS;
+
+    fn prevalidate(&self, _interactive: bool) -> Result<()> {
+        self.json.check(Self::JSON_FIELDS)
+    }
+}
 
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     if args.web {
         let raw = with_spinner(ctx, "", async {
-            let gid = resolve::resolve_gid(ctx, &args.project).await?;
+            let gid = resolve_gid(ctx, &args.project).await?;
             Ok::<_, anyhow::Error>(fetch_view(ctx, &gid).await?)
         })
         .await?;
         let view: View = serde_json::from_value(raw)?;
         return open_in_browser(&view.url());
     }
-    if args.json {
-        let raw = with_spinner(ctx, "", async {
-            let gid = resolve::resolve_gid(ctx, &args.project).await?;
-            Ok::<_, anyhow::Error>(fetch_view(ctx, &gid).await?)
-        })
-        .await?;
-        return print_json(&raw);
-    }
     let (raw, counts) = with_spinner(ctx, "", async {
-        let gid = resolve::resolve_gid(ctx, &args.project).await?;
+        let gid = resolve_gid(ctx, &args.project).await?;
         let (raw, counts) = tokio::join!(fetch_view(ctx, &gid), fetch_counts(ctx, &gid));
-        Ok::<_, anyhow::Error>((raw?, counts.unwrap_or_default()))
+        Ok::<_, anyhow::Error>((raw?, counts))
     })
     .await?;
+    if args.json.is_json() {
+        return json::print(&json_object(raw, counts), &args.json, JSON_FIELDS);
+    }
     let view: View = serde_json::from_value(raw)?;
+    let counts: Counts = counts
+        .and_then(|c| serde_json::from_value(c).ok())
+        .unwrap_or_default();
 
     if ctx.is_tty {
         print!(
@@ -371,10 +424,9 @@ fn render_tty(v: &View, counts: &Counts, width: usize, color: bool, now: DateTim
         );
     }
 
-    // Body: blank, blank, the notes in gh's shape (or the muted placeholder
-    // gh prints for an empty issue body), blank, blank.
-    out.push('\n');
-    out.push('\n');
+    // Body: blank, blank, the notes in gh's issue-body shape, blank, blank.
+    // Nothing to show is one muted line with a single blank line each
+    // side, the way `gh repo view` prints its no-README line.
     let body = render_body(
         v.project.html_notes.as_deref(),
         v.project.notes.as_deref(),
@@ -382,17 +434,21 @@ fn render_tty(v: &View, counts: &Counts, width: usize, color: bool, now: DateTim
         &p,
     );
     if body.is_empty() {
+        out.push('\n');
         line(
             &mut out,
             &format!("  {}", p.muted("No description provided")),
         );
+        out.push('\n');
     } else {
+        out.push('\n');
+        out.push('\n');
         for l in body {
             line(&mut out, &l);
         }
+        out.push('\n');
+        out.push('\n');
     }
-    out.push('\n');
-    out.push('\n');
     line(
         &mut out,
         &p.muted(&format!("View this project in Asana: {}", v.url())),
@@ -622,7 +678,7 @@ mod tests {
         let out = render_tty(&v, &Counts::default(), 80, false, at());
         assert_eq!(
             out,
-            "Bare\nActive\n\n\n  No description provided\n\n\nView this project in Asana: https://app.asana.com/0/42/list\n"
+            "Bare\nActive\n\n  No description provided\n\nView this project in Asana: https://app.asana.com/0/42/list\n"
         );
     }
 
@@ -766,5 +822,148 @@ mod tests {
             .collect();
         let s = member_list(&members);
         assert!(s.ends_with("m19, and 5 more"), "{s}");
+    }
+
+    /// What `GET /projects/{gid}?opt_fields=VIEW_FIELDS` sends back: one
+    /// top-level key per requested field (plus `gid`), so the JSON FIELDS
+    /// list can be checked against the request rather than a guess.
+    #[test]
+    fn json_fields_cover_every_key_the_view_asks_for() {
+        use crate::cmd::Prevalidate;
+        let mut keys: Vec<&str> = VIEW_FIELDS
+            .split(',')
+            .map(|f| f.split('.').next().unwrap_or(f))
+            .collect();
+        keys.push("gid");
+        keys.push("task_counts");
+        keys.sort_unstable();
+        keys.dedup();
+        let mut declared: Vec<&str> = JSON_FIELDS.to_vec();
+        declared.sort_unstable();
+        assert_eq!(declared, keys);
+        assert_eq!(<Args as Prevalidate>::JSON_FIELDS, JSON_FIELDS);
+        // The fallback field list is a subset, so nothing there is unknown.
+        for f in PROJECT_FIELDS.split(',') {
+            let head = f.split('.').next().unwrap_or(f);
+            assert!(JSON_FIELDS.contains(&head), "{head} not in JSON_FIELDS");
+        }
+    }
+
+    #[test]
+    fn json_object_folds_the_task_counts_in() {
+        let raw = serde_json::json!({"gid": "1", "name": "Roadmap"});
+        let counts = serde_json::json!({"num_tasks": 12, "num_incomplete_tasks": 10, "num_completed_tasks": 2});
+        assert_eq!(
+            json_object(raw.clone(), Some(counts.clone())),
+            serde_json::json!({"gid": "1", "name": "Roadmap", "task_counts": counts})
+        );
+        assert_eq!(
+            json_object(raw, None),
+            serde_json::json!({"gid": "1", "name": "Roadmap", "task_counts": null})
+        );
+        // Anything that is not an object is left alone.
+        assert_eq!(json_object(Value::Null, None), Value::Null);
+    }
+
+    #[derive(clap::Parser, Debug)]
+    struct Cli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
+        use clap::Parser;
+        Cli::try_parse_from(std::iter::once("asana").chain(argv.iter().copied())).map(|c| c.args)
+    }
+
+    #[test]
+    fn json_flags_parse_and_prevalidate_like_gh() {
+        use crate::cmd::Prevalidate;
+        let plain = parse(&["Roadmap"]).unwrap();
+        assert_eq!(plain.project, "Roadmap");
+        assert!(!plain.json.is_json());
+        assert!(plain.prevalidate(true).is_ok());
+
+        let all = parse(&["Roadmap", "--json"]).unwrap();
+        assert!(all.json.is_json());
+        assert!(all.json.fields().is_empty());
+        assert!(all.prevalidate(true).is_ok());
+
+        let some = parse(&["Roadmap", "--json", "name,owner.name,task_counts"]).unwrap();
+        assert_eq!(
+            some.json.fields(),
+            vec!["name", "owner.name", "task_counts"]
+        );
+        assert!(some.prevalidate(true).is_ok());
+
+        let jq = parse(&[
+            "1200000000000000",
+            "--json",
+            "permalink_url",
+            "--jq",
+            ".permalink_url",
+        ])
+        .unwrap();
+        assert_eq!(jq.json.jq.as_deref(), Some(".permalink_url"));
+        assert!(jq.prevalidate(true).is_ok());
+
+        // `--json` before the argument would swallow it as the field list,
+        // so a following `--web` is not taken as one either.
+        let web = parse(&["Roadmap", "--json", "--web"]).unwrap();
+        assert!(web.json.is_json() && web.web);
+
+        let lone = parse(&["Roadmap", "--jq", "."]).unwrap();
+        assert_eq!(
+            lone.prevalidate(true).unwrap_err().to_string(),
+            "cannot use `--jq` without specifying `--json`"
+        );
+        let bad = parse(&["Roadmap", "--json", "nope"]).unwrap();
+        let err = bad.prevalidate(true).unwrap_err().to_string();
+        assert!(
+            err.starts_with("Unknown JSON field: \"nope\"\nAvailable fields:\n  archived\n"),
+            "{err}"
+        );
+        assert!(err.ends_with("\n  workspace"), "{err}");
+    }
+
+    #[test]
+    fn json_output_selects_fields_and_runs_jq() {
+        let raw = serde_json::json!({
+            "gid": "1200000000000000",
+            "name": "Roadmap",
+            "owner": {"gid": "1", "name": "Div"},
+            "permalink_url": "https://app.asana.com/0/1200000000000000/list"
+        });
+        let counts = serde_json::json!({"num_tasks": 3, "num_incomplete_tasks": 1, "num_completed_tasks": 2});
+        let value = json_object(raw, Some(counts));
+
+        let args = parse(&["Roadmap", "--json", "name,owner.name"]).unwrap();
+        assert_eq!(
+            json::render(&value, &args.json, JSON_FIELDS).unwrap(),
+            "{\n  \"name\": \"Roadmap\",\n  \"owner\": {\n    \"name\": \"Div\"\n  }\n}\n"
+        );
+        let args = parse(&[
+            "Roadmap",
+            "--json",
+            "--jq",
+            ".task_counts.num_incomplete_tasks",
+        ])
+        .unwrap();
+        assert_eq!(
+            json::render(&value, &args.json, JSON_FIELDS).unwrap(),
+            "1\n"
+        );
+        let args = parse(&[
+            "Roadmap",
+            "--json",
+            "permalink_url",
+            "--jq",
+            ".permalink_url",
+        ])
+        .unwrap();
+        assert_eq!(
+            json::render(&value, &args.json, JSON_FIELDS).unwrap(),
+            "https://app.asana.com/0/1200000000000000/list\n"
+        );
     }
 }
