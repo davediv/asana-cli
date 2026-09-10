@@ -6,7 +6,7 @@ GitHub: `asana task list`, `asana task view <gid>`, `asana task create --title`.
 ## Install
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 # or build locally and use ./bin/asana
 ./scripts/build.sh
 ```
