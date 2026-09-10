@@ -17,17 +17,52 @@
 //! The table itself is the shared `render::Table`, which pads, truncates and
 //! paints in the bytes gh emits; the tests at the bottom hold it to the
 //! reference transcript.
+//!
+//! `--json [fields]` and `-q, --jq <expression>` are gh's (the shared
+//! `render::json`): the raw API objects as an array, only the named
+//! top-level keys when a field list is given, filtered through a jq program
+//! under `--jq`. [`JSON_FIELDS`] is what a field may be, and what `--help`
+//! lists under JSON FIELDS.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::api::{Project, PROJECT_FIELDS};
-use crate::cmd::{open_in_browser, print_json, with_spinner};
+use crate::cli::usage_error;
+use crate::cmd::{open_in_browser, with_spinner};
 use crate::ctx::Ctx;
+use crate::render::json::{self, JsonArgs};
 use crate::render::table::Cell;
 use crate::render::time::{fuzzy_ago, iso, now};
 use crate::render::{Palette, Table};
+
+/// The command's path, for usage errors.
+const PATH: &[&str] = &["project", "list"];
+
+/// Every top-level key of a project as `--json` prints it: `gid` plus the
+/// fields `PROJECT_FIELDS` asks Asana for, with the dotted ones
+/// (`owner.name`, `current_status.title`, `team.name`) under their parent.
+/// `--json` takes these, and `--help` lists them under JSON FIELDS.
+const JSON_FIELDS: &[&str] = &[
+    "gid",
+    "name",
+    "archived",
+    "color",
+    "created_at",
+    "due_on",
+    "modified_at",
+    "owner",
+    "current_status",
+    "team",
+    "permalink_url",
+    "notes",
+    "privacy_setting",
+    "public",
+    "completed",
+    "start_on",
+    "members",
+];
 
 /// A cell painter, as `render::table::Cell::colored` takes it.
 type ColorFn = fn(&Palette, &str) -> String;
@@ -48,7 +83,8 @@ type ColorFn = fn(&Palette, &str) -> String;
     after_help = "$ asana project list\n\
         $ asana project list --archived\n\
         $ asana project list --limit 5\n\
-        $ asana project list --json\n\
+        $ asana project list --json gid,name,permalink_url\n\
+        $ asana project list --json name --jq '.[].name'\n\
         $ asana project list | cut -f1,2"
 )]
 pub struct Args {
@@ -60,9 +96,9 @@ pub struct Args {
     #[arg(short = 'L', long, value_name = "int", default_value_t = 30)]
     pub limit: usize,
 
-    /// Output the raw API objects as JSON
-    #[arg(long)]
-    pub json: bool,
+    /// `--json [fields]` and `-q, --jq <expression>`, gh's output flags.
+    #[command(flatten)]
+    pub json: JsonArgs,
 
     /// List projects in the web browser
     #[arg(short = 'w', long)]
@@ -215,7 +251,7 @@ fn terminal_table(items: &[Item], width: usize, palette: Palette, now: DateTime<
 /// The piped table: `gid  name  description  info  modified` per line,
 /// tab-separated, no header, ISO-8601 time, nothing truncated.
 fn piped_table(items: &[Item]) -> Table {
-    let mut table = Table::new(&[], false, usize::MAX, Palette::new(false));
+    let mut table = Table::tsv();
     for item in items {
         let p = &item.project;
         table.add_row(vec![
@@ -229,8 +265,25 @@ fn piped_table(items: &[Item]) -> Table {
     table
 }
 
-/// Nothing to check before the token is read; see `cmd::Prevalidate`.
-impl crate::cmd::Prevalidate for Args {}
+/// gh's own checks, before the token is read, in the order gh runs them:
+/// the `--json` flags first (an unknown field, `--jq` without `--json`,
+/// `--web` with `--json`; plain errors, no usage block), then `invalid
+/// limit: 0`, a flag error that the usage block follows. `JSON_FIELDS` is
+/// what `--help` prints under JSON FIELDS.
+impl crate::cmd::Prevalidate for Args {
+    const JSON_FIELDS: &'static [&'static str] = JSON_FIELDS;
+
+    fn prevalidate(&self, _interactive: bool) -> Result<()> {
+        self.json.check(Self::JSON_FIELDS)?;
+        if self.web && self.json.is_json() {
+            bail!("cannot use `--web` with `--json`");
+        }
+        if self.limit < 1 {
+            return Err(usage_error(PATH, format!("invalid limit: {}", self.limit)));
+        }
+        Ok(())
+    }
+}
 
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let ws = ctx.workspace().await?;
@@ -252,9 +305,9 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let total = items.len();
     items.truncate(args.limit.max(1));
 
-    if args.json {
+    if args.json.is_json() {
         let values: Vec<Value> = items.into_iter().map(|i| i.raw).collect();
-        return print_json(&values);
+        return json::print(&Value::Array(values), &args.json, JSON_FIELDS);
     }
 
     if !ctx.is_tty {
@@ -690,5 +743,189 @@ cli/scoop-gh                 [DEPRECATED] scoop packaging for the github cli    
             piped_table(&items).render(),
             "1213478466398849\tPR\tAbout PR releases\tprivate\t2026-09-10T08:02:28Z\n2\tBare\t\t\t\n"
         );
+    }
+
+    /// `Args` parsed the way `cli.rs` parses it, for the flag tests.
+    #[derive(clap::Parser, Debug)]
+    struct Cli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    fn parse(argv: &[&str]) -> Args {
+        use clap::Parser as _;
+        Cli::try_parse_from(std::iter::once("asana").chain(argv.iter().copied()))
+            .expect("parse")
+            .args
+    }
+
+    /// gh's `--json` takes an optional comma-separated field list and
+    /// `-q, --jq` an expression; a bare `--json` means every field, and a
+    /// flag after it is not swallowed as its value.
+    #[test]
+    fn json_flag_takes_an_optional_field_list() {
+        let none = parse(&[]);
+        assert!(!none.json.is_json());
+        assert_eq!(none.limit, 30);
+
+        let bare = parse(&["--json"]);
+        assert!(bare.json.is_json());
+        assert!(bare.json.fields().is_empty());
+
+        let some = parse(&["--limit", "2", "--json", "gid,name"]);
+        assert_eq!(some.json.fields(), vec!["gid", "name"]);
+        assert_eq!(some.limit, 2);
+
+        let after = parse(&["--json", "--limit", "2"]);
+        assert!(after.json.is_json());
+        assert!(after.json.fields().is_empty());
+        assert_eq!(after.limit, 2);
+
+        let jq = parse(&["--json", "name", "-q", ".[].name"]);
+        assert_eq!(jq.json.jq.as_deref(), Some(".[].name"));
+        let jq = parse(&["--jq", ".[]", "--json", "name", "--archived"]);
+        assert!(jq.archived);
+        assert_eq!(jq.json.jq.as_deref(), Some(".[]"));
+    }
+
+    /// The checks gh runs before the token is read, in gh's order: the
+    /// `--json` flags (plain errors) before `invalid limit: 0` (a flag
+    /// error, so a `UsageError` that the usage block follows).
+    #[test]
+    fn prevalidate_checks_json_flags_then_the_limit() {
+        use crate::cli::UsageError;
+        use crate::cmd::Prevalidate;
+
+        assert!(parse(&[]).prevalidate(true).is_ok());
+        assert!(parse(&["--json", "gid,owner.name", "--jq", "."])
+            .prevalidate(false)
+            .is_ok());
+
+        let err = parse(&["--limit", "0"])
+            .prevalidate(true)
+            .expect_err("zero");
+        assert_eq!(err.to_string(), "invalid limit: 0");
+        let usage = err.downcast_ref::<UsageError>().expect("a usage error");
+        assert_eq!(usage.path, vec!["project", "list"]);
+
+        let err = parse(&["--json", "nope"])
+            .prevalidate(true)
+            .expect_err("field");
+        assert!(
+            err.to_string()
+                .starts_with("Unknown JSON field: \"nope\"\nAvailable fields:\n  archived\n"),
+            "{err}"
+        );
+        assert!(err.downcast_ref::<UsageError>().is_none());
+
+        let err = parse(&["--jq", "."]).prevalidate(true).expect_err("jq");
+        assert_eq!(
+            err.to_string(),
+            "cannot use `--jq` without specifying `--json`"
+        );
+
+        let err = parse(&["--web", "--json"])
+            .prevalidate(true)
+            .expect_err("web");
+        assert_eq!(err.to_string(), "cannot use `--web` with `--json`");
+
+        // gh's order: a bad field is reported before a bad limit.
+        let err = parse(&["--json", "nope", "--limit", "0"])
+            .prevalidate(true)
+            .expect_err("both");
+        assert!(err.to_string().starts_with("Unknown JSON field"), "{err}");
+    }
+
+    /// `JSON_FIELDS` is exactly what a project off the wire has at its top
+    /// level: `gid` and every name in `PROJECT_FIELDS`, the dotted ones by
+    /// their parent, so `--json` can name any key it prints and no other.
+    #[test]
+    fn json_fields_cover_the_fields_we_request() {
+        let mut expected: Vec<&str> = vec!["gid"];
+        for f in PROJECT_FIELDS.split(',') {
+            let head = f.split('.').next().unwrap();
+            if !expected.contains(&head) {
+                expected.push(head);
+            }
+        }
+        expected.sort_unstable();
+        let mut ours: Vec<&str> = JSON_FIELDS.to_vec();
+        ours.sort_unstable();
+        assert_eq!(ours, expected);
+        assert_eq!(<Args as crate::cmd::Prevalidate>::JSON_FIELDS, JSON_FIELDS);
+    }
+
+    /// `--json gid,name` keeps those keys of each project, in the shape
+    /// gh's `--json number,title,state` prints (reference/gh/issue-list-json.txt);
+    /// a dotted field keeps its parent's shape; `--jq` reduces further, a
+    /// string result printed bare.
+    #[test]
+    fn json_output_keeps_the_fields_asked_for() {
+        let items = vec![
+            item(json!({
+                "gid": "1213478466398849", "name": "PR", "notes": "",
+                "privacy_setting": "private", "owner": {"gid": "9", "name": "Jane"},
+                "members": [{"gid": "9", "resource_type": "user"}],
+                "modified_at": "2026-09-10T08:02:28.980Z"
+            })),
+            item(json!({"gid": "2", "name": "Bare", "owner": null})),
+        ];
+        let raw = Value::Array(items.into_iter().map(|i| i.raw).collect());
+
+        let args = parse(&["--json", "gid,name"]);
+        assert_eq!(
+            json::render(&raw, &args.json, JSON_FIELDS).unwrap(),
+            "[\n  {\n    \"gid\": \"1213478466398849\",\n    \"name\": \"PR\"\n  },\n  {\n    \"gid\": \"2\",\n    \"name\": \"Bare\"\n  }\n]\n"
+        );
+
+        let args = parse(&["--json", "name,owner.name"]);
+        assert_eq!(
+            json::render(&raw, &args.json, JSON_FIELDS).unwrap(),
+            "[\n  {\n    \"name\": \"PR\",\n    \"owner\": {\n      \"name\": \"Jane\"\n    }\n  },\n  {\n    \"name\": \"Bare\",\n    \"owner\": null\n  }\n]\n"
+        );
+
+        let args = parse(&["--json", "name", "--jq", ".[].name"]);
+        assert_eq!(
+            json::render(&raw, &args.json, JSON_FIELDS).unwrap(),
+            "PR\nBare\n"
+        );
+
+        // Bare `--json`: everything, as it came off the wire.
+        let args = parse(&["--json"]);
+        let all = json::render(&raw, &args.json, JSON_FIELDS).unwrap();
+        assert!(all.contains("\"resource_type\": \"user\""), "{all}");
+        assert!(all.contains("\"privacy_setting\": \"private\""), "{all}");
+    }
+
+    /// The help prose is hand-wrapped short of 78 columns like gh's, says
+    /// where the output formats are documented, and its examples put the
+    /// `--json` field list last, where `--json` reads the next word.
+    #[test]
+    fn help_prose_is_hand_wrapped_like_gh() {
+        use clap::Args as _;
+        let cmd = Args::augment_args(clap::Command::new("list"));
+        let about = cmd.get_long_about().expect("long_about").to_string();
+        for line in about.lines() {
+            assert!(line.chars().count() <= 78, "wider than 78: {line}");
+            assert!(line.trim_end() == line, "trailing space: {line:?}");
+        }
+        assert!(about.contains("see `asana help formatting`."));
+        let examples = cmd.get_after_help().expect("examples").to_string();
+        for line in examples.lines() {
+            assert!(line.starts_with("$ asana project list"), "{line:?}");
+            assert!(line.chars().count() <= 78, "wider than 78: {line}");
+        }
+        assert!(examples.contains("--json gid,name,permalink_url"));
+        assert!(examples.contains("--jq '.[].name'"));
+        // The flag rows read as gh's (reference/gh/repo-list-help.txt).
+        let json = cmd.get_arguments().find(|a| a.get_id() == "json").unwrap();
+        assert_eq!(json.get_value_names().unwrap(), ["fields"]);
+        assert_eq!(
+            json.get_help().unwrap().to_string(),
+            "Output JSON with the specified fields"
+        );
+        let jq = cmd.get_arguments().find(|a| a.get_id() == "jq").unwrap();
+        assert_eq!(jq.get_short(), Some('q'));
+        assert_eq!(jq.get_value_names().unwrap(), ["expression"]);
     }
 }
