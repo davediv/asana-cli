@@ -1,30 +1,32 @@
 //! `asana project view`: one project, laid out like `gh repo view` /
-//! `gh issue view`: a bold title, a `state • owner • activity • counts`
-//! line, `Label: value` lines, the description rendered with a two-space
-//! margin, and a muted permalink footer. Piped: `key:\tvalue` lines, `--`,
-//! the raw notes.
+//! `gh issue view`: a bold name, a `state • visibility • owner • activity •
+//! counts` line, `Label: value` lines, the description rendered with a
+//! two-space margin and padded to the width the way glamour does, and a
+//! muted permalink footer. Piped: `key:\tvalue` lines, `--`, the raw notes.
 
-mod notes;
+mod resolve;
 
 use anyhow::Result;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
-use url::Url;
 
-use crate::api::{ApiError, Named, Workspace, PROJECT_FIELDS, TASK_COUNT_FIELDS};
-use crate::cmd::{finish, open_in_browser, print_json, spinner};
+use crate::api::{ApiError, Named, Project, PROJECT_FIELDS, TASK_COUNT_FIELDS};
+use crate::cmd::{open_in_browser, print_json, with_spinner};
 use crate::ctx::Ctx;
+use crate::render::notes::render_body;
 use crate::render::time::{due_phrase, fuzzy_ago, iso, now, short_date, today, DueState};
 use crate::render::Palette;
-use crate::resolve::resolve_project;
 
 #[derive(clap::Args, Debug)]
 #[command(
     about = "View a project",
     long_about = "Display the name, status, owner, task counts and description of a project.\n\n\
-        With `--web` flag, open the project in a web browser instead.\n\n\
-        A project can be given by gid, by URL, or by name (case-insensitive; a unique prefix is enough).",
+        A project can be given by gid, by URL, or by name. Names are matched\n\
+        case-insensitively, a unique prefix is enough, and a leading emoji may be\n\
+        left out (`UTL` finds `⚙️ UTL`).\n\n\
+        With `--web`, open the project in a web browser instead.\n\n\
+        For more information about output formatting flags, see `asana help formatting`.",
     after_help = "$ asana project view Roadmap\n\
         $ asana project view 1200000000000000 --json\n\
         $ asana project view https://app.asana.com/0/1200000000000000/list --web"
@@ -46,13 +48,11 @@ pub struct Args {
 /// Everything the view shows. Richer than the shared `PROJECT_FIELDS`:
 /// `html_notes` for rendering, the latest status update's type and text,
 /// member names, and timestamps.
-const VIEW_FIELDS: &str = "name,archived,color,created_at,modified_at,due_on,start_on,notes,html_notes,owner.name,team.name,members.name,permalink_url,public,completed,completed_at,current_status.title,current_status.text,current_status.color,current_status.created_at,current_status_update.status_type,current_status_update.title,current_status_update.created_at,workspace.name";
+const VIEW_FIELDS: &str = "name,archived,color,created_at,modified_at,due_on,start_on,notes,html_notes,owner.name,team.name,members.name,permalink_url,public,privacy_setting,completed,completed_at,current_status.title,current_status.text,current_status.color,current_status.created_at,current_status_update.status_type,current_status_update.title,current_status_update.created_at,workspace.name";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Status {
     title: Option<String>,
-    #[allow(dead_code)]
-    text: Option<String>,
     color: Option<String>,
     created_at: Option<DateTime<Utc>>,
 }
@@ -64,30 +64,16 @@ struct StatusUpdate {
     created_at: Option<DateTime<Utc>>,
 }
 
+/// The shared `Project` plus what only the view asks for. `current_status`
+/// is declared here (with its `created_at`) so it is taken before the rest
+/// of the object flattens into `project`.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct View {
-    #[serde(default)]
-    gid: String,
-    name: Option<String>,
-    archived: Option<bool>,
-    created_at: Option<DateTime<Utc>>,
-    modified_at: Option<DateTime<Utc>>,
-    due_on: Option<NaiveDate>,
-    #[allow(dead_code)]
-    start_on: Option<NaiveDate>,
-    notes: Option<String>,
-    html_notes: Option<String>,
-    owner: Option<Named>,
-    team: Option<Named>,
-    #[serde(default)]
-    members: Vec<Named>,
-    permalink_url: Option<String>,
-    completed: Option<bool>,
     completed_at: Option<DateTime<Utc>>,
     current_status: Option<Status>,
     current_status_update: Option<StatusUpdate>,
-    #[allow(dead_code)]
-    workspace: Option<Workspace>,
+    #[serde(flatten)]
+    project: Project,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -99,21 +85,38 @@ struct Counts {
 
 impl View {
     fn display(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.gid)
+        self.project.display()
     }
 
     fn url(&self) -> String {
-        self.permalink_url
-            .clone()
-            .unwrap_or_else(|| format!("https://app.asana.com/0/{}/list", self.gid))
+        self.project
+            .permalink_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("https://app.asana.com/0/{}/list", self.project.gid))
     }
 
     fn is_archived(&self) -> bool {
-        self.archived.unwrap_or(false)
+        self.project.archived.unwrap_or(false)
     }
 
     fn is_completed(&self) -> bool {
-        self.completed.unwrap_or(false)
+        self.project.completed.unwrap_or(false)
+    }
+
+    /// `public`, `private to team` or `private`, from `privacy_setting`
+    /// when Asana sent it, else the deprecated `public` flag; nothing when
+    /// neither came back.
+    fn visibility(&self) -> Option<&'static str> {
+        match self.project.privacy_setting.as_deref() {
+            Some("private_to_team") => Some("private to team"),
+            _ => match self.project.is_public()? {
+                true => Some("public"),
+                false => Some("private"),
+            },
+        }
     }
 
     /// The latest status update's health (`On track`, `At risk`, ...), from
@@ -236,40 +239,6 @@ fn task_summary(c: &Counts) -> Option<String> {
     Some(format!("{open} of {total} {noun} open"))
 }
 
-fn is_gid(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
-}
-
-/// A project gid from a gid or an app.asana.com URL (`/0/<project>/...`,
-/// `/1/<ws>/project/<project>/...`); `None` for anything else (a name).
-fn parse_project_gid(input: &str) -> Option<String> {
-    let s = input.trim();
-    if is_gid(s) {
-        return Some(s.to_string());
-    }
-    let url = Url::parse(s).ok()?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return None;
-    }
-    let segs: Vec<&str> = url
-        .path_segments()
-        .map(|it| it.filter(|s| !s.is_empty()).collect())
-        .unwrap_or_default();
-    if let Some(pos) = segs.iter().position(|s| *s == "project") {
-        return segs
-            .get(pos + 1)
-            .filter(|g| is_gid(g))
-            .map(|g| g.to_string());
-    }
-    if segs.first() == Some(&"0") {
-        return segs
-            .get(1)
-            .filter(|g| is_gid(g) && **g != "0")
-            .map(|g| g.to_string());
-    }
-    None
-}
-
 /// `GET /projects/{gid}` with the rich field list, falling back to the
 /// shared field list should Asana reject one of the names (HTTP 400).
 async fn fetch_view(ctx: &Ctx, gid: &str) -> Result<Value, ApiError> {
@@ -282,6 +251,8 @@ async fn fetch_view(ctx: &Ctx, gid: &str) -> Result<Value, ApiError> {
     }
 }
 
+/// The task counts, or nothing when Asana will not say (the view still
+/// prints without them).
 async fn fetch_counts(ctx: &Ctx, gid: &str) -> Option<Counts> {
     ctx.api
         .get(
@@ -296,32 +267,30 @@ async fn fetch_counts(ctx: &Ctx, gid: &str) -> Option<Counts> {
 impl crate::cmd::Prevalidate for Args {}
 
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
-    let sp = spinner(ctx);
-    let gid = match parse_project_gid(&args.project) {
-        Some(gid) => gid,
-        None => match resolve_project(ctx, &args.project).await {
-            Ok(p) => p.gid,
-            Err(e) => {
-                finish(sp);
-                return Err(e);
-            }
-        },
-    };
     if args.web {
-        let raw = fetch_view(ctx, &gid).await;
-        finish(sp);
-        let view: View = serde_json::from_value(raw?)?;
+        let raw = with_spinner(ctx, "", async {
+            let gid = resolve::resolve_gid(ctx, &args.project).await?;
+            Ok::<_, anyhow::Error>(fetch_view(ctx, &gid).await?)
+        })
+        .await?;
+        let view: View = serde_json::from_value(raw)?;
         return open_in_browser(&view.url());
     }
     if args.json {
-        let raw = fetch_view(ctx, &gid).await;
-        finish(sp);
-        return print_json(&raw?);
+        let raw = with_spinner(ctx, "", async {
+            let gid = resolve::resolve_gid(ctx, &args.project).await?;
+            Ok::<_, anyhow::Error>(fetch_view(ctx, &gid).await?)
+        })
+        .await?;
+        return print_json(&raw);
     }
-    let (raw, counts) = tokio::join!(fetch_view(ctx, &gid), fetch_counts(ctx, &gid));
-    finish(sp);
-    let view: View = serde_json::from_value(raw?)?;
-    let counts = counts.unwrap_or_default();
+    let (raw, counts) = with_spinner(ctx, "", async {
+        let gid = resolve::resolve_gid(ctx, &args.project).await?;
+        let (raw, counts) = tokio::join!(fetch_view(ctx, &gid), fetch_counts(ctx, &gid));
+        Ok::<_, anyhow::Error>((raw?, counts.unwrap_or_default()))
+    })
+    .await?;
+    let view: View = serde_json::from_value(raw)?;
 
     if ctx.is_tty {
         print!(
@@ -348,16 +317,19 @@ fn render_tty(v: &View, counts: &Counts, width: usize, color: bool, now: DateTim
     let mut meta: Vec<String> = Vec::new();
     let (label, hue) = state(v);
     meta.push(paint(&p, hue, label));
-    if let Some(owner) = v.owner.as_ref() {
+    if let Some(visibility) = v.visibility() {
+        meta.push(visibility.to_string());
+    }
+    if let Some(owner) = v.project.owner.as_ref() {
         meta.push(format!("owned by {}", owner.display()));
     }
     if v.is_completed() {
         if let Some(t) = v.completed_at {
             meta.push(format!("completed {}", fuzzy_ago(now, t)));
         }
-    } else if let Some(t) = v.modified_at {
+    } else if let Some(t) = v.project.modified_at {
         meta.push(format!("updated {}", fuzzy_ago(now, t)));
-    } else if let Some(t) = v.created_at {
+    } else if let Some(t) = v.project.created_at {
         meta.push(format!("created {}", fuzzy_ago(now, t)));
     }
     if let Some(summary) = task_summary(counts) {
@@ -383,41 +355,41 @@ fn render_tty(v: &View, counts: &Counts, width: usize, color: bool, now: DateTim
         }
         line(&mut out, &format!("{}{s}", p.bold("Status: ")));
     }
-    if let Some(due) = v.due_on {
-        let today = today();
-        let (phrase, due_state) = due_phrase(due, today);
-        let painted = match due_state {
-            DueState::Overdue => p.red(&phrase),
-            DueState::Today => p.yellow(&phrase),
-            DueState::Upcoming => phrase.clone(),
-        };
-        let full = short_date(due, today);
-        if full == phrase {
-            line(&mut out, &format!("{}{painted}", p.bold("Due: ")));
-        } else {
-            line(&mut out, &format!("{}{painted} ({full})", p.bold("Due: ")));
-        }
-    }
-    if let Some(team) = v.team.as_ref() {
-        line(&mut out, &format!("{}{}", p.bold("Team: "), team.display()));
-    }
-    if !v.members.is_empty() {
+    if let Some(due) = v.project.due_on {
         line(
             &mut out,
-            &format!("{}{}", p.bold("Members: "), member_list(&v.members)),
+            &format!("{}{}", p.bold("Due: "), due_line(v, due, &p)),
+        );
+    }
+    if let Some(team) = v.project.team.as_ref() {
+        line(&mut out, &format!("{}{}", p.bold("Team: "), team.display()));
+    }
+    if !v.project.members.is_empty() {
+        line(
+            &mut out,
+            &format!("{}{}", p.bold("Members: "), member_list(&v.project.members)),
         );
     }
 
+    // Body: blank, blank, the notes in gh's shape (or the muted placeholder
+    // gh prints for an empty issue body), blank, blank.
     out.push('\n');
     out.push('\n');
-    let body = notes::render(v.html_notes.as_deref(), v.notes.as_deref(), width, color);
+    let body = render_body(
+        v.project.html_notes.as_deref(),
+        v.project.notes.as_deref(),
+        width,
+        &p,
+    );
     if body.is_empty() {
         line(
             &mut out,
             &format!("  {}", p.muted("No description provided")),
         );
     } else {
-        line(&mut out, &body);
+        for l in body {
+            line(&mut out, &l);
+        }
     }
     out.push('\n');
     out.push('\n');
@@ -426,6 +398,28 @@ fn render_tty(v: &View, counts: &Counts, width: usize, color: bool, now: DateTim
         &p.muted(&format!("View this project in Asana: {}", v.url())),
     );
     out
+}
+
+/// `tomorrow (Sep 11)`, `3 days overdue (Sep 7)` in red, `today` in yellow;
+/// a finished project (complete or archived) gets the plain date, since
+/// nothing about it is overdue any more.
+fn due_line(v: &View, due: chrono::NaiveDate, p: &Palette) -> String {
+    let today = today();
+    let full = short_date(due, today);
+    if v.is_completed() || v.is_archived() {
+        return full;
+    }
+    let (phrase, due_state) = due_phrase(due, today);
+    let painted = match due_state {
+        DueState::Overdue => p.red(&phrase),
+        DueState::Today => p.yellow(&phrase),
+        DueState::Upcoming => phrase.clone(),
+    };
+    if full == phrase {
+        painted
+    } else {
+        format!("{painted} ({full})")
+    }
 }
 
 /// Up to twenty names, then `and N more`.
@@ -443,6 +437,7 @@ fn member_list(members: &[Named]) -> String {
 }
 
 /// `key:\tvalue` lines, `--`, then the raw notes, like `gh issue view | cat`.
+/// Every key is printed even when empty so the line count is stable.
 fn render_piped(v: &View, counts: &Counts) -> String {
     let mut out = String::new();
     let mut kv = |key: &str, value: String| {
@@ -451,11 +446,14 @@ fn render_piped(v: &View, counts: &Counts) -> String {
         out.push_str(&value);
         out.push('\n');
     };
+    let count = |n: Option<u64>| n.map(|n| n.to_string()).unwrap_or_default();
     kv("title", v.display().to_string());
     kv("state", state(v).0.to_uppercase());
+    kv("visibility", v.visibility().unwrap_or("").to_string());
     kv(
         "owner",
-        v.owner
+        v.project
+            .owner
             .as_ref()
             .map(|o| o.display())
             .unwrap_or("")
@@ -463,7 +461,8 @@ fn render_piped(v: &View, counts: &Counts) -> String {
     );
     kv(
         "team",
-        v.team
+        v.project
+            .team
             .as_ref()
             .map(|t| t.display())
             .unwrap_or("")
@@ -471,7 +470,8 @@ fn render_piped(v: &View, counts: &Counts) -> String {
     );
     kv(
         "members",
-        v.members
+        v.project
+            .members
             .iter()
             .map(Named::display)
             .collect::<Vec<_>>()
@@ -484,31 +484,22 @@ fn render_piped(v: &View, counts: &Counts) -> String {
             .or_else(|| v.status_title().map(str::to_string))
             .unwrap_or_default(),
     );
-    kv("due", v.due_on.map(|d| d.to_string()).unwrap_or_default());
     kv(
-        "tasks",
-        counts.num_tasks.map(|n| n.to_string()).unwrap_or_default(),
+        "due",
+        v.project.due_on.map(|d| d.to_string()).unwrap_or_default(),
     );
+    kv("tasks", count(counts.num_tasks));
+    kv("open", count(counts.num_incomplete_tasks));
+    kv("completed", count(counts.num_completed_tasks));
+    kv("created", v.project.created_at.map(iso).unwrap_or_default());
     kv(
-        "open",
-        counts
-            .num_incomplete_tasks
-            .map(|n| n.to_string())
-            .unwrap_or_default(),
+        "updated",
+        v.project.modified_at.map(iso).unwrap_or_default(),
     );
-    kv(
-        "completed",
-        counts
-            .num_completed_tasks
-            .map(|n| n.to_string())
-            .unwrap_or_default(),
-    );
-    kv("created", v.created_at.map(iso).unwrap_or_default());
-    kv("updated", v.modified_at.map(iso).unwrap_or_default());
-    kv("gid", v.gid.clone());
+    kv("gid", v.project.gid.clone());
     kv("url", v.url());
     out.push_str("--\n");
-    out.push_str(v.notes.as_deref().map(str::trim_end).unwrap_or(""));
+    out.push_str(v.project.notes.as_deref().map(str::trim_end).unwrap_or(""));
     out.push('\n');
     out
 }
@@ -517,6 +508,7 @@ fn render_piped(v: &View, counts: &Counts) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use unicode_width::UnicodeWidthStr;
 
     fn sample() -> View {
         serde_json::from_value(serde_json::json!({
@@ -532,6 +524,8 @@ mod tests {
             "team": {"gid": "2", "name": "Engineering"},
             "members": [{"gid": "1", "name": "Div"}, {"gid": "3", "name": "Alice"}],
             "permalink_url": "https://app.asana.com/0/1200000000000000/1200000000000000",
+            "public": false,
+            "privacy_setting": "private_to_team",
             "current_status": {"title": "Status Update - Sep 5", "color": "green", "created_at": "2026-09-05T09:00:00.000Z"},
             "current_status_update": {"status_type": "on_track", "title": "Status Update - Sep 5", "created_at": "2026-09-05T09:00:00.000Z"}
         }))
@@ -542,6 +536,39 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 9, 9, 10, 0, 0)
             .single()
             .expect("time")
+    }
+
+    #[test]
+    fn flattened_project_keeps_every_field() {
+        let v = sample();
+        assert_eq!(v.project.gid, "1200000000000000");
+        assert_eq!(v.display(), "Roadmap");
+        assert_eq!(v.project.members.len(), 2);
+        assert_eq!(
+            v.project.due_on.map(|d| d.to_string()).as_deref(),
+            Some("2026-09-30")
+        );
+        assert_eq!(v.visibility(), Some("private to team"));
+        assert!(v.current_status.as_ref().unwrap().created_at.is_some());
+        assert_eq!(v.status_title(), Some("Status Update - Sep 5"));
+        let bare: View = serde_json::from_value(serde_json::json!({"gid": "7"})).unwrap();
+        assert_eq!(bare.display(), "7");
+        assert_eq!(bare.visibility(), None);
+        assert_eq!(bare.url(), "https://app.asana.com/0/7/list");
+    }
+
+    #[test]
+    fn visibility_prefers_privacy_setting() {
+        let mut v = sample();
+        v.project.privacy_setting = Some("public_to_workspace".into());
+        assert_eq!(v.visibility(), Some("public"));
+        v.project.privacy_setting = Some("private".into());
+        assert_eq!(v.visibility(), Some("private"));
+        v.project.privacy_setting = None;
+        v.project.public = Some(true);
+        assert_eq!(v.visibility(), Some("public"));
+        v.project.public = Some(false);
+        assert_eq!(v.visibility(), Some("private"));
     }
 
     #[test]
@@ -556,7 +583,7 @@ mod tests {
         assert_eq!(lines[0], "Roadmap");
         assert_eq!(
             lines[1],
-            "Active • owned by Div • updated about 2 hours ago • 10 of 12 tasks open"
+            "Active • private to team • owned by Div • updated about 2 hours ago • 10 of 12 tasks open"
         );
         assert_eq!(
             lines[2],
@@ -567,8 +594,11 @@ mod tests {
         assert_eq!(lines[5], "Members: Div, Alice");
         assert_eq!(lines[6], "");
         assert_eq!(lines[7], "");
-        assert_eq!(lines[8], "  Plan for Q4.");
-        assert_eq!(lines[9], "  Ship the CLI.");
+        // The body is padded to width - 2, as glamour pads an issue body.
+        assert_eq!(lines[8].trim_end(), "  Plan for Q4.");
+        assert_eq!(lines[9].trim_end(), "  Ship the CLI.");
+        assert_eq!(UnicodeWidthStr::width(lines[8]), 78);
+        assert_eq!(UnicodeWidthStr::width(lines[9]), 78);
         assert_eq!(lines[10], "");
         assert_eq!(lines[11], "");
         assert_eq!(
@@ -582,14 +612,37 @@ mod tests {
     #[test]
     fn tty_without_extras() {
         let v = View {
-            gid: "42".into(),
-            name: Some("Bare".into()),
+            project: Project {
+                gid: "42".into(),
+                name: Some("Bare".into()),
+                ..Project::default()
+            },
             ..View::default()
         };
         let out = render_tty(&v, &Counts::default(), 80, false, at());
         assert_eq!(
             out,
             "Bare\nActive\n\n\n  No description provided\n\n\nView this project in Asana: https://app.asana.com/0/42/list\n"
+        );
+    }
+
+    #[test]
+    fn emoji_names_survive_the_header() {
+        let v: View = serde_json::from_value(serde_json::json!({
+            "gid": "9",
+            "name": "👨\u{200d}⚖️ LEGAL",
+            "html_notes": "<body></body>",
+            "notes": ""
+        }))
+        .unwrap();
+        let out = render_tty(&v, &Counts::default(), 120, true, at());
+        assert!(
+            out.starts_with("\x1b[0;1;39m👨\u{200d}⚖️ LEGAL\x1b[0m\n"),
+            "{out:?}"
+        );
+        assert_eq!(
+            render_piped(&v, &Counts::default()).lines().next(),
+            Some("title:\t👨\u{200d}⚖️ LEGAL")
         );
     }
 
@@ -604,7 +657,7 @@ mod tests {
             lines[0]
         );
         assert!(
-            lines[1].starts_with("\x1b[0;32mActive\x1b[0m • owned by Div"),
+            lines[1].starts_with("\x1b[0;32mActive\x1b[0m • private to team • owned by Div"),
             "{:?}",
             lines[1]
         );
@@ -613,6 +666,7 @@ mod tests {
             "{:?}",
             lines[2]
         );
+        assert!(lines[4].starts_with("\x1b[0;1;39mTeam: \x1b[0mEngineering"));
         assert!(lines
             .last()
             .unwrap()
@@ -629,18 +683,43 @@ mod tests {
         let out = render_piped(&sample(), &counts);
         assert_eq!(
             out,
-            "title:\tRoadmap\nstate:\tACTIVE\nowner:\tDiv\nteam:\tEngineering\nmembers:\tDiv, Alice\nstatus:\tOn track\ndue:\t2026-09-30\ntasks:\t12\nopen:\t10\ncompleted:\t2\ncreated:\t2026-06-01T10:00:00Z\nupdated:\t2026-09-09T08:00:00Z\ngid:\t1200000000000000\nurl:\thttps://app.asana.com/0/1200000000000000/1200000000000000\n--\nPlan for Q4.\nShip the CLI.\n"
+            "title:\tRoadmap\nstate:\tACTIVE\nvisibility:\tprivate to team\nowner:\tDiv\nteam:\tEngineering\nmembers:\tDiv, Alice\nstatus:\tOn track\ndue:\t2026-09-30\ntasks:\t12\nopen:\t10\ncompleted:\t2\ncreated:\t2026-06-01T10:00:00Z\nupdated:\t2026-09-09T08:00:00Z\ngid:\t1200000000000000\nurl:\thttps://app.asana.com/0/1200000000000000/1200000000000000\n--\nPlan for Q4.\nShip the CLI.\n"
         );
         assert!(!out.contains("\x1b["));
+    }
+
+    #[test]
+    fn piped_empty_notes_still_end_with_a_line() {
+        let v: View = serde_json::from_value(serde_json::json!({"gid": "7", "notes": ""})).unwrap();
+        let out = render_piped(&v, &Counts::default());
+        assert!(
+            out.ends_with("url:\thttps://app.asana.com/0/7/list\n--\n\n"),
+            "{out:?}"
+        );
+        assert_eq!(out.lines().count(), 17);
+    }
+
+    #[test]
+    fn finished_projects_are_never_overdue() {
+        let mut v = sample();
+        let p = Palette::new(true);
+        let past = chrono::NaiveDate::from_ymd_opt(2000, 4, 30).unwrap();
+        assert!(due_line(&v, past, &p).contains("overdue"));
+        assert!(due_line(&v, past, &p).contains("\x1b[0;31m"));
+        v.project.completed = Some(true);
+        assert_eq!(due_line(&v, past, &p), "Apr 30, 2000");
+        v.project.completed = None;
+        v.project.archived = Some(true);
+        assert_eq!(due_line(&v, past, &p), "Apr 30, 2000");
     }
 
     #[test]
     fn states_and_summaries() {
         let mut v = sample();
         assert_eq!(state(&v).0, "Active");
-        v.completed = Some(true);
+        v.project.completed = Some(true);
         assert_eq!(state(&v).0, "Complete");
-        v.archived = Some(true);
+        v.project.archived = Some(true);
         assert_eq!(state(&v).0, "Archived");
         assert_eq!(
             task_summary(&Counts {
@@ -687,32 +766,5 @@ mod tests {
             .collect();
         let s = member_list(&members);
         assert!(s.ends_with("m19, and 5 more"), "{s}");
-    }
-
-    #[test]
-    fn project_gids_from_urls() {
-        assert_eq!(parse_project_gid("123").as_deref(), Some("123"));
-        assert_eq!(parse_project_gid(" 123 ").as_deref(), Some("123"));
-        assert_eq!(
-            parse_project_gid("https://app.asana.com/0/1200000000000000/list").as_deref(),
-            Some("1200000000000000")
-        );
-        assert_eq!(
-            parse_project_gid("https://app.asana.com/0/1200000000000000/1211234567890123/f")
-                .as_deref(),
-            Some("1200000000000000")
-        );
-        assert_eq!(
-            parse_project_gid("https://app.asana.com/1/11/project/1200000000000000/list")
-                .as_deref(),
-            Some("1200000000000000")
-        );
-        assert_eq!(parse_project_gid("Roadmap"), None);
-        assert_eq!(parse_project_gid("12a"), None);
-        assert_eq!(
-            parse_project_gid("https://app.asana.com/0/0/1211234567890123"),
-            None
-        );
-        assert_eq!(parse_project_gid("ftp://app.asana.com/0/123/list"), None);
     }
 }
