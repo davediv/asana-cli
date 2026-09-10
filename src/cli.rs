@@ -223,12 +223,6 @@ impl Commands {
             Commands::Task(TaskCmd::Delete(a)) => parse_task_id(&a.task).map(drop)?,
             Commands::Task(TaskCmd::Complete(a)) => check_all(&a.tasks)?,
             Commands::Task(TaskCmd::Reopen(a)) => check_all(&a.tasks)?,
-            // `project list` has no `Prevalidate` check of its own yet; this
-            // one goes the day it grows gh's `invalid limit: 0` usage error
-            // (`task list` and `task create` carry theirs themselves).
-            Commands::Project(ProjectCmd::List(a)) if a.limit == 0 => {
-                anyhow::bail!("invalid limit: {}", a.limit)
-            }
             _ => {}
         }
         match self {

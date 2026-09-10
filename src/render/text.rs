@@ -15,6 +15,7 @@
 //! built on [`wrap_line`], and both stay inside [`PROSE_WIDTH`] on an
 //! 80-column terminal through [`prose_width`].
 
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// The widest a line of our own prose may be: under 80 columns, so an
@@ -47,7 +48,29 @@ pub fn prose_width() -> usize {
 
 /// Display width in terminal cells.
 pub fn width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    s.graphemes(true).map(grapheme_width).sum()
+}
+
+/// The columns one grapheme cluster occupies in a terminal.
+///
+/// `unicode-width` measures scalar by scalar, which is wrong for the two
+/// shapes that turn up in real names. A cluster joined by U+200D, like the
+/// judge emoji, is drawn as one glyph but measures as the sum of its parts;
+/// and a character followed by U+FE0F, like the gear, is drawn as an emoji
+/// two cells wide but measures as the narrow text form. Both are counted
+/// here as a single wide cell, which is what a terminal draws and therefore
+/// what a table has to pad against.
+fn grapheme_width(g: &str) -> usize {
+    const VARIATION_SELECTOR_16: char = '\u{fe0f}';
+    const ZERO_WIDTH_JOINER: char = '\u{200d}';
+    if g.contains(VARIATION_SELECTOR_16) || g.contains(ZERO_WIDTH_JOINER) {
+        return 2;
+    }
+    match UnicodeWidthStr::width(g) {
+        // A lone combining mark still belongs to whatever it follows.
+        0 if g.chars().count() > 1 => 1,
+        w => w,
+    }
 }
 
 /// Truncate to `max` cells with a `...` suffix, like gh's `text.Truncate`.
@@ -65,13 +88,14 @@ pub fn truncate(max: usize, s: &str) -> String {
 fn take_width(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
-    for ch in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    // Whole clusters only: half of a joined emoji is not a character.
+    for g in s.graphemes(true) {
+        let w = grapheme_width(g);
         if used + w > max {
             break;
         }
         used += w;
-        out.push(ch);
+        out.push_str(g);
     }
     out
 }
@@ -341,6 +365,31 @@ pub fn display_url(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    /// A terminal draws one glyph per grapheme cluster, so the table pads
+    /// against clusters, not scalars: the gear carries a presentation
+    /// selector and the judge is three scalars joined by ZWJ, yet each
+    /// occupies one wide cell.
+    #[test]
+    fn emoji_clusters_measure_one_wide_cell() {
+        use super::width;
+        assert_eq!(width("PR"), 2);
+        assert_eq!(width("\u{2699}\u{fe0f} UTL"), 2 + 1 + 3);
+        assert_eq!(width("\u{1f47e} FUN"), 2 + 1 + 3);
+        assert_eq!(width("\u{1f468}\u{200d}\u{2696}\u{fe0f} LEGAL"), 2 + 1 + 5);
+        assert_eq!(width("caf\u{e9}"), 4);
+        assert_eq!(width("cafe\u{301}"), 4);
+    }
+
+    /// Truncation never splits a cluster in half.
+    #[test]
+    fn truncation_keeps_clusters_whole() {
+        use super::truncate;
+        let judge = "\u{1f468}\u{200d}\u{2696}\u{fe0f} LEGAL";
+        assert_eq!(truncate(2, judge), "\u{1f468}\u{200d}\u{2696}\u{fe0f}");
+        assert_eq!(truncate(1, judge), "");
+        assert_eq!(truncate(99, judge), judge);
+    }
+
     use super::*;
 
     #[test]
