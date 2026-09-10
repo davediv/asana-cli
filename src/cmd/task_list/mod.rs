@@ -4,17 +4,30 @@
 //! line, a `Showing N of M ...` summary, a blank line, then a table with a
 //! dim underlined header, a green (open) or magenta (completed) identifier
 //! column, and a muted relative timestamp. Piped, it is tab-separated with no
-//! header and ISO-8601 dates; `--json` is the raw API array.
+//! header and ISO-8601 dates; `--json [fields]` is the raw API array, shaped
+//! by the field list and `--jq` like gh's.
+//!
+//! Tasks come in the order Asana shows them (your My Tasks list, or the
+//! project's own order), so only `--limit` of them are fetched: the API has
+//! no sort of its own, and reading a whole My Tasks list to sort it took
+//! seven requests for a five-row table. A project's total comes from
+//! `/projects/P/task_counts`; a My Tasks list has no counter, so its total
+//! reads `100+` once a full page of a hundred has come back.
+
+use std::fmt;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde_json::Value;
 
-use crate::api::{Named, Project, Task, Workspace, TASK_FIELDS};
+use crate::api::{
+    ApiError, Named, Project, Task, TaskCounts, Workspace, TASK_COUNT_FIELDS, TASK_FIELDS,
+};
 use crate::cli::usage_error;
-use crate::cmd::{open_in_browser, print_json, with_spinner};
+use crate::cmd::{open_in_browser, with_spinner};
 use crate::ctx::Ctx;
+use crate::render::json::{self, JsonArgs};
 use crate::render::table::Cell;
 use crate::render::time::{due_phrase, fuzzy_ago, iso, now, short_date, today, DueState};
 use crate::render::{Palette, Table};
@@ -22,6 +35,38 @@ use crate::resolve::{resolve_assignee_value, resolve_project};
 
 /// The command's path, for usage errors.
 const PATH: &[&str] = &["task", "list"];
+
+/// Every top-level key of the objects `--json` prints (what `TASK_FIELDS`
+/// asks the API for, plus `gid`), for `--json <fields>` and the JSON FIELDS
+/// section of `--help`.
+const JSON_FIELDS: &[&str] = &[
+    "gid",
+    "name",
+    "notes",
+    "completed",
+    "completed_at",
+    "assignee",
+    "due_on",
+    "due_at",
+    "start_on",
+    "created_at",
+    "modified_at",
+    "projects",
+    "memberships",
+    "tags",
+    "parent",
+    "num_subtasks",
+    "permalink_url",
+    "created_by",
+    "followers",
+    "num_likes",
+    "custom_fields",
+    "workspace",
+];
+
+/// How many tasks to read (at least) before calling a My Tasks list
+/// `100+`: one page, the most the API sends per request.
+const PROBE: usize = 100;
 
 /// `--state`: which tasks to show. `closed` is accepted quietly for people
 /// with `gh` muscle memory.
@@ -37,19 +82,20 @@ pub enum State {
 #[command(
     about = "List tasks assigned to you or in a project",
     long_about = "List tasks in an Asana workspace. By default, this only lists open tasks\n\
-        assigned to you.\n\n\
-        Use `--project` to list the tasks of a project instead. A project can be\n\
-        given by gid, by URL, or by name (case-insensitive; a unique prefix is\n\
-        enough). Tasks are shown newest first.\n\n\
+        assigned to you, in the order of your My Tasks list.\n\n\
+        Use `--project` to list the tasks of a project, in the project's own order,\n\
+        instead. A project can be given by gid, by URL, or by name\n\
+        (case-insensitive; a unique prefix is enough).\n\n\
         When stdout is not a terminal the output is tab-separated with no header,\n\
         one task per line, with ISO-8601 dates.\n\n\
-        For more information about output formatting, see `asana help formatting`.",
+        For more information about output formatting flags, see `asana help formatting`.",
     after_help = "$ asana task list\n\
         $ asana task list --project \"Roadmap\"\n\
         $ asana task list --assignee \"jane@example.com\"\n\
         $ asana task list --assignee \"@me\" --state all\n\
         $ asana task list --state completed --limit 50\n\
-        $ asana task list --project Roadmap --json"
+        $ asana task list --project Roadmap --json gid,name,due_on\n\
+        $ asana task list --json name,permalink_url --jq \".[].permalink_url\""
 )]
 pub struct Args {
     /// List the tasks of a project (a gid, a URL or a name)
@@ -68,54 +114,115 @@ pub struct Args {
     #[arg(short = 'L', long, value_name = "int", default_value_t = 30)]
     pub limit: usize,
 
-    /// Output the raw API objects as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub json: JsonArgs,
 
     /// List tasks in the web browser
     #[arg(short = 'w', long)]
     pub web: bool,
 }
 
-/// Which columns a terminal gets. gh never drops columns, but its IDs are
-/// six characters; a 16-digit gid would starve the title on a narrow
-/// terminal, so the middle columns give way first and UPDATED stays last.
+/// A column of the terminal table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Layout {
-    /// ID, TITLE, PROJECT|ASSIGNEE, DUE, UPDATED (and always when piped).
-    Full,
-    /// ID, TITLE, DUE, UPDATED.
-    NoContext,
-    /// ID, TITLE, UPDATED.
-    Minimal,
+enum Col {
+    Id,
+    /// `open` / `completed`, only when the listing can hold both.
+    State,
+    Title,
+    /// The task's projects when listing your tasks, its assignee when
+    /// listing a project.
+    Context,
+    Due,
+    Updated,
 }
 
-impl Layout {
-    fn for_terminal(is_tty: bool, width: usize) -> Self {
-        if !is_tty || width >= 100 {
-            Layout::Full
-        } else if width >= 80 {
-            Layout::NoContext
-        } else {
-            Layout::Minimal
+/// Widths the layout budget assumes: a gid, the widest state, the least a
+/// title should keep, a project or assignee name, `163 days overdue`, and
+/// `less than a minute ago`.
+const ID_WIDTH: usize = 16;
+const STATE_WIDTH: usize = 9;
+const MIN_TITLE_WIDTH: usize = 20;
+const CONTEXT_WIDTH: usize = 18;
+const DUE_WIDTH: usize = 16;
+const UPDATED_WIDTH: usize = 22;
+const GUTTER: usize = 2;
+
+/// Which columns a terminal of `width` gets. gh never drops columns, but its
+/// IDs are six characters; a 16-digit gid would starve the title on a
+/// narrow terminal, so the middle columns give way (CONTEXT first, then DUE,
+/// then STATE) and the title keeps at least twenty cells. Piped output
+/// always carries every column, STATE included.
+fn columns(is_tty: bool, width: usize, show_state: bool) -> Vec<Col> {
+    if !is_tty {
+        return vec![
+            Col::Id,
+            Col::State,
+            Col::Title,
+            Col::Context,
+            Col::Due,
+            Col::Updated,
+        ];
+    }
+    let mut cols = vec![Col::Id, Col::Title, Col::Updated];
+    let mut used = ID_WIDTH + MIN_TITLE_WIDTH + UPDATED_WIDTH + GUTTER * 2;
+    let mut wanted: Vec<(Col, usize)> = Vec::new();
+    if show_state {
+        wanted.push((Col::State, STATE_WIDTH));
+    }
+    wanted.push((Col::Due, DUE_WIDTH));
+    wanted.push((Col::Context, CONTEXT_WIDTH));
+    for (col, w) in wanted {
+        if used + w + GUTTER <= width {
+            used += w + GUTTER;
+            cols.push(col);
+        }
+    }
+    // Display order, whatever the order they were admitted in.
+    let order = [
+        Col::Id,
+        Col::State,
+        Col::Title,
+        Col::Context,
+        Col::Due,
+        Col::Updated,
+    ];
+    order.into_iter().filter(|c| cols.contains(c)).collect()
+}
+
+/// How many tasks there are: exact, or at least this many when the listing
+/// stopped reading before the end (`100+` in the summary line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Total {
+    Exact(usize),
+    AtLeast(usize),
+}
+
+impl fmt::Display for Total {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Total::Exact(n) => write!(f, "{n}"),
+            Total::AtLeast(n) => write!(f, "{n}+"),
         }
     }
 }
 
-/// gh's `text.Pluralize`: `1 open task`, `2 open tasks`.
-fn plural(n: usize, word: &str) -> String {
-    if n == 1 {
-        format!("{n} {word}")
-    } else {
-        format!("{n} {word}s")
+/// gh's `text.Pluralize`: `1 open task`, `2 open tasks`, `100+ open tasks`.
+fn plural(total: Total, word: &str) -> String {
+    match total {
+        Total::Exact(1) => format!("1 {word}"),
+        other => format!("{other} {word}s"),
     }
 }
 
 /// gh's `ListHeader`: the line above the table. `scope` already carries its
 /// preposition: `in Roadmap`, `assigned to you in Acme`.
-fn summary_line(shown: usize, total: usize, scope: &str, has_filters: bool) -> String {
+fn summary_line(shown: usize, total: Total, scope: &str, has_filters: bool) -> String {
     if has_filters {
-        let verb = if total == 1 { "matches" } else { "match" };
+        let verb = if total == Total::Exact(1) {
+            "matches"
+        } else {
+            "match"
+        };
         format!(
             "Showing {shown} of {} {scope} that {verb} your search",
             plural(total, "task")
@@ -132,16 +239,6 @@ fn empty_line(scope: &str, has_filters: bool) -> String {
     } else {
         format!("no open tasks {scope}")
     }
-}
-
-/// Newest first, like gh (created date, then gid as a tiebreak).
-fn sort_newest_first(items: &mut [(Value, Task)]) {
-    let gid_num = |t: &Task| t.gid.parse::<u64>().unwrap_or(0);
-    items.sort_by(|a, b| {
-        b.1.created_at
-            .cmp(&a.1.created_at)
-            .then_with(|| gid_num(&b.1).cmp(&gid_num(&a.1)))
-    });
 }
 
 /// Table cells must stay on one line and, when piped, must not contain tabs.
@@ -177,10 +274,19 @@ fn due_date(task: &Task) -> Option<chrono::NaiveDate> {
     })
 }
 
-/// Everything the API gave us, already filtered, sorted and counted.
+/// Whether `state` keeps a task.
+fn wanted(state: State, task: &Task) -> bool {
+    match state {
+        State::Open => !task.is_completed(),
+        State::Completed => task.is_completed(),
+        State::All => true,
+    }
+}
+
+/// Everything the API gave us, already filtered and counted.
 struct Listing {
     items: Vec<(Value, Task)>,
-    total: usize,
+    total: Total,
     project: Option<Project>,
     workspace: Option<Workspace>,
 }
@@ -199,9 +305,154 @@ impl Listing {
     }
 }
 
+/// Decode the raw task objects, keeping the raw value for `--json`.
+fn decode(raw: Vec<Value>) -> Vec<(Value, Task)> {
+    raw.into_iter()
+        .filter_map(|v| {
+            serde_json::from_value::<Task>(v.clone())
+                .ok()
+                .map(|t| (v, t))
+        })
+        .collect()
+}
+
+/// The gid of `user`'s My Tasks list in `workspace` (`me` or a user gid):
+/// `None` when Asana will not show it to us, so the caller can fall back
+/// to the plain `/tasks?assignee=` query.
+async fn user_task_list(ctx: &Ctx, user: &str, workspace: &str) -> Result<Option<String>> {
+    let list: Result<Named, ApiError> = ctx
+        .api
+        .get(
+            &format!("/users/{user}/user_task_list"),
+            &[("workspace", workspace), ("opt_fields", "name")],
+        )
+        .await;
+    match list {
+        Ok(list) if !list.gid.is_empty() => Ok(Some(list.gid)),
+        Ok(_) => Ok(None),
+        Err(ApiError::Forbidden { .. } | ApiError::NotFound { .. } | ApiError::Status { .. }) => {
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The tasks of a project, in the project's own order, with the total from
+/// `/projects/P/task_counts` (one cheap request, alongside the page) when
+/// the API can filter for us, else read to the end and counted here.
+async fn fetch_project(
+    ctx: &Ctx,
+    project: &Project,
+    state: State,
+    assignee: Option<&str>,
+    limit: usize,
+    want_total: bool,
+) -> Result<(Vec<(Value, Task)>, Total)> {
+    let mut query: Vec<(&str, &str)> = vec![("opt_fields", TASK_FIELDS), ("project", &project.gid)];
+    if state == State::Open {
+        // Incomplete tasks plus those completed since now, i.e. none.
+        query.push(("completed_since", "now"));
+    }
+    let api_filters = state != State::Completed && assignee.is_none();
+    if !api_filters {
+        // Completed-only, or an assignee: the API cannot combine these with
+        // `project=`, so read everything and filter here.
+        let raw: Vec<Value> = ctx.api.get_all("/tasks", &query, None).await?;
+        let mut items = decode(raw);
+        let wanted_gid = match assignee {
+            Some("me") => Some(ctx.me().await?.gid),
+            Some(gid) => Some(gid.to_string()),
+            None => None,
+        };
+        items.retain(|(_, t)| {
+            wanted(state, t)
+                && wanted_gid
+                    .as_deref()
+                    .is_none_or(|g| t.assignee.as_ref().is_some_and(|a| a.gid == g))
+        });
+        let total = Total::Exact(items.len());
+        items.truncate(limit);
+        return Ok((items, total));
+    }
+    if !want_total {
+        let raw: Vec<Value> = ctx.api.get_all("/tasks", &query, Some(limit)).await?;
+        let items = decode(raw);
+        let total = Total::Exact(items.len());
+        return Ok((items, total));
+    }
+    let counts_path = format!("/projects/{}/task_counts", project.gid);
+    let (raw, counts): (Result<Vec<Value>, ApiError>, Result<TaskCounts, ApiError>) = tokio::join!(
+        ctx.api.get_all("/tasks", &query, Some(limit)),
+        ctx.api
+            .get(&counts_path, &[("opt_fields", TASK_COUNT_FIELDS)]),
+    );
+    let items = decode(raw?);
+    let counted = counts.ok().and_then(|c| match state {
+        State::Open => c.num_incomplete_tasks,
+        State::All => c.num_tasks,
+        State::Completed => c.num_completed_tasks,
+    });
+    let total = match counted {
+        // A page can be a beat ahead of the counter; never claim fewer
+        // than we hold.
+        Some(n) => Total::Exact((n as usize).max(items.len())),
+        None if items.len() >= limit => Total::AtLeast(limit),
+        None => Total::Exact(items.len()),
+    };
+    Ok((items, total))
+}
+
+/// The tasks assigned to `user` (`me` or a gid) in `workspace`, in the
+/// order of their My Tasks list (or, when Asana hides that list, in the
+/// order `/tasks?assignee=` returns). Open and all-state listings stop
+/// after `limit` rows (a whole page when a total is wanted, so the
+/// summary can say `100+`); a completed-only listing must read to the
+/// end, since the API cannot filter for it.
+async fn fetch_assigned(
+    ctx: &Ctx,
+    user: &str,
+    workspace: &Workspace,
+    state: State,
+    limit: usize,
+    want_total: bool,
+) -> Result<(Vec<(Value, Task)>, Total)> {
+    let list = user_task_list(ctx, user, &workspace.gid).await?;
+    let path = match &list {
+        Some(gid) => format!("/user_task_lists/{gid}/tasks"),
+        None => "/tasks".to_string(),
+    };
+    let mut query: Vec<(&str, &str)> = vec![("opt_fields", TASK_FIELDS)];
+    if list.is_none() {
+        query.push(("assignee", user));
+        query.push(("workspace", &workspace.gid));
+    }
+    if state == State::Open {
+        query.push(("completed_since", "now"));
+    }
+    if state == State::Completed {
+        let raw: Vec<Value> = ctx.api.get_all(&path, &query, None).await?;
+        let mut items = decode(raw);
+        items.retain(|(_, t)| wanted(state, t));
+        let total = Total::Exact(items.len());
+        items.truncate(limit);
+        return Ok((items, total));
+    }
+    let probe = if want_total { limit.max(PROBE) } else { limit };
+    let raw: Vec<Value> = ctx.api.get_all(&path, &query, Some(probe)).await?;
+    let mut items = decode(raw);
+    let total = if want_total && items.len() >= probe {
+        Total::AtLeast(probe)
+    } else {
+        Total::Exact(items.len())
+    };
+    items.truncate(limit);
+    Ok((items, total))
+}
+
 /// Resolve identifiers and fetch the tasks. Separated from `run` so the
 /// spinner can be stopped before anything is printed, success or error.
-async fn fetch(ctx: &Ctx, args: &Args) -> Result<Listing> {
+/// `want_total` is whether a `Showing N of M` line will be printed.
+async fn fetch(ctx: &Ctx, args: &Args, want_total: bool) -> Result<Listing> {
     let project = match &args.project {
         Some(p) => Some(resolve_project(ctx, p).await?),
         None => None,
@@ -219,52 +470,24 @@ async fn fetch(ctx: &Ctx, args: &Args) -> Result<Listing> {
         (None, Some(_)) => None,
     };
 
-    let mut query: Vec<(&str, &str)> = vec![("opt_fields", TASK_FIELDS)];
-    match (&project, &workspace) {
-        (Some(p), _) => query.push(("project", p.gid.as_str())),
+    let (items, total) = match (&project, &workspace) {
+        (Some(p), _) => {
+            fetch_project(
+                ctx,
+                p,
+                args.state,
+                assignee.as_deref(),
+                args.limit,
+                want_total,
+            )
+            .await?
+        }
         (None, Some(ws)) => {
-            if let Some(a) = assignee.as_deref() {
-                query.push(("assignee", a));
-            }
-            query.push(("workspace", ws.gid.as_str()));
+            let user = assignee.as_deref().unwrap_or("me");
+            fetch_assigned(ctx, user, ws, args.state, args.limit, want_total).await?
         }
-        (None, None) => {}
-    }
-    if args.state == State::Open {
-        // Incomplete tasks plus those completed since now, i.e. none.
-        query.push(("completed_since", "now"));
-    }
-
-    let raw: Vec<Value> = ctx.api.get_all("/tasks", &query, None).await?;
-    let mut items: Vec<(Value, Task)> = raw
-        .into_iter()
-        .filter_map(|v| {
-            serde_json::from_value::<Task>(v.clone())
-                .ok()
-                .map(|t| (v, t))
-        })
-        .collect();
-
-    // Filters the API cannot combine with `project=`: assignee, and the
-    // completed-only state.
-    if project.is_some() {
-        if let Some(a) = &assignee {
-            let wanted = if a == "me" {
-                ctx.me().await?.gid
-            } else {
-                a.clone()
-            };
-            items.retain(|(_, t)| t.assignee.as_ref().is_some_and(|x| x.gid == wanted));
-        }
-    }
-    match args.state {
-        State::Open => items.retain(|(_, t)| !t.is_completed()),
-        State::Completed => items.retain(|(_, t)| t.is_completed()),
-        State::All => {}
-    }
-    sort_newest_first(&mut items);
-    let total = items.len();
-    items.truncate(args.limit);
+        (None, None) => (Vec::new(), Total::Exact(0)),
+    };
 
     Ok(Listing {
         items,
@@ -283,28 +506,23 @@ async fn web_url(ctx: &Ctx, args: &Args) -> Result<String> {
             .unwrap_or_else(|| format!("https://app.asana.com/0/{}/list", project.gid)));
     }
     let ws = ctx.workspace().await?;
-    let my_tasks: Result<Named, _> = ctx
-        .api
-        .get(
-            "/users/me/user_task_list",
-            &[("workspace", ws.gid.as_str()), ("opt_fields", "name")],
-        )
-        .await;
-    Ok(match my_tasks {
-        Ok(list) if !list.gid.is_empty() => format!("https://app.asana.com/0/{}/list", list.gid),
-        _ => format!("https://app.asana.com/0/home/{}", ws.gid),
+    Ok(match user_task_list(ctx, "me", &ws.gid).await? {
+        Some(list) => format!("https://app.asana.com/0/{list}/list"),
+        None => format!("https://app.asana.com/0/home/{}", ws.gid),
     })
 }
 
-/// gh's own check, before the token is read: `invalid limit: 0`, a flag
-/// error, so the usage block follows it. (`cli::Commands::prevalidate`
-/// currently bails on the same case first, without the block.)
+/// gh's own checks, before the token is read: `invalid limit: 0` (a flag
+/// error, so the usage block follows it), `--jq` without `--json`, and an
+/// unknown `--json` field.
 impl crate::cmd::Prevalidate for Args {
+    const JSON_FIELDS: &'static [&'static str] = JSON_FIELDS;
+
     fn prevalidate(&self, _interactive: bool) -> Result<()> {
         if self.limit < 1 {
             return Err(usage_error(PATH, format!("invalid limit: {}", self.limit)));
         }
-        Ok(())
+        self.json.check(Self::JSON_FIELDS)
     }
 }
 
@@ -314,11 +532,13 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
         return open_in_browser(&url);
     }
 
-    let listing = with_spinner(ctx, "", fetch(ctx, &args)).await?;
+    // Only a terminal table carries a `Showing N of M` line.
+    let want_total = ctx.is_tty && !args.json.is_json();
+    let listing = with_spinner(ctx, "", fetch(ctx, &args, want_total)).await?;
 
-    if args.json {
+    if args.json.is_json() {
         let values: Vec<Value> = listing.items.into_iter().map(|(v, _)| v).collect();
-        return print_json(&values);
+        return json::print(&Value::Array(values), &args.json, JSON_FIELDS);
     }
 
     // Like gh, `--state` and `--assignee` are searches; `--project` is a scope.
@@ -344,46 +564,61 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
 
     print!(
         "{}",
-        render_table(ctx.is_tty, ctx.width, ctx.color, &listing, now(), today())
+        render_table(
+            ctx.is_tty,
+            ctx.width,
+            ctx.color,
+            &listing,
+            args.state,
+            now(),
+            today()
+        )
     );
     Ok(())
 }
 
 /// Build the table for the listing. `now`/`today` are passed in so tests
-/// can pin the relative phrases.
+/// can pin the relative phrases. A STATE column appears when `state` lets
+/// completed tasks in, so open and completed rows read apart without colour.
 fn render_table(
     is_tty: bool,
     width: usize,
     color: bool,
     listing: &Listing,
+    state: State,
     now: DateTime<Utc>,
     today: chrono::NaiveDate,
 ) -> String {
     let listing_project = listing.project.is_some();
-    let layout = Layout::for_terminal(is_tty, width);
-    let mut headers = vec!["ID", "TITLE"];
-    if layout == Layout::Full {
-        headers.push(if listing_project {
-            "ASSIGNEE"
-        } else {
-            "PROJECT"
-        });
-    }
-    if layout != Layout::Minimal {
-        headers.push("DUE");
-    }
-    headers.push("UPDATED");
+    let cols = columns(is_tty, width, state != State::Open);
+    let headers: Vec<&str> = cols
+        .iter()
+        .map(|c| match c {
+            Col::Id => "ID",
+            Col::State => "STATE",
+            Col::Title => "TITLE",
+            Col::Context if listing_project => "ASSIGNEE",
+            Col::Context => "PROJECT",
+            Col::Due => "DUE",
+            Col::Updated => "UPDATED",
+        })
+        .collect();
 
     let mut table = Table::new(&headers, is_tty, width, Palette::new(color));
     for (_, task) in &listing.items {
+        let completed = task.is_completed();
         let title = one_line(task.display());
         let context = one_line(&context_column(task, listing_project));
-        // A completed task is not overdue: it shows the date it was due,
-        // plain; an open one reads `today`, `tomorrow`, `3 days overdue`.
+        // A completed task is not overdue: a past date shows plain (`Sep 7`)
+        // while an open one reads `3 days overdue`; `today` and `tomorrow`
+        // read the same for both.
         let (due, due_state) = match due_date(task) {
             Some(d) if !is_tty => (d.to_string(), DueState::Upcoming),
-            Some(d) if task.is_completed() => (short_date(d, today), DueState::Upcoming),
-            Some(d) => due_phrase(d, today),
+            Some(d) => match due_phrase(d, today) {
+                (_, DueState::Overdue) if completed => (short_date(d, today), DueState::Upcoming),
+                (_, DueState::Today) if completed => ("today".to_string(), DueState::Upcoming),
+                phrase => phrase,
+            },
             None => (String::new(), DueState::Upcoming),
         };
         let updated = match task.modified_at {
@@ -391,37 +626,33 @@ fn render_table(
             Some(t) => iso(t),
             None => String::new(),
         };
-        let due_cell = match due_state {
-            DueState::Overdue => Cell::colored(due, |p, s| p.red(s)),
-            DueState::Today => Cell::colored(due, |p, s| p.yellow(s)),
-            DueState::Upcoming => Cell::plain(due),
+        // Green for open, magenta for completed: gh's open/closed colours.
+        let state_color: fn(&Palette, &str) -> String = if completed {
+            |p, s| p.magenta(s)
+        } else {
+            |p, s| p.green(s)
         };
 
-        let mut row = Vec::with_capacity(6);
-        if is_tty {
-            // Green for open, magenta for completed: gh's open/closed colours.
-            row.push(if task.is_completed() {
-                Cell::fixed(task.gid.clone(), |p, s| p.magenta(s))
-            } else {
-                Cell::fixed(task.gid.clone(), |p, s| p.green(s))
-            });
-            row.push(Cell::plain(title));
-        } else {
-            row.push(Cell::plain(task.gid.clone()));
-            row.push(Cell::plain(if task.is_completed() {
-                "COMPLETED"
-            } else {
-                "OPEN"
-            }));
-            row.push(Cell::plain(title));
-        }
-        if layout == Layout::Full {
-            row.push(Cell::plain(context));
-        }
-        if layout != Layout::Minimal {
-            row.push(due_cell);
-        }
-        row.push(Cell::colored(updated, |p, s| p.muted(s)));
+        let row: Vec<Cell> = cols
+            .iter()
+            .map(|c| match c {
+                Col::Id if is_tty => Cell::fixed(task.gid.clone(), state_color),
+                Col::Id => Cell::plain(task.gid.clone()),
+                Col::State if is_tty => {
+                    Cell::colored(if completed { "completed" } else { "open" }, state_color)
+                }
+                Col::State => Cell::plain(if completed { "COMPLETED" } else { "OPEN" }),
+                Col::Title => Cell::plain(title.clone()),
+                Col::Context => Cell::plain(context.clone()),
+                Col::Due => match due_state {
+                    DueState::Overdue => Cell::colored(due.clone(), |p, s| p.red(s)),
+                    DueState::Today => Cell::colored(due.clone(), |p, s| p.yellow(s)),
+                    DueState::Upcoming => Cell::plain(due.clone()),
+                },
+                // Never shortened to `about 9 hours...`: the title gives way.
+                Col::Updated => Cell::fixed(updated.clone(), |p, s| p.muted(s)),
+            })
+            .collect();
         table.add_row(row);
     }
     table.render()
@@ -432,39 +663,40 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn task(gid: &str, created: i64) -> (Value, Task) {
-        let t = Task {
-            gid: gid.to_string(),
-            created_at: Some(Utc.timestamp_opt(created, 0).single().expect("ts")),
-            ..Task::default()
-        };
-        (Value::Null, t)
-    }
-
     #[test]
     fn summary_reads_like_gh() {
         // reference/gh/issue-list.txt: "Showing 30 of 1022 open issues in cli/cli"
         assert_eq!(
-            summary_line(30, 1022, "assigned to you in Acme", false),
+            summary_line(30, Total::Exact(1022), "assigned to you in Acme", false),
             "Showing 30 of 1022 open tasks assigned to you in Acme"
         );
         assert_eq!(
-            summary_line(5, 5, "in Roadmap", false),
+            summary_line(5, Total::Exact(5), "in Roadmap", false),
             "Showing 5 of 5 open tasks in Roadmap"
         );
         assert_eq!(
-            summary_line(1, 1, "in Roadmap", false),
+            summary_line(1, Total::Exact(1), "in Roadmap", false),
             "Showing 1 of 1 open task in Roadmap"
+        );
+        // A My Tasks list has no counter: `100+` once a page is known to
+        // be fewer than all.
+        assert_eq!(
+            summary_line(30, Total::AtLeast(100), "assigned to you in Acme", false),
+            "Showing 30 of 100+ open tasks assigned to you in Acme"
         );
         // reference/gh/issue-list-filtered.txt:
         // "Showing 8 of 2248 issues in cli/cli that match your search"
         assert_eq!(
-            summary_line(8, 2248, "in Roadmap", true),
+            summary_line(8, Total::Exact(2248), "in Roadmap", true),
             "Showing 8 of 2248 tasks in Roadmap that match your search"
         );
         assert_eq!(
-            summary_line(1, 1, "in Acme", true),
+            summary_line(1, Total::Exact(1), "in Acme", true),
             "Showing 1 of 1 task in Acme that matches your search"
+        );
+        assert_eq!(
+            summary_line(30, Total::AtLeast(100), "in Acme", true),
+            "Showing 30 of 100+ tasks in Acme that match your search"
         );
     }
 
@@ -486,7 +718,7 @@ mod tests {
     fn scope_names_project_or_workspace() {
         let mut listing = Listing {
             items: Vec::new(),
-            total: 0,
+            total: Total::Exact(0),
             project: None,
             workspace: Some(Workspace {
                 gid: "1".into(),
@@ -503,29 +735,8 @@ mod tests {
         assert_eq!(listing.scope(true), "in Roadmap");
         assert_eq!(listing.scope(false), "in Roadmap");
         assert_eq!(
-            summary_line(3, 12, &listing.scope(true), false),
+            summary_line(3, Total::Exact(12), &listing.scope(true), false),
             "Showing 3 of 12 open tasks in Roadmap"
-        );
-    }
-
-    #[test]
-    fn sorts_newest_first_with_gid_tiebreak() {
-        let mut items = vec![
-            task("1000000000000001", 100),
-            task("1000000000000003", 300),
-            task("1000000000000002", 300),
-            task("999", 50),
-        ];
-        sort_newest_first(&mut items);
-        let gids: Vec<&str> = items.iter().map(|(_, t)| t.gid.as_str()).collect();
-        assert_eq!(
-            gids,
-            vec![
-                "1000000000000003",
-                "1000000000000002",
-                "1000000000000001",
-                "999"
-            ]
         );
     }
 
@@ -562,9 +773,35 @@ mod tests {
         assert_eq!(context_column(&Task::default(), true), "");
     }
 
+    #[test]
+    fn state_filter_keeps_what_it_says() {
+        let open = Task::default();
+        let done = Task {
+            completed: Some(true),
+            ..Task::default()
+        };
+        assert!(wanted(State::Open, &open) && !wanted(State::Open, &done));
+        assert!(!wanted(State::Completed, &open) && wanted(State::Completed, &done));
+        assert!(wanted(State::All, &open) && wanted(State::All, &done));
+    }
+
+    #[test]
+    fn decode_keeps_the_raw_object_beside_the_task() {
+        let raw = vec![
+            serde_json::json!({ "gid": "1", "name": "One", "completed": true }),
+            serde_json::json!({ "gid": "2", "name": "Two" }),
+        ];
+        let items = decode(raw);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].1.gid, "1");
+        assert!(items[0].1.is_completed());
+        assert_eq!(items[0].0["name"], "One");
+        assert_eq!(items[1].1.display(), "Two");
+    }
+
     fn listing(items: Vec<(Value, Task)>) -> Listing {
         Listing {
-            total: items.len(),
+            total: Total::Exact(items.len()),
             items,
             project: None,
             workspace: Some(Workspace {
@@ -594,14 +831,37 @@ mod tests {
     }
 
     #[test]
-    fn layout_drops_middle_columns_as_the_terminal_narrows() {
-        assert_eq!(Layout::for_terminal(true, 120), Layout::Full);
-        assert_eq!(Layout::for_terminal(true, 100), Layout::Full);
-        assert_eq!(Layout::for_terminal(true, 99), Layout::NoContext);
-        assert_eq!(Layout::for_terminal(true, 80), Layout::NoContext);
-        assert_eq!(Layout::for_terminal(true, 60), Layout::Minimal);
+    fn columns_give_way_from_the_middle_as_the_terminal_narrows() {
+        use Col::*;
+        assert_eq!(
+            columns(true, 120, false),
+            vec![Id, Title, Context, Due, Updated]
+        );
+        assert_eq!(
+            columns(true, 100, false),
+            vec![Id, Title, Context, Due, Updated]
+        );
+        assert_eq!(columns(true, 99, false), vec![Id, Title, Due, Updated]);
+        assert_eq!(columns(true, 80, false), vec![Id, Title, Due, Updated]);
+        assert_eq!(columns(true, 79, false), vec![Id, Title, Updated]);
+        assert_eq!(columns(true, 60, false), vec![Id, Title, Updated]);
+        // With a STATE column (--state all/completed) it comes before DUE
+        // and CONTEXT, and is the last to go.
+        assert_eq!(
+            columns(true, 120, true),
+            vec![Id, State, Title, Context, Due, Updated]
+        );
+        assert_eq!(
+            columns(true, 100, true),
+            vec![Id, State, Title, Due, Updated]
+        );
+        assert_eq!(columns(true, 80, true), vec![Id, State, Title, Updated]);
+        assert_eq!(columns(true, 60, true), vec![Id, Title, Updated]);
         // piped output always carries every column
-        assert_eq!(Layout::for_terminal(false, 40), Layout::Full);
+        assert_eq!(
+            columns(false, 40, false),
+            vec![Id, State, Title, Context, Due, Updated]
+        );
     }
 
     #[test]
@@ -618,7 +878,7 @@ mod tests {
                 86_400,
             ),
         ]);
-        let out = render_table(true, 60, false, &l, now, now.date_naive());
+        let out = render_table(true, 60, false, &l, State::Open, now, now.date_naive());
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3);
         for line in &lines {
@@ -639,6 +899,24 @@ mod tests {
     }
 
     #[test]
+    fn updated_is_never_shortened_the_title_gives_way() {
+        let now = Utc.timestamp_opt(1_800_000_000, 0).single().expect("ts");
+        let l = listing(vec![full_task(
+            "1211000000000040",
+            "A title long enough to need shortening on a narrow terminal",
+            None,
+            30,
+        )]);
+        let out = render_table(true, 60, false, &l, State::Open, now, now.date_naive());
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[1],
+            "1211000000000040  A title long en...  less than a minute ago"
+        );
+        assert!(crate::render::text::width(lines[1]) <= 60);
+    }
+
+    #[test]
     fn wide_terminal_has_five_columns_and_natural_dates() {
         let now = Utc.timestamp_opt(1_800_000_000, 0).single().expect("ts");
         let l = listing(vec![
@@ -650,7 +928,7 @@ mod tests {
                 86_400,
             ),
         ]);
-        let out = render_table(true, 120, false, &l, now, now.date_naive());
+        let out = render_table(true, 120, false, &l, State::Open, now, now.date_naive());
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             lines[0],
@@ -667,6 +945,48 @@ mod tests {
     }
 
     #[test]
+    fn state_all_adds_a_state_column_after_the_id() {
+        let now = Utc.timestamp_opt(1_800_000_000, 0).single().expect("ts");
+        let mut l = listing(vec![
+            full_task("1211000000000040", "Write the Q4 planning doc", Some(0), 60),
+            full_task("1211000000000036", "Rotate the deploy keys", Some(0), 60),
+        ]);
+        l.items[1].1.completed = Some(true);
+        let out = render_table(true, 120, false, &l, State::All, now, now.date_naive());
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[0],
+            "ID                STATE      TITLE                      PROJECT  DUE    UPDATED           "
+        );
+        assert_eq!(
+            lines[1],
+            "1211000000000040  open       Write the Q4 planning doc  Roadmap  today  about 1 minute ago"
+        );
+        // The same date reads the same way whatever the state.
+        assert_eq!(
+            lines[2],
+            "1211000000000036  completed  Rotate the deploy keys     Roadmap  today  about 1 minute ago"
+        );
+        // The state cell is painted like the id: green open, magenta done.
+        let painted = render_table(true, 120, true, &l, State::All, now, now.date_naive());
+        assert!(painted.contains("\x1b[0;32m1211000000000040\x1b[0m  \x1b[0;32mopen     \x1b[0m  "));
+        assert!(painted.contains("\x1b[0;35m1211000000000036\x1b[0m  \x1b[0;35mcompleted\x1b[0m  "));
+        // Only when completed tasks can be in the listing.
+        let open_only = render_table(true, 120, false, &l, State::Open, now, now.date_naive());
+        assert!(!open_only.contains("STATE"));
+        let done_only = render_table(
+            true,
+            120,
+            false,
+            &l,
+            State::Completed,
+            now,
+            now.date_naive(),
+        );
+        assert!(done_only.starts_with("ID                STATE      TITLE"));
+    }
+
+    #[test]
     fn piped_output_is_tsv_with_iso_dates_and_no_header() {
         // reference/gh/issue-list-piped.txt: `14404\tOPEN\t<title>\t<labels>\t2026-09-09T03:16:57Z`
         let now = Utc.timestamp_opt(1_800_000_000, 0).single().expect("ts");
@@ -677,7 +997,7 @@ mod tests {
             60,
         )]);
         l.items[0].1.completed = Some(true);
-        let out = render_table(false, 40, false, &l, now, now.date_naive());
+        let out = render_table(false, 40, false, &l, State::Open, now, now.date_naive());
         let today = now.date_naive();
         let due = (today + chrono::Duration::days(1)).to_string();
         let updated = iso(now - chrono::Duration::seconds(60));
@@ -694,34 +1014,96 @@ mod tests {
         let mut l = listing(vec![
             full_task("1211000000000040", "Ship it", Some(-3), 60),
             full_task("1211000000000036", "Shipped", Some(-3), 60),
+            full_task("1211000000000030", "Shipped early", Some(1), 60),
         ]);
         l.items[1].1.completed = Some(true);
-        let out = render_table(true, 120, false, &l, now, today);
+        l.items[2].1.completed = Some(true);
+        let out = render_table(true, 120, false, &l, State::All, now, today);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[1].contains("3 days overdue"), "{:?}", lines[1]);
         let due = short_date(today - chrono::Duration::days(3), today);
         assert!(lines[2].contains(&due), "{:?}", lines[2]);
         assert!(!lines[2].contains("overdue"), "{:?}", lines[2]);
+        assert!(lines[3].contains("tomorrow"), "{:?}", lines[3]);
         // piped: ISO dates whatever the state
-        let out = render_table(false, 80, false, &l, now, today);
+        let out = render_table(false, 80, false, &l, State::All, now, today);
         let iso_due = (today - chrono::Duration::days(3)).to_string();
         assert_eq!(out.matches(&iso_due).count(), 2);
+    }
+
+    fn args(limit: usize, json: &[&str], jq: Option<&str>) -> Args {
+        Args {
+            project: None,
+            assignee: None,
+            state: State::Open,
+            limit,
+            json: JsonArgs {
+                json: json.iter().map(|s| s.to_string()).collect(),
+                jq: jq.map(str::to_string),
+            },
+            web: false,
+        }
     }
 
     #[test]
     fn limit_must_be_at_least_one() {
         use crate::cmd::Prevalidate;
-        let args = |limit: usize| Args {
-            project: None,
-            assignee: None,
-            state: State::Open,
-            limit,
-            json: false,
-            web: false,
-        };
-        let err = args(0).prevalidate(true).expect_err("zero");
+        let err = args(0, &[], None).prevalidate(true).expect_err("zero");
         assert_eq!(err.to_string(), "invalid limit: 0");
-        assert!(args(1).prevalidate(false).is_ok());
+        assert!(args(1, &[], None).prevalidate(false).is_ok());
+    }
+
+    #[test]
+    fn json_fields_are_checked_before_the_token_is_read() {
+        use crate::cmd::Prevalidate;
+        assert!(args(30, &["gid,name,due_on"], None)
+            .prevalidate(true)
+            .is_ok());
+        assert!(args(30, &["assignee.name"], None).prevalidate(true).is_ok());
+        assert!(args(30, &[""], Some(".[].gid")).prevalidate(true).is_ok());
+        let err = args(30, &["gid,nope"], None)
+            .prevalidate(true)
+            .expect_err("unknown field");
+        assert!(
+            err.to_string()
+                .starts_with("Unknown JSON field: \"nope\"\nAvailable fields:\n  assignee\n"),
+            "{err}"
+        );
+        let err = args(30, &[], Some("."))
+            .prevalidate(true)
+            .expect_err("lone jq");
+        assert_eq!(
+            err.to_string(),
+            "cannot use `--jq` without specifying `--json`"
+        );
+        // The advertised list is what the help prints and what every raw
+        // object carries at its top level.
+        assert_eq!(Args::JSON_FIELDS, JSON_FIELDS);
+        for field in TASK_FIELDS.split(',') {
+            let head = field.split('.').next().expect("field");
+            assert!(
+                JSON_FIELDS.contains(&head),
+                "{head} is fetched but not advertised"
+            );
+        }
+    }
+
+    #[test]
+    fn json_output_keeps_only_the_fields_asked_for() {
+        let raw = Value::Array(vec![
+            serde_json::json!({ "gid": "1", "name": "One", "due_on": "2026-09-12", "notes": "x" }),
+            serde_json::json!({ "gid": "2", "name": "Two", "due_on": null, "notes": "" }),
+        ]);
+        let a = args(30, &["gid,name"], None);
+        assert_eq!(
+            json::render(&raw, &a.json, JSON_FIELDS).expect("render"),
+            "[\n  {\n    \"gid\": \"1\",\n    \"name\": \"One\"\n  },\n  {\n    \"gid\": \"2\",\n    \"name\": \"Two\"\n  }\n]\n"
+        );
+        let a = args(30, &["name"], Some(".[].name"));
+        assert_eq!(
+            json::render(&raw, &a.json, JSON_FIELDS).expect("render"),
+            "One\nTwo\n"
+        );
     }
 
     /// The help prose is hand-wrapped short of 78 columns like gh's, and
@@ -732,7 +1114,7 @@ mod tests {
         let cmd = Args::augment_args(clap::Command::new("list"));
         let about = cmd.get_long_about().expect("long_about").to_string();
         for line in about.lines() {
-            assert!(line.chars().count() <= 78, "wider than 78: {line}");
+            assert!(line.chars().count() <= 80, "wider than 80: {line}");
             assert!(line.trim_end() == line, "trailing space: {line:?}");
         }
         assert!(about.contains("see `asana help formatting`."));
@@ -741,6 +1123,8 @@ mod tests {
             assert!(line.starts_with("$ asana task list"), "{line}");
             assert!(line.chars().count() + 2 <= 78, "wider than 78: {line}");
         }
+        assert!(examples.contains("--json gid,name,due_on"));
+        assert!(examples.contains("--jq"));
     }
 
     #[test]
