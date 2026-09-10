@@ -24,17 +24,22 @@ pub const ROOT_ABOUT: &str = "Work with an Asana workspace from the command line
 /// works before a token is stored: the one command that logs in, with the
 /// page the token comes from in its comment. Then one taste of each noun,
 /// as gh's root screen gives one of `issue`, `repo` and `pr`, none of them
-/// repeating the group screens' own examples. gh's leaf screens group
-/// examples this way, a `# comment` line over each block and a blank line
-/// between.
+/// repeating the group screens' own examples. Each invocation gets its own
+/// `# comment` saying what it does, the way `gh auth login --help` and `gh
+/// auth status --help` comment theirs: a comment shared by three unrelated
+/// commands explains none of them.
 pub const ROOT_EXAMPLES: &str = "\
 # Log in with a personal access token from https://app.asana.com/0/my-apps
 $ asana auth login
 
-# Work with tasks and projects
+# List the open tasks assigned to you
 $ asana task list
-$ asana project view \"Roadmap\"
-$ asana task create --title \"Fix the login page\" --project \"Roadmap\"";
+
+# Create a task in a project
+$ asana task create --title \"Fix the login page\" --project \"Roadmap\"
+
+# Open a project in the browser
+$ asana project view \"Roadmap\" --web";
 
 /// The `auth:` line on the root screen and the first line of `asana auth
 /// --help` say the same thing, as gh's do ("Authenticate gh and git with
@@ -47,17 +52,22 @@ pub const AUTH_ABOUT: &str = "Authenticate with Asana";
 /// token comes from, where it is stored), the environment variable second
 /// as the route for scripts, then the command that checks the result.
 /// `AUTH_ABOUT` plus a period, then the how-to, hand-wrapped like gh's
-/// heredoc descriptions.
+/// heredoc descriptions and split into one paragraph per question a reader
+/// arrives with (how do I log in, what if I am a script, how do I check),
+/// so the screen is scanned rather than read.
 pub const AUTH_LONG_ABOUT: &str = "\
 Authenticate with Asana.
 
 Run `asana auth login` to get started: it prompts for a personal access
 token from https://app.asana.com/0/my-apps, checks it against Asana and
 stores it in ~/.config/asana/config.toml for every other command to use.
+
 Alternatively, populate the ASANA_TOKEN environment variable with a token,
 which suits scripts and automation; `asana help environment` has the
-details. Run `asana auth status` to see which account is in use and where
-its token came from.";
+details.
+
+Run `asana auth status` to see which account is in use and where its token
+came from.";
 
 /// The auth group's examples, commented like `gh auth login --help`'s: the
 /// interactive login, the scripted one, and the check.
@@ -461,6 +471,30 @@ mod tests {
             }
         }
         assert!(ROOT_EXAMPLES.contains("https://app.asana.com/0/my-apps\n$ asana auth login\n"));
+        // Every commented block explains the invocations under it, so no
+        // comment stands over commands it does not describe: one `#` line
+        // per block, and at most two invocations under any of them.
+        for ex in [ROOT_EXAMPLES, AUTH_EXAMPLES] {
+            for block in ex.split("\n\n") {
+                let mut lines = block.lines();
+                let head = lines.next().expect("a block has a first line");
+                assert!(head.starts_with("# "), "block without a comment: {block:?}");
+                let rest: Vec<&str> = lines.collect();
+                assert!(
+                    !rest.is_empty() && rest.len() <= 2 && rest.iter().all(|l| l.starts_with("$ ")),
+                    "one comment over {} commands: {block:?}",
+                    rest.len()
+                );
+            }
+        }
+        // The root gives one taste of each noun, in the order a first run
+        // meets them.
+        for noun in ["auth", "task", "project"] {
+            assert!(
+                ROOT_EXAMPLES.contains(&format!("$ asana {noun} ")),
+                "root examples skip {noun}"
+            );
+        }
         assert!(AUTH_EXAMPLES.contains("\n$ asana auth login --with-token < token.txt\n"));
         assert!(AUTH_EXAMPLES.ends_with("\n$ asana auth status"));
         for path in [&[][..], &["task"], &["project"]] {

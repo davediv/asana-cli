@@ -124,6 +124,15 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
+/// The `about` of each variant is the row the root screen prints for it.
+/// gh can afford `issue: Manage issues` on a screen of forty rows; ours
+/// has four, so a row that only repeats its own name would be the least
+/// informative line on the screen a reader always sees. Each one instead
+/// names the work its commands do, as one imperative verb phrase, short
+/// enough to leave the column aligned on an 80-column terminal. The group
+/// screen under each row opens with its `long_about` rather than this
+/// line, the way gh's `issue: Manage issues` opens "Work with GitHub
+/// issues."
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     #[command(
@@ -135,21 +144,21 @@ pub enum Commands {
     Auth(AuthCmd),
     #[command(
         subcommand,
-        about = "Manage workspaces",
+        about = "List the workspaces your token can reach",
         long_about = "Work with the Asana workspaces your token can reach.",
         after_help = "$ asana workspace list"
     )]
     Workspace(WorkspaceCmd),
     #[command(
         subcommand,
-        about = "Manage projects",
+        about = "List and view the projects in the workspace",
         long_about = "Work with Asana projects.",
-        after_help = "$ asana project list\n$ asana project view \"Roadmap\"\n$ asana project view 1200000000000000 --web"
+        after_help = "$ asana project list\n$ asana project list --archived\n$ asana project view \"Roadmap\" --web"
     )]
     Project(ProjectCmd),
     #[command(
         subcommand,
-        about = "Manage tasks",
+        about = "Create, view, assign and complete tasks",
         long_about = "Work with Asana tasks.",
         after_help = "$ asana task list\n$ asana task create --title \"Fix the login page\"\n$ asana task view 1211234567890123 --web"
     )]
@@ -913,9 +922,9 @@ USAGE
 
 CORE COMMANDS
   auth:          Authenticate with Asana
-  project:       Manage projects
-  task:          Manage tasks
-  workspace:     Manage workspaces
+  project:       List and view the projects in the workspace
+  task:          Create, view, assign and complete tasks
+  workspace:     List the workspaces your token can reach
 
 HELP TOPICS
   environment:   Environment variables that can be used with asana
@@ -933,10 +942,14 @@ EXAMPLES
   # Log in with a personal access token from https://app.asana.com/0/my-apps
   $ asana auth login
 
-  # Work with tasks and projects
+  # List the open tasks assigned to you
   $ asana task list
-  $ asana project view \"Roadmap\"
+
+  # Create a task in a project
   $ asana task create --title \"Fix the login page\" --project \"Roadmap\"
+
+  # Open a project in the browser
+  $ asana project view \"Roadmap\" --web
 
 LEARN MORE
   Use `asana <command> <subcommand> --help` for more information on a command.
@@ -951,6 +964,30 @@ LEARN MORE
         // same at 80 as at 120.
         assert_eq!(render_help_at(&[], &Palette::off(), NARROW), expected);
         assert!(!expected.contains("\n  \n"), "whitespace-only line");
+    }
+
+    /// Every row of the root's command list says what that noun's commands
+    /// do: an imperative verb phrase of at least three words that is not
+    /// the noun said twice, and no trailing period, so the four rows read
+    /// as one list.
+    #[test]
+    fn root_command_rows_say_more_than_their_name() {
+        let root = command();
+        for sub in root.get_subcommands().filter(|c| !c.is_hide_set()) {
+            let name = sub.get_name();
+            let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
+            assert!(!about.is_empty(), "{name}: no description");
+            assert!(!about.ends_with('.'), "{name}: trailing period: {about:?}");
+            assert!(
+                about.split_whitespace().count() >= 3,
+                "{name}: {about:?} says no more than the name"
+            );
+            assert_ne!(
+                about.to_lowercase(),
+                format!("manage {name}s"),
+                "{name}: the row repeats its own name"
+            );
+        }
     }
 
     #[test]
@@ -978,6 +1015,18 @@ ARGUMENTS
   A project can be supplied as argument in any of the following formats:
 ";
         assert!(project.contains(expected_tail), "{project}");
+        // The examples spread over the screen's own commands, as `gh repo
+        // --help` spreads over create/clone/view: the collection command,
+        // the same command with the one flag that changes what it returns,
+        // then the targeted one. Nothing repeats an identifier the
+        // ARGUMENTS block above has already spelled out.
+        assert!(
+            project.contains(
+                "\nEXAMPLES\n  $ asana project list\n  $ asana project list --archived\n  $ asana project view \"Roadmap\" --web\n"
+            ),
+            "{project}"
+        );
+        assert!(!project.contains("$ asana project view 12"), "{project}");
         assert!(!project.contains("\nFLAGS\n"));
         assert!(!project.contains("HELP TOPICS"));
         assert!(project
@@ -1209,10 +1258,13 @@ Authenticate with Asana.
 Run `asana auth login` to get started: it prompts for a personal access
 token from https://app.asana.com/0/my-apps, checks it against Asana and
 stores it in ~/.config/asana/config.toml for every other command to use.
+
 Alternatively, populate the ASANA_TOKEN environment variable with a token,
 which suits scripts and automation; `asana help environment` has the
-details. Run `asana auth status` to see which account is in use and where
-its token came from.
+details.
+
+Run `asana auth status` to see which account is in use and where its token
+came from.
 
 USAGE
   asana auth <command> [flags]
@@ -1253,7 +1305,7 @@ LEARN MORE
             .expect("root EXAMPLES");
         assert!(
             examples.starts_with(
-                "  # Log in with a personal access token from https://app.asana.com/0/my-apps\n  $ asana auth login\n\n  # Work with tasks and projects\n"
+                "  # Log in with a personal access token from https://app.asana.com/0/my-apps\n  $ asana auth login\n\n  # List the open tasks assigned to you\n  $ asana task list\n"
             ),
             "{examples}"
         );
@@ -1779,7 +1831,7 @@ LEARN MORE
         let r = run(&["asana", "help", "reference"]).expect("reference");
         assert_eq!(r.code, 0);
         assert!(r.stdout.starts_with("# asana reference\n\n## `asana auth <command> [flags]`\n\nAuthenticate with Asana\n\n### `asana auth login [flags]`\n\n"), "{}", r.stdout);
-        assert!(r.stdout.contains("\n## `asana task <command> [flags]`\n\nManage tasks\n\n### `asana task assign {<gid> | <url>} [<assignee>] [flags]`\n"), "{}", r.stdout);
+        assert!(r.stdout.contains("\n## `asana task <command> [flags]`\n\nCreate, view, assign and complete tasks\n\n### `asana task assign {<gid> | <url>} [<assignee>] [flags]`\n"), "{}", r.stdout);
         assert!(
             r.stdout.contains(
                 "\n### `asana task complete {<gids> | <urls>} [flags]`\n\nMark a task complete\n"
