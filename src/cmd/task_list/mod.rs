@@ -7,6 +7,11 @@
 //! header and ISO-8601 dates; `--json [fields]` is the raw API array, shaped
 //! by the field list and `--jq` like gh's.
 //!
+//! A listing asks the API for the fields it is going to print and no more:
+//! the columns of the table by default, whatever `--json` named when it
+//! named any. So a bare `--json` is a row of the table as an object, not
+//! every field a task has, and the request is shorter for it.
+//!
 //! Tasks come in the order Asana shows them (your My Tasks list, or the
 //! project's own order), so only `--limit` of them are fetched: the API has
 //! no sort of its own, and reading a whole My Tasks list to sort it took
@@ -64,6 +69,63 @@ const JSON_FIELDS: &[&str] = &[
     "workspace",
 ];
 
+/// What a listing asks for when `--json` named no fields: the columns of
+/// the table, plus the permalink a script follows. `--json` with no field
+/// list prints exactly these, so it reads like a row of the table rather
+/// than a dump of everything a task carries.
+///
+/// `due_at` is not among them: Asana fills `due_on` with the local date of
+/// a `due_at`, so the date column has what it needs from `due_on` alone.
+/// Neither is an assignee's address: the column shows a name, and an
+/// address nobody asked for is not ours to print.
+const LIST_FIELDS: &[&str] = &[
+    "name",
+    "completed",
+    "assignee.name",
+    "projects.name",
+    "due_on",
+    "modified_at",
+    "permalink_url",
+];
+
+/// Fields a listing reads whatever it prints: `--state` and `--assignee`
+/// are applied here for the combinations the API will not filter, so every
+/// row must carry them even when `--json` did not ask (an assignee is
+/// matched by the gid every nested object comes with). `--json <fields>`
+/// prunes them back out before printing.
+const FILTER_FIELDS: &[&str] = &["completed", "assignee.name"];
+
+/// The `opt_fields` value for a listing: exactly the fields `--json` named,
+/// each expanded to the sub-fields `TASK_FIELDS` knows under it (so
+/// `assignee` arrives with a name and not just a gid), or [`LIST_FIELDS`]
+/// when it named none.
+fn opt_fields(requested: &[&str]) -> String {
+    // Asana sends a gid whether or not it is asked for; naming it keeps the
+    // value non-empty when everything else is nested.
+    let mut out: Vec<&'static str> = vec!["gid"];
+    for entry in FILTER_FIELDS {
+        if !out.contains(entry) {
+            out.push(entry);
+        }
+    }
+    if requested.is_empty() {
+        for entry in LIST_FIELDS {
+            if !out.contains(entry) {
+                out.push(entry);
+            }
+        }
+    } else {
+        for head in requested.iter().map(|f| f.split('.').next().unwrap_or(f)) {
+            for entry in TASK_FIELDS.split(',') {
+                if entry.split('.').next() == Some(head) && !out.contains(&entry) {
+                    out.push(entry);
+                }
+            }
+        }
+    }
+    out.join(",")
+}
+
 /// How many tasks to read (at least) before calling a My Tasks list
 /// `100+`: one page, the most the API sends per request.
 const PROBE: usize = 100;
@@ -87,7 +149,8 @@ pub enum State {
         instead. A project can be given by gid, by URL, or by name\n\
         (case-insensitive; a unique prefix is enough).\n\n\
         When stdout is not a terminal the output is tab-separated with no header,\n\
-        one task per line, with ISO-8601 dates.\n\n\
+        one task per line, with ISO-8601 dates. `--json` with no field list prints\n\
+        the fields the table shows, plus the permalink.\n\n\
         For more information about output formatting flags, see `asana help formatting`.",
     after_help = "$ asana task list\n\
         $ asana task list --project \"Roadmap\"\n\
@@ -232,10 +295,13 @@ fn summary_line(shown: usize, total: Total, scope: &str, has_filters: bool) -> S
     }
 }
 
-/// gh's `ListNoResults`: the one line printed when nothing matched.
+/// gh's `ListNoResults`: the one line printed when nothing matched. The
+/// scope comes before the verb, unlike gh's `no issues match your search in
+/// cli/cli`, because ours can read `assigned to you in Acme` and that has
+/// to sit beside the noun it qualifies.
 fn empty_line(scope: &str, has_filters: bool) -> String {
     if has_filters {
-        format!("no tasks match your search {scope}")
+        format!("no tasks {scope} match your search")
     } else {
         format!("no open tasks {scope}")
     }
@@ -289,16 +355,22 @@ struct Listing {
     total: Total,
     project: Option<Project>,
     workspace: Option<Workspace>,
+    /// Nobody named a project or an assignee, so this is your own list.
+    mine: bool,
 }
 
 impl Listing {
     /// Where the tasks were looked for, with its preposition: `in Roadmap`,
-    /// `in Acme`, or for the unfiltered default `assigned to you in Acme`
-    /// (gh's `in cli/cli`).
-    fn scope(&self, unfiltered: bool) -> String {
+    /// `in Acme`, or `assigned to you in Acme` (gh's `in cli/cli`).
+    ///
+    /// The scope is where we looked, never what we looked for, so
+    /// `assigned to you` survives `--state`: the default listing is your
+    /// own tasks, and `of 100+ tasks in Acme` would claim to have counted
+    /// everybody's. An assignee somebody named is a search, as gh's is.
+    fn scope(&self) -> String {
         match (&self.project, &self.workspace) {
             (Some(p), _) => format!("in {}", p.display()),
-            (None, Some(ws)) if unfiltered => format!("assigned to you in {}", ws.display()),
+            (None, Some(ws)) if self.mine => format!("assigned to you in {}", ws.display()),
             (None, Some(ws)) => format!("in {}", ws.display()),
             (None, None) => "in the workspace".to_string(),
         }
@@ -347,8 +419,9 @@ async fn fetch_project(
     assignee: Option<&str>,
     limit: usize,
     want_total: bool,
+    fields: &str,
 ) -> Result<(Vec<(Value, Task)>, Total)> {
-    let mut query: Vec<(&str, &str)> = vec![("opt_fields", TASK_FIELDS), ("project", &project.gid)];
+    let mut query: Vec<(&str, &str)> = vec![("opt_fields", fields), ("project", &project.gid)];
     if state == State::Open {
         // Incomplete tasks plus those completed since now, i.e. none.
         query.push(("completed_since", "now"));
@@ -415,13 +488,14 @@ async fn fetch_assigned(
     state: State,
     limit: usize,
     want_total: bool,
+    fields: &str,
 ) -> Result<(Vec<(Value, Task)>, Total)> {
     let list = user_task_list(ctx, user, &workspace.gid).await?;
     let path = match &list {
         Some(gid) => format!("/user_task_lists/{gid}/tasks"),
         None => "/tasks".to_string(),
     };
-    let mut query: Vec<(&str, &str)> = vec![("opt_fields", TASK_FIELDS)];
+    let mut query: Vec<(&str, &str)> = vec![("opt_fields", fields)];
     if list.is_none() {
         query.push(("assignee", user));
         query.push(("workspace", &workspace.gid));
@@ -470,6 +544,10 @@ async fn fetch(ctx: &Ctx, args: &Args, want_total: bool) -> Result<Listing> {
         (None, Some(_)) => None,
     };
 
+    // Ask for what is going to be printed, and for what the filters below
+    // read, and for nothing else.
+    let fields = opt_fields(&args.json.fields());
+
     let (items, total) = match (&project, &workspace) {
         (Some(p), _) => {
             fetch_project(
@@ -479,12 +557,13 @@ async fn fetch(ctx: &Ctx, args: &Args, want_total: bool) -> Result<Listing> {
                 assignee.as_deref(),
                 args.limit,
                 want_total,
+                &fields,
             )
             .await?
         }
         (None, Some(ws)) => {
             let user = assignee.as_deref().unwrap_or("me");
-            fetch_assigned(ctx, user, ws, args.state, args.limit, want_total).await?
+            fetch_assigned(ctx, user, ws, args.state, args.limit, want_total, &fields).await?
         }
         (None, None) => (Vec::new(), Total::Exact(0)),
     };
@@ -494,6 +573,7 @@ async fn fetch(ctx: &Ctx, args: &Args, want_total: bool) -> Result<Listing> {
         total,
         project,
         workspace,
+        mine: args.project.is_none() && args.assignee.is_none(),
     })
 }
 
@@ -541,9 +621,10 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
         return json::print(&Value::Array(values), &args.json, JSON_FIELDS);
     }
 
-    // Like gh, `--state` and `--assignee` are searches; `--project` is a scope.
+    // Like gh, `--state` and `--assignee` are searches; `--project`, and
+    // the assignee nobody named, are the scope they searched.
     let has_filters = args.state != State::Open || args.assignee.is_some();
-    let scope = listing.scope(!has_filters);
+    let scope = listing.scope();
 
     if listing.items.is_empty() {
         // gh prints this on stderr, and only when stdout is a terminal.
@@ -706,11 +787,17 @@ mod tests {
         assert_eq!(empty_line("in Roadmap", false), "no open tasks in Roadmap");
         assert_eq!(
             empty_line("in Roadmap", true),
-            "no tasks match your search in Roadmap"
+            "no tasks in Roadmap match your search"
         );
         assert_eq!(
             empty_line("assigned to you in Acme", false),
             "no open tasks assigned to you in Acme"
+        );
+        // The scope sits beside the noun, so it reads as a sentence even
+        // when it is longer than gh's `in cli/cli`.
+        assert_eq!(
+            empty_line("assigned to you in Acme", true),
+            "no tasks assigned to you in Acme match your search"
         );
     }
 
@@ -724,19 +811,51 @@ mod tests {
                 gid: "1".into(),
                 name: Some("Acme".into()),
             }),
+            mine: true,
         };
-        assert_eq!(listing.scope(true), "assigned to you in Acme");
-        assert_eq!(listing.scope(false), "in Acme");
+        assert_eq!(listing.scope(), "assigned to you in Acme");
+        listing.mine = false;
+        assert_eq!(listing.scope(), "in Acme");
         listing.project = Some(Project {
             gid: "2".into(),
             name: Some("Roadmap".into()),
             ..Project::default()
         });
-        assert_eq!(listing.scope(true), "in Roadmap");
-        assert_eq!(listing.scope(false), "in Roadmap");
+        assert_eq!(listing.scope(), "in Roadmap");
+        listing.mine = true;
+        assert_eq!(listing.scope(), "in Roadmap");
         assert_eq!(
-            summary_line(3, Total::Exact(12), &listing.scope(true), false),
+            summary_line(3, Total::Exact(12), &listing.scope(), false),
             "Showing 3 of 12 open tasks in Roadmap"
+        );
+    }
+
+    /// `--state all` widens what is shown, not who it belongs to: the
+    /// summary keeps saying whose list was counted.
+    #[test]
+    fn a_filter_never_widens_the_scope_of_your_own_list() {
+        let listing = Listing {
+            items: Vec::new(),
+            total: Total::AtLeast(100),
+            project: None,
+            workspace: Some(Workspace {
+                gid: "1".into(),
+                name: Some("Acme".into()),
+            }),
+            mine: true,
+        };
+        assert_eq!(
+            summary_line(30, listing.total, &listing.scope(), true),
+            "Showing 30 of 100+ tasks assigned to you in Acme that match your search"
+        );
+        // Naming an assignee makes it a search, as gh's `--assignee` does.
+        let named = Listing {
+            mine: false,
+            ..listing
+        };
+        assert_eq!(
+            summary_line(3, Total::Exact(3), &named.scope(), true),
+            "Showing 3 of 3 tasks in Acme that match your search"
         );
     }
 
@@ -808,6 +927,7 @@ mod tests {
                 gid: "1".into(),
                 name: Some("Acme".into()),
             }),
+            mine: true,
         }
     }
 
@@ -1084,6 +1204,91 @@ mod tests {
             assert!(
                 JSON_FIELDS.contains(&head),
                 "{head} is fetched but not advertised"
+            );
+        }
+    }
+
+    /// A bare `--json` prints a row of the table as an object, not every
+    /// field a task has, because that is all the request asked for.
+    #[test]
+    fn a_bare_json_asks_for_the_columns_and_the_permalink() {
+        let asked = opt_fields(&[]);
+        let entries: Vec<&str> = asked.split(',').collect();
+        for want in LIST_FIELDS {
+            assert!(
+                entries.contains(want),
+                "{want} is printed but not asked for"
+            );
+        }
+        for needed in FILTER_FIELDS {
+            assert!(
+                entries.contains(needed),
+                "{needed} is filtered on but not asked for"
+            );
+        }
+        // Every entry is one the API knows, and one a row can show.
+        assert!(entries.contains(&"gid"), "{asked}");
+        for entry in &entries {
+            assert!(
+                *entry == "gid" || TASK_FIELDS.split(',').any(|f| f == *entry),
+                "{entry} is not a field the API is asked for anywhere"
+            );
+        }
+        // Nothing a row never shows: followers, addresses, notes and
+        // custom fields belong to `task view`, not to a listing.
+        let heads: Vec<&str> = entries
+            .iter()
+            .map(|f| f.split('.').next().expect("head"))
+            .collect();
+        for unwanted in [
+            "followers",
+            "notes",
+            "custom_fields",
+            "memberships",
+            "num_likes",
+            "created_by",
+        ] {
+            assert!(
+                !heads.contains(&unwanted),
+                "{unwanted} is asked for but never printed"
+            );
+        }
+        assert!(!asked.contains("assignee.email"), "{asked}");
+        // Asana fills due_on from due_at, so the date column needs one field.
+        assert!(
+            entries.contains(&"due_on") && !entries.contains(&"due_at"),
+            "{asked}"
+        );
+    }
+
+    /// `--json <fields>` asks the API for those fields, so a listing never
+    /// pays for what it is about to prune away, and every advertised field
+    /// resolves to something the API understands.
+    #[test]
+    fn json_fields_decide_what_is_requested() {
+        let asked = opt_fields(&["gid", "name", "due_on"]);
+        let mut heads: Vec<&str> = asked
+            .split(',')
+            .map(|f| f.split('.').next().expect("head"))
+            .collect();
+        heads.sort_unstable();
+        heads.dedup();
+        assert_eq!(
+            heads,
+            vec!["assignee", "completed", "due_on", "gid", "name"]
+        );
+        // A dotted field is asked for by its parent, so `--json assignee`
+        // still gets the address a bare `--json` leaves alone.
+        assert!(opt_fields(&["assignee"]).contains("assignee.email"));
+        assert!(opt_fields(&["assignee.name"]).contains("assignee.email"));
+        // Every field the help advertises can actually be requested.
+        for field in JSON_FIELDS {
+            let asked = opt_fields(&[field]);
+            assert!(
+                asked
+                    .split(',')
+                    .any(|f| f.split('.').next() == Some(*field)),
+                "{field} is advertised but cannot be requested"
             );
         }
     }
