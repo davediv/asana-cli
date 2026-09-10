@@ -263,7 +263,8 @@ async fn post_comment(ctx: &Ctx, gid: &str, body: &str) -> Result<()> {
         ctx,
         "",
         ctx.api.post(
-            &format!("/tasks/{gid}/stories?opt_fields=permalink_url"),
+            &format!("/tasks/{gid}/stories"),
+            &[("opt_fields", "permalink_url")],
             json!({ "text": body }),
         ),
     )

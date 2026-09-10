@@ -151,6 +151,7 @@ async fn run() -> i32 {
         api,
         config,
         should_color(is_tty, cli.no_color),
+        cli.no_color,
         terminal_width(),
         is_tty,
     );

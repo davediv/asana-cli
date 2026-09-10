@@ -1,6 +1,7 @@
 //! One module per subcommand. Each exports `Args` (clap derive with all of
 //! its help text, implementing `Prevalidate`) and `run(ctx, args)`. Shared
-//! little helpers live here: the spinner, prompts, browser, JSON, permalinks.
+//! little helpers live here: the spinner, prompts, the editor, browser,
+//! JSON, permalinks, and the not-logged-in sentence.
 
 pub mod auth_login;
 pub mod auth_status;
@@ -18,17 +19,19 @@ pub mod workspace_list;
 
 use std::future::Future;
 use std::io::{BufRead, IsTerminal, Read, Write};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use serde::Serialize;
 use url::{Position, Url};
 
 use crate::api::Task;
 use crate::ctx::Ctx;
 use crate::render::text::display_url;
+use crate::render::Palette;
 
 /// Open a URL with the system browser and say so on stderr, like gh.
 pub fn open_in_browser(url: &str) -> Result<()> {
@@ -79,18 +82,140 @@ pub fn confirm(question: &str) -> Result<bool> {
     Ok(matches!(answer.to_lowercase().as_str(), "y" | "yes"))
 }
 
-/// Checks a command can run before the token is read: identifier formats,
-/// flag combinations, and gh's "must provide `--title` ... when not running
-/// interactively". `main` calls it before `config::load`, so a usage error
-/// exits 1 even when there is no token (gh checks flags before auth).
+/// `? question (Y/n)` on stderr, gh's `Submit?` shape: Enter or y/yes is a
+/// yes, anything else a no.
+#[allow(dead_code)]
+pub fn confirm_default_yes(question: &str) -> Result<bool> {
+    let answer = prompt_line(&format!("{question} (Y/n)"))?;
+    Ok(answer.is_empty() || matches!(answer.to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// gh's `You are not logged into any GitHub hosts. To log in, run: gh auth
+/// login`, said of the host we would have asked, with the command in bold
+/// as gh paints it: the one sentence for the not-logged-in state, which
+/// `auth status`, `auth logout` and `auth token` all print.
+#[allow(dead_code)]
+pub fn not_logged_in(palette: &Palette) -> String {
+    format!(
+        "You are not logged in to {}. To log in, run: {}",
+        crate::config::host(),
+        palette.bold("asana auth login")
+    )
+}
+
+/// `$VISUAL`, else `$EDITOR`, else `vi` (`notepad` on Windows), like gh.
+#[allow(dead_code)]
+pub fn editor_command() -> String {
+    ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".to_string()
+            } else {
+                "vi".to_string()
+            }
+        })
+}
+
+/// The editor's name for a prompt: the program without its path or flags
+/// (`code --wait` is `code`), like gh's `surveyext.EditorName`.
+#[allow(dead_code)]
+pub fn editor_name(command: &str) -> String {
+    let program = command.split_whitespace().next().unwrap_or(command);
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program)
+        .to_string()
+}
+
+/// Open [`editor_command`] on a scratch file holding `initial` and return
+/// what was written (the file is removed afterwards). The editor runs
+/// through the shell, so `code --wait` works as a value.
+#[allow(dead_code)]
+pub fn edit_in_editor(initial: &str) -> Result<String> {
+    let editor = editor_command();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("asana-{}-{stamp}.md", std::process::id()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(initial.as_bytes()))
+        .with_context(|| format!("could not create {}", path.display()))?;
+    let status = if cfg!(windows) {
+        Command::new("cmd")
+            .arg("/C")
+            .arg(format!("{editor} \"{}\"", path.display()))
+            .status()
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("{editor} \"$1\""))
+            .arg(&editor)
+            .arg(&path)
+            .status()
+    };
+    let text = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    let status = status.with_context(|| format!("could not run the editor `{editor}`"))?;
+    if !status.success() {
+        bail!("the editor `{editor}` exited with {status}");
+    }
+    text.with_context(|| format!("could not read {}", path.display()))
+}
+
+/// What a leaf command declares about itself before it runs.
 ///
-/// Return `cli::usage_error(PATH, ..)` for the message + `Usage:` block, or
-/// any other error for a bare one-line message; both exit 1. `interactive`
-/// is gh's `CanPrompt`: stdin, stdout and stderr are all terminals.
+/// `prevalidate` checks a command can run before the token is read:
+/// identifier formats, flag combinations, and gh's "must provide `--title`
+/// ... when not running interactively". `main` calls it before
+/// `config::load`, so a usage error exits 1 even when there is no token (gh
+/// checks flags before auth). Return `cli::usage_error(PATH, ..)` for the
+/// message + `Usage:` block, or any other error for a bare one-line
+/// message; both exit 1. `interactive` is gh's `CanPrompt`: stdin, stdout
+/// and stderr are all terminals.
+///
+/// `JSON_FIELDS` is the list a command's `--json` accepts (`render::json`):
+/// set it in the same `impl` and `--help` prints it under JSON FIELDS the
+/// way `gh issue list --help` does; `JsonArgs::check` and `json::print`
+/// take it as their `allowed` list. Empty (the default) prints nothing.
 pub trait Prevalidate {
+    const JSON_FIELDS: &'static [&'static str] = &[];
+
     fn prevalidate(&self, interactive: bool) -> Result<()> {
         let _ = interactive;
         Ok(())
+    }
+}
+
+/// The JSON FIELDS of the leaf command at `path` (`["task", "list"]`), for
+/// the help renderer: each `Args`'s `Prevalidate::JSON_FIELDS`, so a piece
+/// opts in by setting the constant in its own `impl Prevalidate`.
+pub fn json_fields(path: &[&str]) -> &'static [&'static str] {
+    match path {
+        ["auth", "login"] => auth_login::LoginArgs::JSON_FIELDS,
+        ["auth", "logout"] => auth_login::LogoutArgs::JSON_FIELDS,
+        ["auth", "status"] => auth_status::Args::JSON_FIELDS,
+        ["auth", "token"] => auth_login::TokenArgs::JSON_FIELDS,
+        ["workspace", "list"] => workspace_list::Args::JSON_FIELDS,
+        ["project", "list"] => project_list::Args::JSON_FIELDS,
+        ["project", "view"] => project_view::Args::JSON_FIELDS,
+        ["task", "list"] => task_list::Args::JSON_FIELDS,
+        ["task", "view"] => task_view::Args::JSON_FIELDS,
+        ["task", "create"] => task_create::Args::JSON_FIELDS,
+        ["task", "complete"] => task_complete::CompleteArgs::JSON_FIELDS,
+        ["task", "reopen"] => task_complete::ReopenArgs::JSON_FIELDS,
+        ["task", "assign"] => task_assign::Args::JSON_FIELDS,
+        ["task", "comment"] => task_comment::Args::JSON_FIELDS,
+        ["task", "delete"] => task_delete::Args::JSON_FIELDS,
+        _ => &[],
     }
 }
 
@@ -261,6 +386,37 @@ pub async fn with_spinner<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_logged_in_is_one_sentence_with_the_command_in_bold() {
+        let plain = not_logged_in(&Palette::off());
+        assert_eq!(
+            plain,
+            format!(
+                "You are not logged in to {}. To log in, run: asana auth login",
+                crate::config::host()
+            )
+        );
+        let painted = not_logged_in(&Palette::new(true));
+        assert!(painted.ends_with("run: \x1b[0;1;39masana auth login\x1b[0m"));
+    }
+
+    #[test]
+    fn editor_names_drop_paths_and_flags() {
+        assert_eq!(editor_name("code --wait"), "code");
+        assert_eq!(editor_name("/usr/bin/vim"), "vim");
+        assert_eq!(editor_name("vi"), "vi");
+        assert!(!editor_command().is_empty());
+    }
+
+    /// No piece has opted in yet, so every leaf reports no fields and the
+    /// help screens stay as they are.
+    #[test]
+    fn json_fields_default_to_none() {
+        assert!(json_fields(&["task", "list"]).is_empty());
+        assert!(json_fields(&["nope"]).is_empty());
+        assert!(json_fields(&[]).is_empty());
+    }
 
     fn task(url: Option<&str>) -> Task {
         Task {

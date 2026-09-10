@@ -1,7 +1,9 @@
 //! Turn what the user typed into Asana identifiers.
 //!
 //! - tasks: a gid or any app.asana.com task URL
-//! - projects: a gid, a URL, or a (case-insensitive, prefix-tolerant) name
+//! - projects: a gid, a URL, or a name (case-insensitive, prefix-tolerant,
+//!   and tolerant of the emoji Asana users put in front: `UTL` finds
+//!   `⚙️ UTL`; see [`pick`])
 //! - assignees: `me`/`@me`, an email, a gid, or a name via typeahead
 //!
 //! Something that cannot be an identifier at all is an [`InvalidIdentifier`]
@@ -151,27 +153,10 @@ pub async fn resolve_project(ctx: &Ctx, input: &str) -> Result<Project> {
             None,
         )
         .await?;
-    let lower = name.to_lowercase();
-    let exact: Vec<&Project> = projects
-        .iter()
-        .filter(|p| p.name.as_deref().is_some_and(|n| n.to_lowercase() == lower))
-        .collect();
-    let candidates = if exact.is_empty() {
-        projects
-            .iter()
-            .filter(|p| {
-                p.name
-                    .as_deref()
-                    .is_some_and(|n| n.to_lowercase().starts_with(&lower))
-            })
-            .collect::<Vec<_>>()
-    } else {
-        exact
-    };
-    match candidates.as_slice() {
-        [one] => Ok((*one).clone()),
-        [] => bail!("no project named \"{name}\" in {}", ws.display()),
-        many => {
+    match pick(&projects, |p| p.name.as_deref(), name) {
+        Match::One(p) => Ok(p.clone()),
+        Match::None => bail!("no project named \"{name}\" in {}", ws.display()),
+        Match::Many(many) => {
             let mut msg = format!(
                 "\"{name}\" matches {} projects in {}:",
                 many.len(),
@@ -184,6 +169,93 @@ pub async fn resolve_project(ctx: &Ctx, input: &str) -> Result<Project> {
             bail!(msg)
         }
     }
+}
+
+/// The outcome of a name lookup: one item, several (ambiguous), or none.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Match<'a, T> {
+    One(&'a T),
+    Many(Vec<&'a T>),
+    None,
+}
+
+/// `name` without whatever decorates its front: emoji, their variation
+/// selectors and joiners, punctuation, spaces. Empty when nothing but
+/// decoration is left (`🚀`), so a bare match is never a match on nothing.
+pub fn bare_name(name: &str) -> &str {
+    name.trim_start_matches(|c: char| !c.is_alphanumeric())
+}
+
+/// The words of `name` for a whole-word match: split at whitespace, each
+/// stripped of the symbols around it (`Roadmap:` is `roadmap`), lowercased,
+/// empty ones dropped.
+fn words(name: &str) -> Vec<String> {
+    name.split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Whether the words of `query` appear in `name`'s words, whole and in a
+/// row (`roadmap` in `Q3 Roadmap 2026`, `q3 roadmap` too, `road` not).
+fn has_words(name: &str, query: &str) -> bool {
+    let (n, q) = (words(name), words(query));
+    !q.is_empty() && n.windows(q.len()).any(|w| w == q.as_slice())
+}
+
+/// Case-insensitive lookup of `query` among `items` by the name `name_of`
+/// gives each, in tiers, stopping at the first tier with any candidate:
+///
+/// 1. the whole name;
+/// 2. the name without its leading symbols ([`bare_name`]: `UTL` finds
+///    `⚙️ UTL`, `legal` finds `👨‍⚖️ LEGAL`);
+/// 3. a prefix of the name;
+/// 4. a prefix of the bare name;
+/// 5. whole words of the name (`roadmap` finds `Q3 Roadmap 2026`).
+///
+/// A tier with several candidates is ambiguous. The full name beats the
+/// bare one and an exact match beats a prefix, so adding a project called
+/// `UTL` next to `⚙️ UTL` never changes what `⚙️ UTL` resolves to.
+pub fn pick<'a, T>(
+    items: &'a [T],
+    name_of: impl Fn(&T) -> Option<&str>,
+    query: &str,
+) -> Match<'a, T> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Match::None;
+    }
+    let named: Vec<(&T, String)> = items
+        .iter()
+        .filter_map(|item| name_of(item).map(|n| (item, n.to_lowercase())))
+        .collect();
+    let bare_is = |n: &str, f: &dyn Fn(&str) -> bool| {
+        let b = bare_name(n);
+        !b.is_empty() && f(b)
+    };
+    let tiers: [&dyn Fn(&str) -> bool; 5] = [
+        &|n: &str| n == query,
+        &|n: &str| bare_is(n, &|b| b == query),
+        &|n: &str| n.starts_with(&query),
+        &|n: &str| bare_is(n, &|b| b.starts_with(&query)),
+        &|n: &str| has_words(n, &query),
+    ];
+    for tier in tiers {
+        let hits: Vec<&T> = named
+            .iter()
+            .filter(|(_, lower)| tier(lower))
+            .map(|(item, _)| *item)
+            .collect();
+        match hits.as_slice() {
+            [] => continue,
+            [one] => return Match::One(one),
+            _ => return Match::Many(hits),
+        }
+    }
+    Match::None
 }
 
 /// A resolved assignee: the value to send to the API and a display name.
@@ -379,6 +451,113 @@ mod tests {
         assert!(!is_me("Me"));
         assert!(!is_me("jane@example.com"));
         assert!(!is_me(""));
+    }
+
+    fn named(gid: &str, name: &str) -> Named {
+        Named {
+            gid: gid.into(),
+            name: Some(name.into()),
+            email: None,
+        }
+    }
+
+    fn projects() -> Vec<Named> {
+        vec![
+            named("1", "PR"),
+            named("2", "⚙️ UTL"),
+            named("3", "👾 FUN"),
+            named("4", "👨\u{200d}⚖️ LEGAL"),
+            named("5", "HCK-RC"),
+            named("6", "HCK-AG"),
+            named("7", "Roadmap"),
+            named("8", "🚀"),
+            named("9", "Q3 Roadmap 2026"),
+            named("10", "Marketing: launch"),
+            Named {
+                gid: "11".into(),
+                name: None,
+                email: None,
+            },
+        ]
+    }
+
+    fn gid_of(m: Match<'_, Named>) -> Option<String> {
+        match m {
+            Match::One(p) => Some(p.gid.clone()),
+            _ => None,
+        }
+    }
+
+    fn find(query: &str) -> Option<String> {
+        gid_of(pick(&projects(), |p| p.name.as_deref(), query))
+    }
+
+    #[test]
+    fn bare_names_lose_their_leading_decoration_only() {
+        assert_eq!(bare_name("⚙️ UTL"), "UTL");
+        assert_eq!(bare_name("👨\u{200d}⚖️ LEGAL"), "LEGAL");
+        assert_eq!(bare_name("#1 Priority"), "1 Priority");
+        assert_eq!(bare_name("Roadmap 🚀"), "Roadmap 🚀");
+        assert_eq!(bare_name("🚀"), "");
+        assert_eq!(bare_name("  spaced"), "spaced");
+    }
+
+    #[test]
+    fn project_names_match_with_or_without_the_emoji() {
+        assert_eq!(find("⚙️ UTL").as_deref(), Some("2"));
+        assert_eq!(find("UTL").as_deref(), Some("2"));
+        assert_eq!(find("utl").as_deref(), Some("2"));
+        assert_eq!(find(" legal ").as_deref(), Some("4"));
+        assert_eq!(find("LEGAL").as_deref(), Some("4"));
+        assert_eq!(find("👨\u{200d}⚖️ LEGAL").as_deref(), Some("4"));
+        assert_eq!(find("roadmap").as_deref(), Some("7"));
+        assert_eq!(find("🚀").as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn project_prefixes_are_unique_or_ambiguous() {
+        assert_eq!(find("road").as_deref(), Some("7"));
+        assert_eq!(find("fu").as_deref(), Some("3"));
+        assert_eq!(find("leg").as_deref(), Some("4"));
+        match pick(&projects(), |p| p.name.as_deref(), "hck") {
+            Match::Many(many) => assert_eq!(many.len(), 2),
+            other => panic!("expected two HCK projects, got {other:?}"),
+        }
+        assert_eq!(pick(&projects(), |p| p.name.as_deref(), "zzz"), Match::None);
+        assert_eq!(pick(&projects(), |p| p.name.as_deref(), ""), Match::None);
+        assert_eq!(pick(&projects(), |p| p.name.as_deref(), "  "), Match::None);
+    }
+
+    #[test]
+    fn project_words_match_whole_and_in_a_row() {
+        assert_eq!(find("2026").as_deref(), Some("9"));
+        assert_eq!(find("roadmap 2026").as_deref(), Some("9"));
+        assert_eq!(find("launch").as_deref(), Some("10"));
+        assert_eq!(find("marketing").as_deref(), Some("10"));
+        // A prefix of a word is not a word; the prefix tier still has it.
+        assert_eq!(find("mark").as_deref(), Some("10"));
+        assert_eq!(find("aunch"), None);
+        assert!(has_words("Q3 Roadmap 2026", "roadmap"));
+        assert!(has_words("Q3 Roadmap 2026", "q3 roadmap"));
+        assert!(!has_words("Q3 Roadmap 2026", "roadmap q3"));
+        assert!(!has_words("Q3 Roadmap 2026", "road"));
+        assert!(!has_words("Q3 Roadmap 2026", ""));
+    }
+
+    #[test]
+    fn the_full_project_name_beats_the_bare_one() {
+        let mut p = projects();
+        p.push(named("20", "UTL"));
+        let by = |p: &[Named], q: &str| gid_of(pick(p, |n| n.name.as_deref(), q));
+        assert_eq!(by(&p, "UTL").as_deref(), Some("20"));
+        assert_eq!(by(&p, "⚙️ UTL").as_deref(), Some("2"));
+        // An exact bare match beats a plain prefix match.
+        p.push(named("21", "PRIMARY"));
+        assert_eq!(by(&p, "pr").as_deref(), Some("1"));
+        p.push(named("22", "🔥 PR"));
+        assert_eq!(by(&p, "pr").as_deref(), Some("1"));
+        p.remove(0);
+        assert_eq!(by(&p, "pr").as_deref(), Some("22"));
     }
 
     #[test]

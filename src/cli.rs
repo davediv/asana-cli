@@ -45,6 +45,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// descriptions stay under this.
 pub const MAX_HELP_WIDTH: usize = 100;
 
+/// gh wraps a JSON FIELDS list at 80 columns whatever the terminal.
+const JSON_FIELDS_WIDTH: usize = 80;
+
 /// The width help is laid out for: one column short of the terminal's
 /// (stdout, else stderr, so `asana --help | less` still sees the screen it
 /// is read on; else `COLUMNS`, else 80), so no row ever fills the last
@@ -211,15 +214,9 @@ impl Commands {
             Commands::Task(TaskCmd::Delete(a)) => parse_task_id(&a.task).map(drop)?,
             Commands::Task(TaskCmd::Complete(a)) => check_all(&a.tasks)?,
             Commands::Task(TaskCmd::Reopen(a)) => check_all(&a.tasks)?,
-            Commands::Task(TaskCmd::Create(a)) => {
-                a.due
-                    .as_deref()
-                    .map(|d| task_create::parse_due(d, crate::render::time::today()))
-                    .transpose()?;
-            }
-            Commands::Task(TaskCmd::List(a)) if a.limit == 0 => {
-                anyhow::bail!("invalid limit: {}", a.limit)
-            }
+            // `project list` has no `Prevalidate` check of its own yet; this
+            // one goes the day it grows gh's `invalid limit: 0` usage error
+            // (`task list` and `task create` carry theirs themselves).
             Commands::Project(ProjectCmd::List(a)) if a.limit == 0 => {
                 anyhow::bail!("invalid limit: {}", a.limit)
             }
@@ -615,13 +612,22 @@ pub fn render_help(path: &[String], palette: &Palette) -> String {
 pub fn render_help_at(path: &[String], palette: &Palette, width: usize) -> String {
     let root = command();
     if find(&root, path).is_none() {
-        return render_help_for(&root, &[], palette, width);
+        return render_help_for(&root, &[], palette, width, &[]);
     }
-    render_help_for(&root, path, palette, width)
+    let json_fields = crate::cmd::json_fields(&strs(path));
+    render_help_for(&root, path, palette, width, json_fields)
 }
 
 /// `render_help_at` over a given tree; `path` must exist in it.
-fn render_help_for(root: &Command, path: &[String], palette: &Palette, width: usize) -> String {
+/// `json_fields` is the leaf's `Prevalidate::JSON_FIELDS` (see
+/// `cmd::json_fields`), printed under JSON FIELDS when it is not empty.
+fn render_help_for(
+    root: &Command,
+    path: &[String],
+    palette: &Palette,
+    width: usize,
+    json_fields: &[&str],
+) -> String {
     let cmd = find(root, path).expect("path exists in the tree");
     let heading = |s: &str| palette.bold(s);
     let mut out = String::new();
@@ -768,6 +774,21 @@ fn render_help_for(root: &Command, path: &[String], palette: &Palette, width: us
         out.push_str(&heading("INHERITED FLAGS"));
         out.push('\n');
         out.push_str(&flag_table(&inherited_lines, "  ", Some(width)));
+        out.push('\n');
+    }
+
+    // gh lists the `--json` fields between the flags and ARGUMENTS, sorted
+    // and wrapped at 80 columns whatever the terminal (`text.FormatSlice`);
+    // a narrower terminal wraps them sooner, like everything else here. A
+    // leaf opts in with `Prevalidate::JSON_FIELDS`.
+    if !json_fields.is_empty() {
+        out.push_str(&heading("JSON FIELDS"));
+        out.push('\n');
+        out.push_str(&crate::render::json::format_fields(
+            json_fields,
+            "  ",
+            width.min(JSON_FIELDS_WIDTH),
+        ));
         out.push('\n');
     }
 
@@ -1358,14 +1379,14 @@ LEARN MORE
                 ),
             );
         root.build();
-        let one = render_help_for(&root, &["one".to_string()], &p, 80);
+        let one = render_help_for(&root, &["one".to_string()], &p, 80, &[]);
         assert!(
             one.starts_with(
                 "First paragraph.\n\nSecond paragraph.\n\n\nUSAGE\n  asana one [flags]\n"
             ),
             "{one}"
         );
-        let two = render_help_for(&root, &["two".to_string()], &p, 80);
+        let two = render_help_for(&root, &["two".to_string()], &p, 80, &[]);
         assert!(two.starts_with("Two\n\nUSAGE\n"), "{two}");
         assert!(two.contains("\n  --workspace NAME   \n"), "{two}");
     }
@@ -1395,7 +1416,7 @@ LEARN MORE
         );
         root.build();
         let path = ["wide".to_string()];
-        let narrow = render_help_for(&root, &path, &p, 80);
+        let narrow = render_help_for(&root, &path, &p, 80, &[]);
         let expected_head = "\
 A project can be given by gid, by URL, or by name (case-insensitive; a unique
 prefix is enough).
@@ -1415,7 +1436,7 @@ EXAMPLES
   $ asana wide --notes-file - < a-very-long-file-name-that-nobody-would-ever-break-across-lines.txt
 ";
         assert!(narrow.starts_with(expected_head), "{narrow}");
-        let wide = render_help_for(&root, &path, &p, MAX_HELP_WIDTH);
+        let wide = render_help_for(&root, &path, &p, MAX_HELP_WIDTH, &[]);
         assert!(
             wide.starts_with("A project can be given by gid, by URL, or by name (case-insensitive; a unique prefix is enough).\n\n"),
             "{wide}"
@@ -1459,9 +1480,9 @@ EXAMPLES
         let path = ["list".to_string()];
         let row = "  -s, --state string   Filter by state: {open|completed|all} (default \"open\")";
         assert_eq!(row.len(), 77);
-        let wide = render_help_for(&root, &path, &p, 77);
+        let wide = render_help_for(&root, &path, &p, 77, &[]);
         assert!(wide.contains(&format!("\n{row}\n")), "{wide}");
-        let narrow = render_help_for(&root, &path, &p, 76);
+        let narrow = render_help_for(&root, &path, &p, 76, &[]);
         assert!(
             narrow.contains(
                 "\n  -s, --state string   Filter by state: {open|completed|all}\n                       (default \"open\")\n"
@@ -1476,6 +1497,79 @@ EXAMPLES
             table,
             "  -L, --limit int      Maximum number of things to fetch (default 30)\n  -s, --state string   Filter by state: {open|completed|all} (default \"open\")\n"
         );
+    }
+
+    /// A leaf that declares `JSON_FIELDS` gets gh's JSON FIELDS section:
+    /// after the flag tables, before EXAMPLES, the names sorted and wrapped
+    /// at 80 columns on a wide terminal and at the terminal's width on a
+    /// narrow one (`reference/gh/issue-list-help.txt`).
+    #[test]
+    fn json_fields_section_sits_between_flags_and_examples() {
+        let p = Palette::off();
+        let mut root = Command::new("asana").subcommand(
+            Command::new("list")
+                .disable_help_flag(true)
+                .about("List things")
+                .arg(clap::Arg::new("json").long("json").value_name("fields"))
+                .after_help("$ asana list --json gid,name"),
+        );
+        root.build();
+        let path = ["list".to_string()];
+        let fields = [
+            "name",
+            "gid",
+            "assignee",
+            "due_on",
+            "completed",
+            "permalink_url",
+            "projects",
+            "modified_at",
+            "created_at",
+            "notes",
+            "tags",
+            "memberships",
+            "custom_fields",
+        ];
+        let wide = render_help_for(&root, &path, &p, MAX_HELP_WIDTH, &fields);
+        let expected = "\
+FLAGS
+  --json fields   
+
+JSON FIELDS
+  assignee, completed, created_at, custom_fields, due_on, gid, memberships,
+  modified_at, name, notes, permalink_url, projects, tags
+
+EXAMPLES
+  $ asana list --json gid,name
+";
+        assert!(wide.contains(expected), "{wide}");
+        let narrow = render_help_for(&root, &path, &p, 40, &fields);
+        assert!(
+            narrow.contains("\nJSON FIELDS\n  assignee, completed, created_at,\n"),
+            "{narrow}"
+        );
+        let section = narrow
+            .split("\nJSON FIELDS\n")
+            .nth(1)
+            .and_then(|s| s.split("\n\n").next())
+            .expect("JSON FIELDS");
+        assert_eq!(section.lines().count(), 4, "{section}");
+        for line in section.lines() {
+            assert!(line.chars().count() <= 40, "{line}");
+            assert!(
+                line.starts_with("  ") && !line.starts_with("   "),
+                "{line:?}"
+            );
+        }
+        // Without fields there is no section; the real tree has none yet.
+        let plain = render_help_for(&root, &path, &p, MAX_HELP_WIDTH, &[]);
+        assert!(!plain.contains("JSON FIELDS"), "{plain}");
+        for path in all_paths() {
+            assert!(!render_help_at(&path, &p, MAX_HELP_WIDTH).contains("JSON FIELDS"));
+        }
+        // The list is coloured like every other heading.
+        let coloured = render_help_for(&root, &path, &Palette::new(true), 80, &fields);
+        assert!(coloured.contains("\x1b[0;1;39mJSON FIELDS\x1b[0m\n  assignee, "));
     }
 
     #[test]

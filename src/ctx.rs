@@ -1,12 +1,14 @@
 //! Everything a command needs: the API client, the resolved identity and
 //! workspace (fetched lazily and cached), and output settings.
 
+use std::io::IsTerminal;
 use std::sync::OnceLock;
 
 use anyhow::{bail, Result};
 
 use crate::api::{Client, User, Workspace, USER_FIELDS};
 use crate::config::{Config, WORKSPACE_ENV};
+use crate::render::Palette;
 
 pub struct Ctx {
     pub api: Client,
@@ -15,6 +17,9 @@ pub struct Ctx {
     workspace: OnceLock<Workspace>,
     /// Emit ANSI colour on stdout.
     pub color: bool,
+    /// `--no-color` was given: colour is off on every stream, whatever
+    /// its terminal-ness (`stderr_palette` reads it).
+    pub no_color: bool,
     /// Terminal width in columns (or `COLUMNS`, or 80).
     pub width: usize,
     /// stdout is a terminal.
@@ -22,16 +27,39 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    pub fn new(api: Client, config: Config, color: bool, width: usize, is_tty: bool) -> Self {
+    pub fn new(
+        api: Client,
+        config: Config,
+        color: bool,
+        no_color: bool,
+        width: usize,
+        is_tty: bool,
+    ) -> Self {
         Self {
             api,
             config,
             me: OnceLock::new(),
             workspace: OnceLock::new(),
             color,
+            no_color,
             width,
             is_tty,
         }
+    }
+
+    /// The palette for stdout: `color` as a `Palette`.
+    #[allow(dead_code)]
+    pub fn palette(&self) -> Palette {
+        Palette::new(self.color)
+    }
+
+    /// The palette for status lines on stderr, from stderr's own
+    /// terminal-ness (never stdout's): `asana task complete 2>log` keeps the
+    /// log clean, and `--no-color`, `NO_COLOR` and `TERM=dumb` switch it off
+    /// as usual.
+    #[allow(dead_code)]
+    pub fn stderr_palette(&self) -> Palette {
+        Palette::for_stream(std::io::stderr().is_terminal(), self.no_color)
     }
 
     /// The authenticated user, fetched once.

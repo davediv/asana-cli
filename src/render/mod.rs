@@ -1,7 +1,9 @@
 //! Output helpers shared by every command: colour, tables, relative times,
-//! text wrapping, and the notes renderer. Nothing here talks to the API.
+//! text wrapping, the notes renderer, and the `--json`/`--jq` flags.
+//! Nothing here talks to the API.
 
 pub mod color;
+pub mod json;
 pub mod notes;
 pub mod table;
 pub mod text;

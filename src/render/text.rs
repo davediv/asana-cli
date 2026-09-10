@@ -4,7 +4,9 @@
 //!
 //! Wrapping follows one rule everywhere: greedy at ASCII spaces, no
 //! hyphenation, never inside a word, so a URL wider than the limit stays
-//! whole on a line of its own. [`wrap_prose`] lays out running text (a help
+//! whole on a line of its own; a `code span` in backticks counts as one
+//! word, so `asana help formatting` never breaks at the `help`.
+//! [`wrap_prose`] lays out running text (a help
 //! description, a multi-line message): every line keeps the indent it
 //! started with, a `- ` bullet's continuation hangs under its text, blank
 //! lines survive. [`wrap_sentences`] is the variant error reports use: a
@@ -104,8 +106,10 @@ pub fn indent(s: &str, n: usize) -> String {
 /// prefixed with `first` and the rest with `rest` (both count towards the
 /// limit). Greedy, at ASCII spaces only, like a terminal would if it broke
 /// at words: no hyphenation, and a word wider than the limit (a URL) stays
-/// whole on a line of its own. A line that already fits comes back as it
-/// is, spacing and all; no line ends in whitespace.
+/// whole on a line of its own. A span in backticks (`asana help
+/// formatting`) is one word: it moves whole to the next line rather than
+/// breaking inside. A line that already fits comes back as it is, spacing
+/// and all; no line ends in whitespace.
 pub fn wrap_line(text: &str, limit: usize, first: &str, rest: &str) -> Vec<String> {
     let text = text.trim_end();
     if text.is_empty() {
@@ -114,6 +118,9 @@ pub fn wrap_line(text: &str, limit: usize, first: &str, rest: &str) -> Vec<Strin
     if width(first) + width(text) <= limit {
         return vec![format!("{first}{text}")];
     }
+    // The spaces inside a code span are made non-breaking while textwrap
+    // lays the line out, then put back.
+    let glued = glue_code_spans(text);
     let opts = textwrap::Options::new(limit)
         .initial_indent(first)
         .subsequent_indent(rest)
@@ -121,10 +128,39 @@ pub fn wrap_line(text: &str, limit: usize, first: &str, rest: &str) -> Vec<Strin
         .word_separator(textwrap::WordSeparator::AsciiSpace)
         .word_splitter(textwrap::WordSplitter::NoHyphenation)
         .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
-    textwrap::wrap(text, &opts)
+    textwrap::wrap(&glued, &opts)
         .into_iter()
-        .map(|l| l.into_owned())
+        .map(|l| l.replace(GLUE, " "))
         .collect()
+}
+
+/// The character that stands in for a space that must not break: U+00A0,
+/// one cell wide like the space it replaces, so widths are unchanged.
+pub const GLUE: char = '\u{a0}';
+
+/// `text` with the spaces inside each pair of backticks replaced by
+/// [`GLUE`]. A backtick without a partner (or a span with a newline in it)
+/// is left alone.
+pub fn glue_code_spans(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        match after.find('`') {
+            Some(close) if !after[..close].contains('\n') => {
+                out.push_str(&rest[..=open]);
+                out.push_str(&after[..close].replace(' ', &GLUE.to_string()));
+                out.push('`');
+                rest = &after[close + 1..];
+            }
+            _ => {
+                out.push_str(&rest[..=open]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Lay out running text for `width` columns. Each line of `text` is a
@@ -386,6 +422,49 @@ mod tests {
         assert_eq!(
             wrap_line("please run:  asana auth login", 14, "", ""),
             vec!["please run:", "asana auth", "login"]
+        );
+    }
+
+    /// A backtick span is one word: the formatting sentence on an 80-column
+    /// terminal (79 usable) moves `asana help formatting` whole to the next
+    /// line instead of breaking after `help`, and a span wider than the
+    /// limit stays whole like a URL. Widths are unchanged: the glue is one
+    /// cell, like the space it stands in for.
+    #[test]
+    fn code_spans_never_break_inside() {
+        let sentence =
+            "For more information about output formatting flags, see `asana help formatting`.";
+        assert_eq!(width(sentence), 80);
+        assert_eq!(
+            wrap_line(sentence, 79, "", ""),
+            vec![
+                "For more information about output formatting flags, see",
+                "`asana help formatting`."
+            ]
+        );
+        assert_eq!(
+            wrap_prose(sentence, 79),
+            "For more information about output formatting flags, see\n`asana help formatting`."
+        );
+        assert_eq!(
+            wrap_line("run `asana auth login --with-token` now", 12, "", ""),
+            vec!["run", "`asana auth login --with-token`", "now"]
+        );
+        // The glue never reaches the output, and a stray backtick is plain.
+        for line in wrap_line("a `b c` d `e f g", 5, "", "") {
+            assert!(!line.contains(GLUE), "{line:?}");
+        }
+        assert_eq!(
+            wrap_line("a `b c` d `e f g", 5, "", ""),
+            vec!["a", "`b c`", "d `e", "f g"]
+        );
+        assert_eq!(glue_code_spans("`a b` c `d"), "`a\u{a0}b` c `d");
+        assert_eq!(glue_code_spans("no spans"), "no spans");
+        assert_eq!(glue_code_spans("`x\ny z`"), "`x\ny z`");
+        // Error prose gets the same treatment through `wrap_sentences`.
+        assert_eq!(
+            wrap_sentences("To get started, run `asana auth login` now", 30),
+            "To get started, run\n`asana auth login` now"
         );
     }
 

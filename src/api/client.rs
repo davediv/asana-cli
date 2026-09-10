@@ -167,13 +167,27 @@ impl Client {
         Ok(items)
     }
 
-    pub async fn post<T: DeserializeOwned>(&self, path: &str, data: Value) -> Result<T, ApiError> {
-        let value = self.request(Method::POST, path, &[], Some(data)).await?;
+    /// `POST path?query` with `{ "data": data }` as the body, returning the
+    /// `data` member decoded as `T`. `query` carries `opt_fields` for the
+    /// object Asana sends back (`&[]` for the compact default).
+    pub async fn post<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        data: Value,
+    ) -> Result<T, ApiError> {
+        let value = self.request(Method::POST, path, query, Some(data)).await?;
         decode(value, &self.url(path))
     }
 
-    pub async fn put<T: DeserializeOwned>(&self, path: &str, data: Value) -> Result<T, ApiError> {
-        let value = self.request(Method::PUT, path, &[], Some(data)).await?;
+    /// `PUT path?query` with `{ "data": data }` as the body; see [`Self::post`].
+    pub async fn put<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        data: Value,
+    ) -> Result<T, ApiError> {
+        let value = self.request(Method::PUT, path, query, Some(data)).await?;
         decode(value, &self.url(path))
     }
 
@@ -617,7 +631,7 @@ mod tests {
         let (base, server) = serve(vec![canned(201, r#"{"data":{"gid":"5","name":"New"}}"#)]);
         let client = Client::with_base(&base, "tok").unwrap();
         let task: Task = client
-            .post("/tasks", serde_json::json!({ "name": "New" }))
+            .post("/tasks", &[], serde_json::json!({ "name": "New" }))
             .await
             .unwrap();
         assert_eq!(task.gid, "5");
@@ -627,6 +641,51 @@ mod tests {
             seen[0].ends_with(r#"| {"data":{"name":"New"}}"#),
             "{}",
             seen[0]
+        );
+    }
+
+    /// `post` and `put` send their query (`opt_fields` for the object that
+    /// comes back) the way `get` does, and the body still wrapped in `data`.
+    #[tokio::test]
+    async fn post_and_put_send_a_query() {
+        let (base, server) = serve(vec![
+            canned(201, r#"{"data":{"gid":"5","permalink_url":"https://x/5"}}"#),
+            canned(200, r#"{"data":{"gid":"6","completed":true}}"#),
+        ]);
+        let client = Client::with_base(&base, "tok").unwrap();
+        let story: crate::api::types::Story = client
+            .post(
+                "/tasks/1/stories",
+                &[("opt_fields", "permalink_url")],
+                serde_json::json!({ "text": "hi" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(story.permalink_url.as_deref(), Some("https://x/5"));
+        let task: Task = client
+            .put(
+                "/tasks/6",
+                &[("opt_fields", "completed")],
+                serde_json::json!({ "completed": true }),
+            )
+            .await
+            .unwrap();
+        assert!(task.is_completed());
+        let seen = server.join().unwrap();
+        assert!(
+            seen[0].starts_with("POST /tasks/1/stories?opt_fields=permalink_url HTTP/1.1"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[0].ends_with(r#"| {"data":{"text":"hi"}}"#),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[1].starts_with("PUT /tasks/6?opt_fields=completed HTTP/1.1"),
+            "{}",
+            seen[1]
         );
     }
 

@@ -180,7 +180,11 @@ async fn update(
         Some(text) => {
             let story: Story = ctx
                 .api
-                .post(&format!("/tasks/{gid}/stories"), json!({ "text": text }))
+                .post(
+                    &format!("/tasks/{gid}/stories"),
+                    &[],
+                    json!({ "text": text }),
+                )
                 .await?;
             Some(comment_url(&task, &story.gid))
         }
@@ -190,6 +194,7 @@ async fn update(
         .api
         .put(
             &format!("/tasks/{gid}"),
+            &[],
             json!({ "completed": action.completed }),
         )
         .await?;

@@ -133,10 +133,13 @@ impl Prevalidate for Args {
     /// (`--web` and `--editor` need none). Runs before the token is read, so
     /// this exits 1 with gh's usage error rather than 4 for a missing token.
     /// A `--parent` that cannot be a task fails here too, like gh's
-    /// `invalid issue format`.
+    /// `invalid issue format`, and so does a `--due` that is not a date.
     fn prevalidate(&self, interactive: bool) -> Result<()> {
         if let Some(parent) = &self.parent {
             parse_task_id(parent)?;
+        }
+        if let Some(due) = self.due.as_deref() {
+            parse_due(due, today())?;
         }
         if self.web || self.editor || interactive || self.title().is_some() {
             return Ok(());
@@ -458,7 +461,8 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
         data.insert("due_on".into(), Value::String(d.to_string()));
     }
 
-    let created: Task = with_spinner(ctx, "", ctx.api.post("/tasks", Value::Object(data))).await?;
+    let created: Task =
+        with_spinner(ctx, "", ctx.api.post("/tasks", &[], Value::Object(data))).await?;
     println!("{}", task_url(&created));
     Ok(())
 }

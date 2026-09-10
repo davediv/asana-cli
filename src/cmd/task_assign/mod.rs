@@ -124,7 +124,11 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
         let assignee = assignee_value(ctx, args.assignee.as_deref()).await?;
         let task: Task = ctx
             .api
-            .put(&format!("/tasks/{gid}"), json!({ "assignee": assignee }))
+            .put(
+                &format!("/tasks/{gid}"),
+                &[],
+                json!({ "assignee": assignee }),
+            )
             .await?;
         Ok::<_, anyhow::Error>(task)
     })

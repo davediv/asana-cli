@@ -393,8 +393,17 @@ fn status_lines(status: u16, message: &str, url: &str) -> String {
     }
 }
 
+/// The markers Asana puts before an id it does not know: `Unknown object`
+/// (404), `Not a recognized ID` (a 400 for a bad `project=`), and `Not a
+/// valid actor ID` (a 400 from `PUT /tasks` with an unknown `assignee`).
+const UNKNOWN_ID_MARKERS: [&str; 3] = [
+    "Unknown object: ",
+    "Not a recognized ID: ",
+    "Not a valid actor ID: ",
+];
+
 fn looks_unknown_id(message: &str) -> bool {
-    message.contains("Unknown object: ") || message.contains("Not a recognized ID: ")
+    UNKNOWN_ID_MARKERS.iter().any(|m| message.contains(m))
 }
 
 /// `7 seconds`, `1 second`, or `a moment` when `Retry-After` said nothing.
@@ -424,7 +433,7 @@ impl fmt::Display for Subject {
 /// the request URL otherwise (`/tasks/9/stories` is about task 9,
 /// `/tasks?project=5` about project 5).
 fn subject(message: &str, url: &str) -> Option<Subject> {
-    for marker in ["Unknown object: ", "Not a recognized ID: "] {
+    for marker in UNKNOWN_ID_MARKERS {
         if let Some((head, id)) = message.split_once(marker) {
             let id = id.trim().trim_end_matches('.').trim();
             if id.is_empty() {
@@ -1705,6 +1714,18 @@ mod tests {
             "HTTP 400: project 42 was not found.\n\
              Check the gid or URL, or that you have access to it.\n"
         );
+        // `PUT /tasks/T` with an unknown assignee gid: Asana's `Not a valid
+        // actor ID` reads the same way, about the assignee.
+        let err = ApiError::Status {
+            status: 400,
+            message: "assignee: Not a valid actor ID: 1234567890123456".into(),
+            url: "https://app.asana.com/api/1.0/tasks/1".into(),
+        };
+        assert_eq!(
+            report_api(&err, Some(&env_source())).stderr,
+            "HTTP 400: assignee 1234567890123456 was not found.\n\
+             Check the email or gid, or that you share a workspace with them.\n"
+        );
         // ... unless nothing names the id, which is then a plain 400.
         let err = ApiError::Status {
             status: 400,
@@ -1766,6 +1787,11 @@ mod tests {
             subject("assignee: Not a recognized ID: abc", "u"),
             s("assignee", "abc")
         );
+        assert_eq!(
+            subject("assignee: Not a valid actor ID: 42", "u"),
+            s("assignee", "42")
+        );
+        assert!(looks_unknown_id("assignee: Not a valid actor ID: 42"));
         assert_eq!(
             subject("Not a recognized ID: abc", "https://x/api/1.0/tasks/abc"),
             s("task", "abc")
@@ -1854,7 +1880,7 @@ mod tests {
              Usage:  asana task create [flags]\n\
              \n\
              Flags:\n\
-             \x20 -b, --notes string   Supply a description (what Asana calls notes)\n\
+             \x20 -b, --notes string   Supply notes (the task's description)\n\
              \x20 -t, --title string   Supply a title. Will prompt for one otherwise.\n"
         );
         let err = usage_error(
@@ -2552,7 +2578,7 @@ mod tests {
                  Usage:  asana task list [flags]\n\
                  \n\
                  Flags:\n\
-                 \x20 -a, --assignee string   Filter by assignee"
+                 \x20 -a, --assignee user    Filter by assignee"
             ),
             "{}",
             r.stderr

@@ -19,8 +19,10 @@ pub const TASK_FIELDS: &str = "name,notes,completed,completed_at,assignee.name,a
 pub const TASK_VIEW_FIELDS: &str = "name,notes,html_notes,completed,completed_at,assignee.name,assignee.email,due_on,due_at,start_on,created_at,modified_at,projects.name,memberships.section.name,memberships.project.name,tags.name,parent.name,num_subtasks,permalink_url,created_by.name,followers.name,num_likes,custom_fields.name,custom_fields.display_value,workspace.name";
 
 /// Fields requested for task stories (comments and system events).
+/// `permalink_url` is Asana's own link to the comment (undocumented but
+/// sent), so no piece needs to guess the URL shape.
 pub const STORY_FIELDS: &str =
-    "created_at,created_by.name,text,type,resource_subtype,is_pinned,is_edited,num_likes,html_text";
+    "created_at,created_by.name,text,type,resource_subtype,is_pinned,is_edited,num_likes,html_text,permalink_url";
 
 /// Fields requested for subtasks.
 pub const SUBTASK_FIELDS: &str = "name,completed,assignee.name,due_on";
@@ -222,6 +224,9 @@ pub struct Story {
     /// The comment was edited after it was posted (` • Edited` in gh).
     pub is_edited: Option<bool>,
     pub num_likes: Option<u64>,
+    /// Asana's link to the comment (`https://app.asana.com/0/<task>/<task>/<story>`
+    /// today), when `permalink_url` was requested.
+    pub permalink_url: Option<String>,
 }
 
 impl Story {

@@ -66,6 +66,13 @@ impl Table {
         }
     }
 
+    /// A table for piped output: no header, one tab-separated line per
+    /// row, no colour and no truncation, whatever the terminal.
+    #[allow(dead_code)]
+    pub fn tsv() -> Self {
+        Self::new(&[], false, usize::MAX, Palette::new(false))
+    }
+
     pub fn add_row(&mut self, cells: Vec<Cell>) {
         self.rows.push(cells);
     }
@@ -123,6 +130,10 @@ impl Table {
                 if i + 1 < ncols {
                     s = pad_right(&s, widths[i]);
                 }
+                // Painted after padding, blank or not, as go-gh's
+                // `tablePrinter` applies the colour function (project_list
+                // pins that shape); a piece that wants a blank cell left
+                // plain makes it `Cell::plain`.
                 if let Some(f) = cell.color {
                     s = f(&self.palette, &s);
                 }
@@ -260,6 +271,15 @@ mod tests {
         let mut t = Table::new(&["ID", "TITLE"], false, 80, Palette::off());
         t.add_row(vec![Cell::plain("1"), Cell::plain("a\tb")]);
         assert_eq!(t.render(), "1\ta\tb\n");
+    }
+
+    #[test]
+    fn tsv_tables_have_no_header_and_no_colour() {
+        let mut t = Table::tsv();
+        t.add_row(vec![Cell::fixed("1", Palette::bold), Cell::plain("a b")]);
+        t.add_row(vec![Cell::plain("22"), Cell::colored("", Palette::muted)]);
+        assert_eq!(t.render(), "1\ta b\n22\t\n");
+        assert_eq!(Table::tsv().render(), "");
     }
 
     #[test]
