@@ -16,13 +16,13 @@
 //! ✓ Logged in to app.asana.com account Dave Div (~/.config/asana/config.toml)
 //!
 //! $ echo notarealtoken | asana auth login --with-token      (gh-errors/auth-login-bad-token)
-//! HTTP 401: the token was rejected by app.asana.com, so it was not stored.
+//! The token was rejected by app.asana.com (HTTP 401), so it was not stored.
 //! Check it, or create a new one at https://app.asana.com/0/my-apps.
 //! [exit 4]
 //!
 //! $ asana auth login < /dev/null                            (gh-errors/create-noninteractive)
-//! Cannot prompt for a token when not running interactively.
-//! Pipe the token in: echo "$TOKEN" | asana auth login --with-token
+//! A token cannot be prompted for when not running interactively.
+//! To pipe one in, run:  echo "$TOKEN" | asana auth login --with-token
 //!
 //! Usage:  asana auth login [flags]
 //! ...
@@ -33,11 +33,11 @@
 //!
 //! $ asana auth logout                                       (gh-errors/auth-logout-none)
 //! You are not logged in to app.asana.com. To log in, run: asana auth login
-//! [exit 1]
+//! [exit 4]
 //!
 //! $ asana auth token                                        (gh-errors/auth-status-none)
 //! You are not logged in to app.asana.com. To log in, run: asana auth login
-//! [exit 1]
+//! [exit 4]
 //! ```
 //!
 //! # One voice for every failure
@@ -46,28 +46,34 @@
 //! a bad token, the bare `not logged in to any hosts` for a logout with
 //! nothing stored, and the sentence `You are not logged into any GitHub
 //! hosts. To log in, run: gh auth login` for status. Every failure in this
-//! file uses the one shape `error.rs` gives the rest of the CLI instead: a
-//! sentence saying what happened (an API error opens with gh's `HTTP
-//! <status>:` label), then a line saying what to do next, which names the
-//! command to run after `run:` or `Pipe the token in:` where there is one.
-//! No `error:` prefix, no lowercase fragment, nothing wider than 79
-//! columns, and the not-logged-in state is one sentence wherever it is met.
-//! A usage error (the prompt without a terminal) keeps the `Usage:` block
-//! under its two lines, as every usage error in the CLI does.
+//! file has one shape instead, the shape of that last line: a sentence
+//! that leads with its subject and says what happened (`You are not logged
+//! in ...`, `The token was rejected ...`, `A token cannot be prompted for
+//! ...`), then the next step, which names the command to run after `run:`
+//! where there is one. No `error:` prefix and no `HTTP 401:` label opening
+//! the line (the status sits in parentheses inside the sentence), no
+//! lowercase fragment, nothing wider than 79 columns. A command after a
+//! colon follows two spaces, as gh's `Try authenticating with:  gh auth
+//! login` and every next step `error.rs` prints do; the one exception is
+//! the shared not-logged-in sentence, which keeps gh's own one-space
+//! spelling. A usage error (the prompt without a terminal) keeps the
+//! `Usage:` block under its two lines, as every usage error in the CLI
+//! does.
 //!
 //! # Exit codes
 //!
-//! `asana help exit-codes` gives 4 to a command that requires
-//! authentication and 1 to every other failure. A token Asana rejects is
-//! an authentication failure, so `login` exits 4 with it: the same code
-//! `task list` exits with when its token is rejected, so a script can tell
-//! a bad credential from a bad invocation. Not being logged in is an
-//! ordinary error (1) for `logout` and `token`: neither needs a token to
-//! run, they manage the one that is stored, and a logout that removed
-//! nothing did not do what was asked. gh draws the line in the same place
-//! (`auth logout` and `auth token` exit 1 with nothing stored). A script
-//! that wants a no-op logout writes `asana auth logout 2>/dev/null ||
-//! true`, the way it would for `rm`.
+//! `asana help exit-codes` gives 4 to authentication required or rejected
+//! and 1 to every other failure. Every auth-state failure here is in the
+//! one family, 4, so a script can branch on it: a token Asana rejects
+//! (the code `task list` exits with when its token is rejected), and the
+//! not-logged-in state met by `logout` and `token`, the same code `auth
+//! status` exits with for the same sentence. A logout that finds nothing
+//! stored is in that family too, whether or not an environment variable is
+//! doing the authenticating. The prompt without a terminal and an empty
+//! standard input are usage errors, 1: a script that wants a no-op logout
+//! writes `asana auth logout 2>/dev/null || true`, the way it would for
+//! `rm`. gh exits 1 for its `not logged in to any hosts`; ours follows the
+//! design contract's table instead, which puts every auth state under 4.
 //!
 //! The account name is kept beside the token (`user = "..."`) so `logout`
 //! can say whose token it removed, the way `gh auth logout` names the
@@ -79,14 +85,15 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::api::{self, ApiError, User, USER_FIELDS};
 use crate::cli::{usage_error, Cancelled, SilentExit};
-use crate::cmd::{confirm, Prevalidate};
+use crate::cmd::{confirm, not_logged_in, Prevalidate};
 use crate::config::{
     base_url, host, load, remove_token, save_login, stored_login, tilde, ConfigError, PAT_URL,
     TOKEN_ENV, TOKEN_ENV_ALT,
 };
 use crate::render::Palette;
 
-const EXIT_ERROR: i32 = 1;
+/// Authentication required or rejected (`asana help exit-codes`): the one
+/// code for every auth-state failure in this file.
 const EXIT_AUTH: i32 = 4;
 
 // ------------------------------------------------------------------- help
@@ -237,7 +244,7 @@ pub async fn run_login(args: LoginArgs, palette: &Palette) -> Result<()> {
 /// `asana auth logout`: remove the stored token, naming the account it
 /// belonged to. With nothing stored there is nothing to do: the
 /// not-logged-in line (or, when a variable is the login, what to unset)
-/// and exit 1, like gh.
+/// and exit 4, the not-logged-in code.
 pub async fn run_logout(_args: LogoutArgs, palette: &Palette) -> Result<()> {
     let Some(stored) = stored_login()? else {
         return Err(nothing_to_log_out(palette));
@@ -266,7 +273,7 @@ pub async fn run_logout(_args: LogoutArgs, palette: &Palette) -> Result<()> {
 
 /// `asana auth token`: the token every other command uses, alone on stdout
 /// so it can be substituted into another command. Without one, the same
-/// not-logged-in line as `logout`, exit 1.
+/// not-logged-in line as `logout` and `auth status`, exit 4.
 pub async fn run_token(_args: TokenArgs, palette: &Palette) -> Result<()> {
     match load(None) {
         Ok(cfg) => {
@@ -275,7 +282,7 @@ pub async fn run_token(_args: TokenArgs, palette: &Palette) -> Result<()> {
         }
         Err(ConfigError::MissingToken(_)) => {
             eprintln!("{}", not_logged_in(palette));
-            Err(SilentExit(EXIT_ERROR).into())
+            Err(SilentExit(EXIT_AUTH).into())
         }
         Err(err) => Err(err.into()),
     }
@@ -283,56 +290,44 @@ pub async fn run_token(_args: TokenArgs, palette: &Palette) -> Result<()> {
 
 // --------------------------------------------------------------- messages
 //
-// Every failure below is a sentence saying what happened, then a line
-// saying what to do next; a command to run follows `run:` (or `Pipe the
-// token in:`) after one space. Runtime errors that exit 1 are returned as
-// plain errors, so `error::report` prints them as they are (each line is
-// kept inside its 79 columns by hand); the two that paint or exit 4 are
-// printed here and finished with `SilentExit`.
+// Every failure below is one sentence that leads with its subject and says
+// what happened, then the next step; a command to run follows `run:` and
+// two spaces (`error.rs`'s spelling, from gh's `Try authenticating with:
+// gh auth login`). Each line is kept inside its 79 columns by hand. The
+// usage errors (exit 1) are returned as errors for `error::report` to
+// print; the auth-state failures (exit 4) are printed here, on stderr, and
+// finished with `SilentExit`, since `report` has no code for them.
 
 /// The next step for a script: the token on standard input.
-const PIPE_HINT: &str = "Pipe the token in: echo \"$TOKEN\" | asana auth login --with-token";
+const PIPE_HINT: &str = "To pipe one in, run:  echo \"$TOKEN\" | asana auth login --with-token";
 
-/// The one sentence for the not-logged-in state, shared by `logout` and
-/// `token`: gh's `You are not logged into any GitHub hosts. To log in, run:
-/// gh auth login`, naming the host we would have asked, with the command in
-/// bold as gh paints it.
-fn not_logged_in(palette: &Palette) -> String {
-    format!(
-        "You are not logged in to {}. To log in, run: {}",
-        host(),
-        palette.bold("asana auth login")
-    )
-}
-
-/// `logout` found no stored token. Nothing was removed, so this is an
-/// error (exit 1, where gh prints `not logged in to any hosts`): the
-/// not-logged-in line, or, when an environment variable is what every
-/// command authenticates with, the variable to unset instead of a login to
-/// run.
+/// `logout` found no stored token. Nothing was removed, so this is a
+/// failure, and the not-logged-in kind (exit 4, where gh prints `not
+/// logged in to any hosts`): the shared not-logged-in sentence, or, when
+/// an environment variable is what every command authenticates with, that
+/// there is nothing stored and the variable to unset.
 fn nothing_to_log_out(palette: &Palette) -> anyhow::Error {
-    match env_token_var() {
-        Some(var) => anyhow!("{}", logout_leaves_env(var)),
-        None => {
-            eprintln!("{}", not_logged_in(palette));
-            SilentExit(EXIT_ERROR).into()
-        }
-    }
+    let text = match env_token_var() {
+        Some(var) => logout_leaves_env(var),
+        None => not_logged_in(palette),
+    };
+    eprintln!("{text}");
+    SilentExit(EXIT_AUTH).into()
 }
 
-/// The login is `var`, which `logout` cannot remove: what it is, and how
-/// to stop using it.
+/// The login is `var`, which `logout` cannot remove: that nothing is
+/// stored, where the token comes from, and how to stop using it.
 fn logout_leaves_env(var: &str) -> String {
     format!(
-        "The token comes from {var}, which logout does not touch.\n\
-         To stop using it, run: unset {var}"
+        "No token is stored to remove; the one in use comes from {var}.\n\
+         To stop using it, run:  unset {var}"
     )
 }
 
 /// `login` without `--with-token` and without a terminal to prompt on:
-/// the reason, then the way in for a script.
+/// what cannot happen and why, then the way in for a script.
 fn cannot_prompt() -> String {
-    format!("Cannot prompt for a token when not running interactively.\n{PIPE_HINT}")
+    format!("A token cannot be prompted for when not running interactively.\n{PIPE_HINT}")
 }
 
 /// `--with-token` read an empty line: the same next step.
@@ -340,16 +335,17 @@ fn no_token_on_stdin() -> anyhow::Error {
     anyhow!("No token was read from standard input.\n{PIPE_HINT}")
 }
 
-/// Asana answered 401 to the candidate token. The lines `error.rs` prints
-/// for a rejected token, adapted to one that was never stored: the `HTTP
-/// 401:` label opens the sentence, which says the token went nowhere, and
-/// the next step is the token itself (`asana auth login` is what the user
-/// just ran, so it is not repeated). gh's `error validating token:` prefix
-/// and the endpoint that saw the 401 are left out: a rejected token is
-/// rejected everywhere.
+/// Asana answered 401 to the candidate token: what happened, with the
+/// status in parentheses rather than opening the line as `error.rs`'s
+/// `HTTP 401:` label does, so the sentence has the shape of every other
+/// failure here; that the token went nowhere; and the next step, which is
+/// the token itself (`asana auth login` is what the user just ran, so it
+/// is not repeated). gh's `error validating token:` prefix and the
+/// endpoint that saw the 401 are left out: a rejected token is rejected
+/// everywhere.
 fn token_rejected() -> String {
     format!(
-        "HTTP 401: the token was rejected by {}, so it was not stored.\n\
+        "The token was rejected by {} (HTTP 401), so it was not stored.\n\
          Check it, or create a new one at {PAT_URL}.",
         host()
     )
@@ -575,16 +571,20 @@ mod tests {
         assert_eq!(account_name(&user(None, None)), "12345");
     }
 
-    /// gh's `auth status` sentence, naming our host, with only the command
+    /// The shared not-logged-in sentence (`cmd::not_logged_in`) is the one
+    /// `logout` and `token` print, so it cannot drift from `auth status`:
+    /// gh's `auth status` line, naming our host, with only the command
     /// painted (bold, like `reference/gh-errors/auth-status-none.ansi.txt`).
     /// One line, no trailing period after the command, under 80 columns.
     #[test]
     fn not_logged_in_is_one_sentence_with_the_next_step() {
         let plain = not_logged_in(&Palette::off());
-        assert!(plain.starts_with("You are not logged in to "), "{plain}");
-        assert!(
-            plain.ends_with(". To log in, run: asana auth login"),
-            "{plain}"
+        assert_eq!(
+            plain,
+            format!(
+                "You are not logged in to {}. To log in, run: asana auth login",
+                host()
+            )
         );
         assert!(!plain.contains('\n'), "{plain}");
         assert!(plain.chars().count() < 80, "{plain}");
@@ -599,11 +599,14 @@ mod tests {
         );
     }
 
-    /// Every failure speaks with one voice: a sentence (capital, full
-    /// stop) saying what happened, then a line with the next step; where
-    /// the next step is a command it follows `run:` (or the pipe hint's
-    /// colon) after exactly one space. No `error:` prefix, no line wider
-    /// than 79 columns, no trailing space.
+    /// Every failure speaks with one voice: a sentence that leads with its
+    /// subject (a capital letter, never an `error:` prefix or an `HTTP`
+    /// label) and says what happened, then the next step; where the next
+    /// step is a command it follows `run:` and two spaces, gh's spelling
+    /// in `Try authenticating with:  gh auth login` and `error.rs`'s in
+    /// every hint it prints. The one exception is the shared not-logged-in
+    /// sentence, which keeps gh's own one-space `To log in, run: `. No
+    /// line wider than 79 columns, no trailing space.
     #[test]
     fn every_failure_is_a_sentence_then_a_next_step() {
         let messages = [
@@ -621,14 +624,14 @@ mod tests {
                 !text.starts_with("error"),
                 "{name}: no `error:` prefix: {text}"
             );
-            // A sentence opens with a capital, or with gh's `HTTP <status>:`
-            // label, which `error.rs` follows with lowercase (`HTTP 401:
-            // the token in ASANA_TOKEN was rejected.`).
             let first = lines[0];
             assert!(
-                first.starts_with("HTTP 401: ")
-                    || first.starts_with(|c: char| c.is_ascii_uppercase()),
-                "{name}: opens with a capital or the HTTP label: {first}"
+                first.starts_with(|c: char| c.is_ascii_uppercase()),
+                "{name}: leads with its subject: {first}"
+            );
+            assert!(
+                !first.starts_with("HTTP "),
+                "{name}: no label opens the line: {first}"
             );
             // The sentence closes with a full stop, either ending its line
             // or, in gh's one-line shape, before the next step.
@@ -639,43 +642,53 @@ mod tests {
             for line in &lines {
                 assert!(line.chars().count() <= 79, "{name}: too wide: {line}");
                 assert_eq!(*line, line.trim_end(), "{name}: trailing space: {line:?}");
-                assert!(
-                    !line.contains(":  "),
-                    "{name}: two spaces after a colon: {line}"
-                );
             }
             let next = lines.last().expect("a next-step line");
-            let has_next_step = next.contains("run: ")
-                || next.starts_with("Pipe the token in: ")
+            let has_next_step = next.contains("run:  ")
+                || next.contains("To log in, run: asana auth login")
                 || next.starts_with("Check it, or create a new one at ");
             assert!(has_next_step, "{name}: names the next step: {next}");
+            // A command after `run:` follows two spaces (one in the shared
+            // gh sentence), never one, never three.
+            if let Some((_, command)) = next.split_once("run:") {
+                let spaces = command.len() - command.trim_start().len();
+                let expected = if *name == "not logged in" { 1 } else { 2 };
+                assert_eq!(spaces, expected, "{name}: spaces after `run:`: {next:?}");
+            }
         }
     }
 
-    /// The pipe hint is one whole command a script can paste.
+    /// The pipe hint is one whole command a script can paste, after the
+    /// two spaces that set a command off from its sentence.
     #[test]
     fn pipe_hint_is_a_pasteable_command() {
         assert_eq!(
             PIPE_HINT,
-            "Pipe the token in: echo \"$TOKEN\" | asana auth login --with-token"
+            "To pipe one in, run:  echo \"$TOKEN\" | asana auth login --with-token"
         );
         assert!(cannot_prompt().ends_with(PIPE_HINT));
         assert!(no_token_on_stdin().to_string().ends_with(PIPE_HINT));
         assert_eq!(cannot_prompt().lines().count(), 2);
+        assert_eq!(
+            cannot_prompt().lines().next().unwrap(),
+            "A token cannot be prompted for when not running interactively."
+        );
     }
 
-    /// The rejected-token lines: the label, the host, that nothing was
-    /// stored, and the tokens page, in two lines.
+    /// The rejected-token lines: the host, the status in parentheses, that
+    /// nothing was stored, and the tokens page, in two lines.
     #[test]
     fn token_rejected_names_the_host_and_the_tokens_page() {
         let text = token_rejected();
         let mut lines = text.lines();
         let first = lines.next().unwrap();
-        assert!(
-            first.starts_with("HTTP 401: the token was rejected by "),
-            "{first}"
+        assert_eq!(
+            first,
+            format!(
+                "The token was rejected by {} (HTTP 401), so it was not stored.",
+                host()
+            )
         );
-        assert!(first.ends_with(", so it was not stored."), "{first}");
         assert_eq!(
             lines.next().unwrap(),
             format!("Check it, or create a new one at {PAT_URL}.")
@@ -687,8 +700,25 @@ mod tests {
     fn logout_with_env_var_says_what_to_unset() {
         assert_eq!(
             logout_leaves_env("ASANA_TOKEN"),
-            "The token comes from ASANA_TOKEN, which logout does not touch.\n\
-             To stop using it, run: unset ASANA_TOKEN"
+            "No token is stored to remove; the one in use comes from ASANA_TOKEN.\n\
+             To stop using it, run:  unset ASANA_TOKEN"
         );
+    }
+
+    /// Every auth-state failure exits with the one code, 4 (`asana help
+    /// exit-codes`: authentication required or rejected), the code `auth
+    /// status` uses for the same sentence; the usage errors exit 1 through
+    /// `error::report`.
+    #[test]
+    fn auth_state_failures_share_the_auth_exit_code() {
+        assert_eq!(EXIT_AUTH, crate::error::EXIT_AUTH);
+        let err = nothing_to_log_out(&Palette::off());
+        let silent = err
+            .downcast_ref::<SilentExit>()
+            .expect("printed here, finished with SilentExit");
+        assert_eq!(silent.0, EXIT_AUTH);
+        assert!(no_token_on_stdin().downcast_ref::<SilentExit>().is_none());
+        let usage = usage_error(&["auth", "login"], cannot_prompt());
+        assert!(usage.downcast_ref::<SilentExit>().is_none());
     }
 }
