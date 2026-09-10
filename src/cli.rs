@@ -811,9 +811,16 @@ fn render_help_for(
         out.push('\n');
     }
 
+    // The `--help` hint and the manual on every screen; the topic lines on
+    // the root alone, under the HELP TOPICS it lists (see `help::learn_more`).
     out.push_str(&heading("LEARN MORE"));
     out.push('\n');
-    prose(&mut out, &help::learn_more().join("\n"), "  ", width);
+    prose(
+        &mut out,
+        &help::learn_more(path.is_empty()).join("\n"),
+        "  ",
+        width,
+    );
     out.push('\n');
     out
 }
@@ -973,7 +980,48 @@ ARGUMENTS
         assert!(project.contains(expected_tail), "{project}");
         assert!(!project.contains("\nFLAGS\n"));
         assert!(!project.contains("HELP TOPICS"));
-        assert!(project.ends_with("`asana help formatting`\n\n"));
+        assert!(project
+            .ends_with("\n  Read the manual at https://github.com/davediv/asana-cli#readme\n\n"));
+    }
+
+    /// The footer is two lines below the root (the `--help` hint and the
+    /// manual) and five on the root, where the three topic lines follow the
+    /// HELP TOPICS they name: a group or leaf screen never ends in a footer
+    /// longer than its command list, and no screen repeats what the root
+    /// said. Every footer is laid out like the rest of the screen.
+    #[test]
+    fn topic_links_close_the_root_screen_only() {
+        let p = Palette::off();
+        let footer = |screen: &str| -> Vec<String> {
+            screen
+                .split("\nLEARN MORE\n")
+                .nth(1)
+                .expect("LEARN MORE")
+                .trim_end_matches('\n')
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let root = footer(&help(&[], &p));
+        assert_eq!(root.len(), 5, "{root:?}");
+        assert_eq!(
+            root[..2],
+            [
+                "  Use `asana <command> <subcommand> --help` for more information on a command.",
+                "  Read the manual at https://github.com/davediv/asana-cli#readme",
+            ]
+        );
+        assert!(root[2..].iter().all(|l| l.starts_with("  Learn about ")));
+        for path in all_paths().into_iter().filter(|p| !p.is_empty()) {
+            let screen = render_help_at(&path, &p, MAX_HELP_WIDTH);
+            let lines = footer(&screen);
+            assert_eq!(lines, root[..2].to_vec(), "{path:?}:\n{screen}");
+            assert!(screen.ends_with("#readme\n\n"), "{path:?}");
+            // The same two lines on an 80-column terminal: both fit.
+            let narrow = render_help_at(&path, &p, NARROW);
+            assert_eq!(footer(&narrow), lines, "{path:?}:\n{narrow}");
+            assert!(!narrow.contains("asana help exit-codes"), "{path:?}");
+        }
     }
 
     /// Every description on the task screen names one task, the way gh's
@@ -1000,7 +1048,9 @@ TARGETED COMMANDS
 
     /// `asana help formatting` reads like `gh help formatting`: the prose,
     /// two blank lines, a plain `EXAMPLES` heading and the examples indented
-    /// two spaces (blank lines included), with no colour anywhere.
+    /// two spaces (blank lines included), with no colour anywhere. It
+    /// documents the three things a `--json` command offers: the optional
+    /// field list, the JSON FIELDS section of its `--help`, and `--jq`.
     #[test]
     fn formatting_topic_has_examples_like_gh() {
         let topic = help::topic("formatting").expect("formatting topic");
@@ -1008,12 +1058,33 @@ TARGETED COMMANDS
         assert!(out.starts_with("By default, the result of `asana` commands is output in line-based plain\ntext format"), "{out}");
         assert!(out.contains("`--json`"), "{out}");
         assert!(out.contains("tab-separated with no header"), "{out}");
+        for phrase in [
+            "The `--json` flag takes an optional comma-separated list of fields to keep",
+            "`--json gid,name,assignee`",
+            "`assignee.name`",
+            "under JSON FIELDS",
+            "The `--jq` flag requires a string argument in jq query syntax",
+            "it needs `--json` as well",
+            "https://jqlang.github.io/jq/manual/",
+        ] {
+            assert!(out.contains(phrase), "{phrase:?} missing in:\n{out}");
+        }
+        assert!(!out.contains("takes no field list"), "{out}");
+        assert!(!out.contains("--template"), "{out}");
         assert!(
             out.contains(".\n\n\nEXAMPLES\n  # Default output format\n  $ asana task list\n\n"),
             "{out}"
         );
         assert!(
-            out.contains("\n  $ asana task list --json\n  [\n    {\n"),
+            out.contains("\n  # Adding the --json flag with a list of field names\n  $ asana task list --json gid,name,assignee\n  [\n    {\n      \"assignee\": {\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n  # Adding the --jq flag and selecting fields from the array\n  $ asana task list --json name --jq '.[].name'\n  Fix the login page\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n  $ asana task list --json name,due_on --jq \\\n    'map(select(.due_on != null))"),
             "{out}"
         );
         assert!(
@@ -1500,19 +1571,40 @@ EXAMPLES
     }
 
     /// A leaf that declares `JSON_FIELDS` gets gh's JSON FIELDS section:
-    /// after the flag tables, before EXAMPLES, the names sorted and wrapped
-    /// at 80 columns on a wide terminal and at the terminal's width on a
-    /// narrow one (`reference/gh/issue-list-help.txt`).
+    /// after FLAGS and INHERITED FLAGS, before EXAMPLES, the names sorted
+    /// and wrapped at 80 columns on a wide terminal and at the terminal's
+    /// width on a narrow one (`reference/gh/issue-list-help.txt`).
     #[test]
     fn json_fields_section_sits_between_flags_and_examples() {
         let p = Palette::off();
-        let mut root = Command::new("asana").subcommand(
-            Command::new("list")
-                .disable_help_flag(true)
-                .about("List things")
-                .arg(clap::Arg::new("json").long("json").value_name("fields"))
-                .after_help("$ asana list --json gid,name"),
-        );
+        let mut root = Command::new("asana")
+            .disable_help_flag(true)
+            .arg(
+                clap::Arg::new("workspace")
+                    .long("workspace")
+                    .global(true)
+                    .value_name("<name|gid>")
+                    .help("Select the workspace by name or gid"),
+            )
+            .subcommand(
+                Command::new("list")
+                    .disable_help_flag(true)
+                    .about("List things")
+                    .arg(
+                        clap::Arg::new("json")
+                            .long("json")
+                            .value_name("fields")
+                            .help("Output JSON with the specified fields"),
+                    )
+                    .arg(
+                        clap::Arg::new("jq")
+                            .short('q')
+                            .long("jq")
+                            .value_name("expression")
+                            .help("Filter JSON output using a jq expression"),
+                    )
+                    .after_help("$ asana list --json gid,name"),
+            );
         root.build();
         let path = ["list".to_string()];
         let fields = [
@@ -1533,7 +1625,11 @@ EXAMPLES
         let wide = render_help_for(&root, &path, &p, MAX_HELP_WIDTH, &fields);
         let expected = "\
 FLAGS
-  --json fields   
+  -q, --jq expression   Filter JSON output using a jq expression
+      --json fields     Output JSON with the specified fields
+
+INHERITED FLAGS
+      --workspace <name|gid>   Select the workspace by name or gid
 
 JSON FIELDS
   assignee, completed, created_at, custom_fields, due_on, gid, memberships,
@@ -1541,8 +1637,48 @@ JSON FIELDS
 
 EXAMPLES
   $ asana list --json gid,name
+
+LEARN MORE
 ";
         assert!(wide.contains(expected), "{wide}");
+        // gh's own list, wrapped where gh wraps it (the second line is the
+        // widest, 80 columns exactly).
+        let gh = [
+            "assignees",
+            "author",
+            "blockedBy",
+            "blocking",
+            "body",
+            "closed",
+            "closedAt",
+            "closedByPullRequestsReferences",
+            "comments",
+            "createdAt",
+            "id",
+            "isPinned",
+            "issueType",
+            "labels",
+            "milestone",
+            "number",
+            "parent",
+            "projectCards",
+            "projectItems",
+            "reactionGroups",
+            "state",
+            "stateReason",
+            "subIssues",
+            "subIssuesSummary",
+            "title",
+            "updatedAt",
+            "url",
+        ];
+        let issue_list = render_help_for(&root, &path, &p, MAX_HELP_WIDTH, &gh);
+        assert!(
+            issue_list.contains(
+                "\nJSON FIELDS\n  assignees, author, blockedBy, blocking, body, closed, closedAt,\n  closedByPullRequestsReferences, comments, createdAt, id, isPinned, issueType,\n  labels, milestone, number, parent, projectCards, projectItems, reactionGroups,\n  state, stateReason, subIssues, subIssuesSummary, title, updatedAt, url\n\nEXAMPLES\n"
+            ),
+            "{issue_list}"
+        );
         let narrow = render_help_for(&root, &path, &p, 40, &fields);
         assert!(
             narrow.contains("\nJSON FIELDS\n  assignee, completed, created_at,\n"),

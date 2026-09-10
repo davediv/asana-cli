@@ -75,15 +75,28 @@ pub const MANUAL_URL: &str = "https://github.com/davediv/asana-cli#readme";
 
 pub const RELEASES_URL: &str = "https://github.com/davediv/asana-cli/releases/tag";
 
-/// The `LEARN MORE` footer printed on every help screen.
-pub fn learn_more() -> Vec<String> {
-    vec![
+/// The `LEARN MORE` footer. Every screen points at `--help` and the manual
+/// (gh's two lines, `on a command` rather than `about` so the hint fits an
+/// 80-column terminal with our longer name); the root screen alone goes on
+/// to the help topics, one line per prose topic, which it has just listed
+/// under HELP TOPICS. gh stamps its topic lines on every screen too, but
+/// under `asana project --help` that footer would be longer than the
+/// two-command list it follows, and a reader who reached a group or leaf
+/// screen has already passed the root, so those screens keep the two lines
+/// that say something new: how to go deeper, and where the manual is.
+pub fn learn_more(root: bool) -> Vec<String> {
+    let mut lines = vec![
         "Use `asana <command> <subcommand> --help` for more information on a command.".to_string(),
         format!("Read the manual at {MANUAL_URL}"),
-        "Learn about exit codes using `asana help exit-codes`".to_string(),
-        "Learn about environment variables using `asana help environment`".to_string(),
-        "Learn about output formatting using `asana help formatting`".to_string(),
-    ]
+    ];
+    if root {
+        lines.extend([
+            "Learn about exit codes using `asana help exit-codes`".to_string(),
+            "Learn about environment variables using `asana help environment`".to_string(),
+            "Learn about output formatting using `asana help formatting`".to_string(),
+        ]);
+    }
+    lines
 }
 
 /// The usage line for a command path, when it differs from the default
@@ -236,10 +249,24 @@ pub const TOPICS: &[Topic] = &[
                \n\
                Commands that read from Asana (`list` and `view`) also support the `--json`\n\
                flag, which prints the objects the API returned instead: an array for\n\
-               lists, one object for views, pretty-printed and never colored. The flag\n\
-               takes no field list; every field the command fetched is included, so pipe\n\
-               the output into `jq` to select or reshape it. To learn about jq query\n\
-               syntax, see: https://jqlang.github.io/jq/manual/\n\
+               lists, one object for views, pretty-printed and never colored. Once in\n\
+               JSON, the output can be filtered further by adding the `--jq` flag. This is\n\
+               useful for selecting a subset of data, creating new data structures, or as\n\
+               input to another command line script.\n\
+               \n\
+               The `--json` flag takes an optional comma-separated list of fields to keep,\n\
+               as in `--json gid,name,assignee`; given alone, it keeps every field the\n\
+               command fetched. A dotted name such as `assignee.name` keeps that one key\n\
+               inside its parent object. Each command's `--help` lists the field names it\n\
+               accepts under JSON FIELDS, and an unknown name is refused with that list.\n\
+               \n\
+               The `--jq` flag requires a string argument in jq query syntax, and will only\n\
+               print those JSON values which match the query; it needs `--json` as well.\n\
+               jq queries can be used to select elements from an array, fields from an\n\
+               object, create a new array, and more. The `jq` utility does not need to be\n\
+               installed on the system to use this formatting directive. A result that is\n\
+               a string prints bare, one per line; anything else is pretty-printed. To\n\
+               learn about jq query syntax, see: https://jqlang.github.io/jq/manual/\n\
                \n\
                Commands that create something (`task create`, `task comment`) print its\n\
                permalink URL alone on stdout, and every command's progress and status\n\
@@ -264,29 +291,45 @@ pub const TOPICS: &[Topic] = &[
                   1211234567890125\tRenew the certificate\n\
                   \n\
                   \n\
-                  # Adding the --json flag\n\
-                  $ asana task list --json\n\
+                  # Adding the --json flag with a list of field names\n\
+                  $ asana task list --json gid,name,assignee\n\
                   [\n\
                   \x20 {\n\
                   \x20   \"assignee\": {\n\
                   \x20     \"gid\": \"1200000000000001\",\n\
                   \x20     \"name\": \"Jane Doe\"\n\
                   \x20   },\n\
-                  \x20   \"completed\": false,\n\
-                  \x20   \"due_on\": \"2026-09-09\",\n\
                   \x20   \"gid\": \"1211234567890123\",\n\
-                  \x20   \"name\": \"Fix the login page\",\n\
-                  \x20   ...\n\
+                  \x20   \"name\": \"Fix the login page\"\n\
+                  \x20 },\n\
+                  \x20 {\n\
+                  \x20   \"assignee\": {\n\
+                  \x20     \"gid\": \"1200000000000001\",\n\
+                  \x20     \"name\": \"Jane Doe\"\n\
+                  \x20   },\n\
+                  \x20   \"gid\": \"1211234567890124\",\n\
+                  \x20   \"name\": \"Write the release notes\"\n\
                   \x20 },\n\
                   \x20 ...\n\
                   ]\n\
                   \n\
                   \n\
-                  # Selecting fields from the JSON with jq\n\
-                  $ asana task list --json | jq -r '.[].name'\n\
+                  # Adding the --jq flag and selecting fields from the array\n\
+                  $ asana task list --json name --jq '.[].name'\n\
                   Fix the login page\n\
                   Write the release notes\n\
                   Renew the certificate\n\
+                  \n\
+                  \n\
+                  # --jq can be used to implement more complex filtering and output changes\n\
+                  $ asana task list --json name,due_on --jq \\\n\
+                  \x20 'map(select(.due_on != null))   # only tasks with a due date\n\
+                  \x20 | sort_by(.due_on)              # soonest first\n\
+                  \x20 | .[0]'                         # and just the first of them\n\
+                  {\n\
+                  \x20 \"due_on\": \"2026-09-09\",\n\
+                  \x20 \"name\": \"Fix the login page\"\n\
+                  }\n\
                   \n\
                   \n\
                   # A created task's URL is all that reaches stdout\n\
@@ -427,18 +470,103 @@ mod tests {
         }
     }
 
-    /// The footer fits an 80-column terminal under its indent and points at
-    /// every prose topic.
+    /// The `--json` and `--jq` examples in the formatting topic are real:
+    /// run through the shared `render::json` engine over the three tasks
+    /// the topic's table shows (due today, Sep 12 and tomorrow), each prints
+    /// what the topic says it prints: the field list selected and sorted as
+    /// `select` sorts it, the jq comments tolerated, the string results
+    /// bare and the object pretty.
     #[test]
-    fn learn_more_points_at_the_topics() {
-        let lines = learn_more();
-        assert_eq!(lines.len(), 5);
-        assert_prose("learn more", &lines.join("\n"), 2);
-        assert_eq!(lines[1], format!("Read the manual at {MANUAL_URL}"));
+    fn formatting_examples_run_through_the_json_engine() {
+        use crate::render::json::{render, JsonArgs};
+        use serde_json::json;
+
+        let example = topic("formatting").expect("formatting").example;
+        let jane = json!({"gid": "1200000000000001", "name": "Jane Doe"});
+        let tasks = json!([
+            {"gid": "1211234567890123", "name": "Fix the login page",
+             "assignee": jane, "due_on": "2026-09-09", "completed": false},
+            {"gid": "1211234567890124", "name": "Write the release notes",
+             "assignee": jane, "due_on": "2026-09-12", "completed": false},
+            {"gid": "1211234567890125", "name": "Renew the certificate",
+             "assignee": jane, "due_on": "2026-09-10", "completed": false},
+        ]);
+        let allowed = ["gid", "name", "assignee", "due_on", "completed"];
+        let args = |json: &str, jq: Option<&str>| JsonArgs {
+            json: vec![json.to_string()],
+            jq: jq.map(str::to_string),
+        };
+
+        // `--json gid,name,assignee`: the topic shows the first two objects
+        // and elides the rest.
+        let shown = render(&tasks, &args("gid,name,assignee", None), &allowed).unwrap();
+        let expected_head = "\
+[
+  {
+    \"assignee\": {
+      \"gid\": \"1200000000000001\",
+      \"name\": \"Jane Doe\"
+    },
+    \"gid\": \"1211234567890123\",
+    \"name\": \"Fix the login page\"
+  },
+  {
+    \"assignee\": {
+      \"gid\": \"1200000000000001\",
+      \"name\": \"Jane Doe\"
+    },
+    \"gid\": \"1211234567890124\",
+    \"name\": \"Write the release notes\"
+  },
+";
+        assert!(shown.starts_with(expected_head), "{shown}");
+        let quoted =
+            format!("$ asana task list --json gid,name,assignee\n{expected_head}  ...\n]\n");
+        assert!(example.contains(&quoted), "{example}");
+
+        // `--jq '.[].name'`: strings print bare, one per line.
+        let names = render(&tasks, &args("name", Some(".[].name")), &allowed).unwrap();
+        assert_eq!(
+            names,
+            "Fix the login page\nWrite the release notes\nRenew the certificate\n"
+        );
+        assert!(example.contains(&format!(
+            "$ asana task list --json name --jq '.[].name'\n{names}"
+        )));
+
+        // The multi-line expression, comments included, as the shell hands
+        // it over: the topic's lines between the quotes.
+        let (_, rest) = example
+            .split_once("--jq \\\n  '")
+            .expect("the multi-line --jq example");
+        let (expr, _) = rest.split_once('\'').expect("closing quote");
+        assert!(expr.contains("# only tasks with a due date"), "{expr}");
+        let first = render(&tasks, &args("name,due_on", Some(expr)), &allowed).unwrap();
+        let expected = "{\n  \"due_on\": \"2026-09-09\",\n  \"name\": \"Fix the login page\"\n}\n";
+        assert_eq!(first, expected);
+        assert!(example.contains(&format!("# and just the first of them\n{expected}")));
+    }
+
+    /// The footer fits an 80-column terminal under its indent. The root's
+    /// points at every prose topic after the `--help` hint and the manual;
+    /// every other screen's is those two lines alone.
+    #[test]
+    fn learn_more_points_at_the_topics_from_the_root_only() {
+        let root = learn_more(true);
+        assert_eq!(root.len(), 5);
+        assert_prose("learn more", &root.join("\n"), 2);
+        assert_eq!(
+            root[0],
+            "Use `asana <command> <subcommand> --help` for more information on a command."
+        );
+        assert_eq!(root[1], format!("Read the manual at {MANUAL_URL}"));
         for t in TOPICS.iter().filter(|t| matches!(t.body, Body::Text(_))) {
-            assert!(lines
+            assert!(root
                 .iter()
                 .any(|l| l.contains(&format!("asana help {}", t.name))));
         }
+        let below = learn_more(false);
+        assert_eq!(below, root[..2].to_vec());
+        assert!(!below.iter().any(|l| l.contains("asana help ")));
     }
 }
