@@ -8,20 +8,17 @@
 //! pipes.
 
 use std::io::{BufRead, Write};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context as _, Result};
-use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::Task;
+use crate::api::{Story, Task};
 use crate::cli::usage_error;
 use crate::cmd::{
-    can_prompt, open_in_browser, prompt_line, read_text_file, task_url, with_spinner, Prevalidate,
+    can_prompt, confirm_default_yes, edit_in_editor, editor_command, editor_name, open_in_browser,
+    read_text_file, task_url, with_spinner, Prevalidate,
 };
 use crate::ctx::Ctx;
-use crate::render::Palette;
 use crate::resolve::parse_task_id;
 
 const PATH: &[&str] = &["task", "comment"];
@@ -125,21 +122,13 @@ fn require_body(text: &str) -> Result<String> {
     Ok(body.to_string())
 }
 
-/// What `POST /tasks/{gid}/stories?opt_fields=permalink_url` sends back.
-/// Asana returns the comment's own permalink when asked for it (a field the
-/// shared `Story` does not carry), so the link we print is the one Asana
-/// would give, not a guess at its URL scheme.
-#[derive(Debug, Default, Deserialize)]
-struct Created {
-    #[serde(default)]
-    gid: String,
-    permalink_url: Option<String>,
-}
-
-/// The comment's permalink as Asana reports it, or the same shape Asana uses
-/// (`/0/<task>/<task>/<story>`) built by hand when the response left it out.
-fn comment_link(task_gid: &str, created: &Created) -> String {
-    created
+/// The comment's permalink as Asana reports it: `POST /tasks/{gid}/stories`
+/// is asked for `permalink_url` and the [`Story`] that comes back carries
+/// it (`https://app.asana.com/0/<task>/<task>/<story>` today). Only if the
+/// field is missing is that same shape built by hand, so what we print is
+/// never a guess at Asana's URL scheme when Asana has told us the link.
+fn comment_link(task_gid: &str, story: &Story) -> String {
+    story
         .permalink_url
         .as_deref()
         .map(str::trim)
@@ -148,84 +137,21 @@ fn comment_link(task_gid: &str, created: &Created) -> String {
         .unwrap_or_else(|| {
             format!(
                 "https://app.asana.com/0/{task_gid}/{task_gid}/{}",
-                created.gid
+                story.gid
             )
         })
-}
-
-/// `$VISUAL`, else `$EDITOR`, else `vi` (`notepad` on Windows), like gh.
-fn editor_command() -> String {
-    ["VISUAL", "EDITOR"]
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "notepad".to_string()
-            } else {
-                "vi".to_string()
-            }
-        })
-}
-
-/// The editor's name for a prompt: the program without its path or flags
-/// (`code --wait` is `code`), like gh's `surveyext.EditorName`.
-fn editor_name(command: &str) -> String {
-    let program = command.split_whitespace().next().unwrap_or(command);
-    std::path::Path::new(program)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(program)
-        .to_string()
-}
-
-/// Open the editor on a fresh scratch file and return what was written.
-fn edit_in_editor(editor: &str) -> Result<String> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path =
-        std::env::temp_dir().join(format!("asana-comment-{}-{stamp}.md", std::process::id()));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| format!("could not create {}", path.display()))?;
-    let status = if cfg!(windows) {
-        Command::new("cmd")
-            .arg("/C")
-            .arg(format!("{editor} \"{}\"", path.display()))
-            .status()
-    } else {
-        Command::new("sh")
-            .arg("-c")
-            .arg(format!("{editor} \"$1\""))
-            .arg(editor)
-            .arg(&path)
-            .status()
-    };
-    let text = std::fs::read_to_string(&path);
-    let _ = std::fs::remove_file(&path);
-    let status = status.with_context(|| format!("could not run the editor `{editor}`"))?;
-    if !status.success() {
-        bail!("the editor `{editor}` exited with {status}");
-    }
-    text.with_context(|| format!("could not read {}", path.display()))
 }
 
 /// gh's interactive flow: `- Press Enter to draft your comment in vim... `,
 /// wait for Enter, then the editor.
 fn draft_in_editor(ctx: &Ctx) -> Result<String> {
-    let editor = editor_command();
-    let palette = Palette::new(ctx.color);
+    let palette = ctx.palette();
     let mut out = std::io::stdout();
     write!(
         out,
         "- {} to draft your comment in {}... ",
         palette.bold("Press Enter"),
-        palette.bold(&editor_name(&editor))
+        palette.bold(&editor_name(&editor_command()))
     )?;
     out.flush()?;
     let mut line = String::new();
@@ -233,13 +159,7 @@ fn draft_in_editor(ctx: &Ctx) -> Result<String> {
         .lock()
         .read_line(&mut line)
         .context("could not read standard input")?;
-    edit_in_editor(&editor)
-}
-
-/// gh's `Submit?` confirmation: Enter or `y` sends the comment.
-fn confirm_submit() -> Result<bool> {
-    let answer = prompt_line("Submit? (Y/n)")?;
-    Ok(answer.is_empty() || matches!(answer.to_lowercase().as_str(), "y" | "yes"))
+    edit_in_editor("")
 }
 
 /// The task, fetched so a bad identifier fails with Asana's own message
@@ -259,7 +179,7 @@ async fn fetch_task(ctx: &Ctx, gid: &str) -> Result<Task> {
 
 /// Post the comment and print its permalink alone on stdout, like gh.
 async fn post_comment(ctx: &Ctx, gid: &str, body: &str) -> Result<()> {
-    let created: Created = with_spinner(
+    let story: Story = with_spinner(
         ctx,
         "",
         ctx.api.post(
@@ -269,7 +189,7 @@ async fn post_comment(ctx: &Ctx, gid: &str, body: &str) -> Result<()> {
         ),
     )
     .await?;
-    println!("{}", comment_link(gid, &created));
+    println!("{}", comment_link(gid, &story));
     Ok(())
 }
 
@@ -289,13 +209,15 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
         }
         Input::Editor => {
             fetch_task(ctx, &gid).await?;
-            let body = require_body(&edit_in_editor(&editor_command())?)?;
+            let body = require_body(&edit_in_editor("")?)?;
             post_comment(ctx, &gid, &body).await
         }
         Input::Interactive => {
             fetch_task(ctx, &gid).await?;
             let body = require_body(&draft_in_editor(ctx)?)?;
-            if !confirm_submit()? {
+            // gh's `Submit?` confirmation: Enter or `y` sends the comment,
+            // anything else is gh's `Discarding...` (an error, exit 1).
+            if !confirm_default_yes("Submit?")? {
                 bail!("Discarding...");
             }
             post_comment(ctx, &gid, &body).await
@@ -307,19 +229,20 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn created(gid: &str, url: Option<&str>) -> Created {
-        Created {
+    fn story(gid: &str, url: Option<&str>) -> Story {
+        Story {
             gid: gid.to_string(),
             permalink_url: url.map(str::to_string),
+            ..Story::default()
         }
     }
 
     #[test]
     fn the_link_is_asanas_own_permalink() {
         let want = "https://app.asana.com/0/34/34/56";
-        assert_eq!(comment_link("34", &created("56", Some(want))), want);
+        assert_eq!(comment_link("34", &story("56", Some(want))), want);
         assert_eq!(
-            comment_link("34", &created("56", Some("  https://x/y  "))),
+            comment_link("34", &story("56", Some("  https://x/y  "))),
             "https://x/y"
         );
     }
@@ -327,24 +250,32 @@ mod tests {
     #[test]
     fn a_missing_permalink_is_built_in_the_same_shape() {
         assert_eq!(
-            comment_link("34", &created("56", None)),
+            comment_link("34", &story("56", None)),
             "https://app.asana.com/0/34/34/56"
         );
         assert_eq!(
-            comment_link("34", &created("56", Some("  "))),
+            comment_link("34", &story("56", Some("  "))),
             "https://app.asana.com/0/34/34/56"
         );
     }
 
+    /// What `POST /tasks/{gid}/stories?opt_fields=permalink_url` sends back
+    /// decodes into the shared `Story` with or without the link.
     #[test]
     fn the_response_is_read_with_or_without_the_permalink() {
-        let with: Created =
-            serde_json::from_str(r#"{"gid":"56","permalink_url":"https://a/b","text":"hi"}"#)
-                .unwrap();
+        let with: Story = serde_json::from_str(
+            r#"{"gid":"56","resource_type":"story","permalink_url":"https://a/b","text":"hi"}"#,
+        )
+        .unwrap();
         assert_eq!(with.gid, "56");
         assert_eq!(with.permalink_url.as_deref(), Some("https://a/b"));
-        let without: Created = serde_json::from_str(r#"{"gid":"56"}"#).unwrap();
+        assert_eq!(comment_link("34", &with), "https://a/b");
+        let without: Story = serde_json::from_str(r#"{"gid":"56"}"#).unwrap();
         assert_eq!(without.permalink_url, None);
+        assert_eq!(
+            comment_link("34", &without),
+            "https://app.asana.com/0/34/34/56"
+        );
     }
 
     #[test]
@@ -359,14 +290,6 @@ mod tests {
                 "input {blank:?}"
             );
         }
-    }
-
-    #[test]
-    fn editor_names_drop_paths_and_flags() {
-        assert_eq!(editor_name("vim"), "vim");
-        assert_eq!(editor_name("/usr/bin/vim"), "vim");
-        assert_eq!(editor_name("code --wait"), "code");
-        assert_eq!(editor_name("  /opt/homebrew/bin/nvim -f "), "nvim");
     }
 
     fn args(body: Option<&str>, body_file: Option<&str>, editor: bool, web: bool) -> Args {
@@ -454,5 +377,73 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
+
+    /// The help screen is the one `gh issue comment --help` prints, with
+    /// Asana's nouns: the same two paragraphs, two blank lines before
+    /// USAGE, and gh's flag descriptions and placeholders word for word.
+    #[test]
+    fn help_reads_like_gh_issue_comment() {
+        use clap::CommandFactory as _;
+        let root = crate::cli::Cli::command();
+        let cmd = root
+            .find_subcommand("task")
+            .and_then(|t| t.find_subcommand("comment"))
+            .expect("task comment");
+        let about = cmd.get_long_about().expect("long about").to_string();
+        assert!(about.starts_with("Add a comment to an Asana task.\n\n"));
+        assert!(about.ends_with("prompt for the comment text.\n"));
+        let flag = |long: &str| {
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_long() == Some(long))
+                .unwrap_or_else(|| panic!("--{long}"));
+            (
+                arg.get_short(),
+                arg.get_action()
+                    .takes_values()
+                    .then(|| arg.get_value_names())
+                    .flatten()
+                    .map(|v| {
+                        v.iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }),
+                arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+            )
+        };
+        assert_eq!(
+            flag("body"),
+            (
+                Some('b'),
+                Some("text".to_string()),
+                "The comment body text".to_string()
+            )
+        );
+        assert_eq!(
+            flag("body-file"),
+            (
+                Some('F'),
+                Some("file".to_string()),
+                "Read body text from file (use \"-\" to read from standard input)".to_string()
+            )
+        );
+        assert_eq!(
+            flag("editor"),
+            (
+                Some('e'),
+                None,
+                "Skip prompts and open the text editor to write the body in".to_string()
+            )
+        );
+        assert_eq!(
+            flag("web"),
+            (
+                Some('w'),
+                None,
+                "Open the web browser to write the comment".to_string()
+            )
+        );
     }
 }
