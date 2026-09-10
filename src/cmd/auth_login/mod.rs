@@ -9,18 +9,18 @@
 //! `config::remove_token`; `token` prints whichever token every other
 //! command would use.
 //!
-//! What each prints, and the references it is judged against:
+//! What each prints:
 //!
 //! ```text
 //! $ echo $TOKEN | asana auth login --with-token
-//! ✓ Logged in to app.asana.com account Dave Div (~/.config/asana/config.toml)
+//! ✓ Logged in as Dave Div (token stored in ~/.config/asana/config.toml)
 //!
-//! $ echo notarealtoken | asana auth login --with-token      (gh-errors/auth-login-bad-token)
+//! $ echo notarealtoken | asana auth login --with-token
 //! The token was rejected by app.asana.com (HTTP 401), so it was not stored.
 //! Check it, or create a new one at https://app.asana.com/0/my-apps.
 //! [exit 4]
 //!
-//! $ asana auth login < /dev/null                            (gh-errors/create-noninteractive)
+//! $ asana auth login < /dev/null
 //! A token cannot be prompted for when not running interactively.
 //! To pipe one in, run:  echo "$TOKEN" | asana auth login --with-token
 //!
@@ -31,11 +31,11 @@
 //! $ asana auth logout
 //! ✓ Logged out of app.asana.com account Dave Div
 //!
-//! $ asana auth logout                                       (gh-errors/auth-logout-none)
+//! $ asana auth logout            (nothing stored)
 //! You are not logged in to app.asana.com. To log in, run: asana auth login
 //! [exit 4]
 //!
-//! $ asana auth token                                        (gh-errors/auth-status-none)
+//! $ asana auth token             (nothing stored)
 //! You are not logged in to app.asana.com. To log in, run: asana auth login
 //! [exit 4]
 //! ```
@@ -70,14 +70,22 @@
 //! status` exits with for the same sentence. A logout that finds nothing
 //! stored is in that family too, whether or not an environment variable is
 //! doing the authenticating. The prompt without a terminal and an empty
-//! standard input are usage errors, 1: a script that wants a no-op logout
-//! writes `asana auth logout 2>/dev/null || true`, the way it would for
-//! `rm`. gh exits 1 for its `not logged in to any hosts`; ours follows the
-//! design contract's table instead, which puts every auth state under 4.
+//! standard input are usage errors, 1. A script that does not care whether
+//! anything was stored writes `asana auth logout || true`, the way it would
+//! for `rm`, and `logout --help` says so. gh exits 1 for its `not logged in
+//! to any hosts`; ours puts every auth state under the one code instead.
 //!
-//! The account name is kept beside the token (`user = "..."`) so `logout`
-//! can say whose token it removed, the way `gh auth logout` names the
-//! account, without a network call.
+//! # Success lines
+//!
+//! `login` says what only it can: whose token was accepted and the file it
+//! now sits in (`Logged in as ...`, gh's own wording for the same line),
+//! and leaves the standing state to `auth status`, which reports the
+//! account and the source in its own shape. Saying it twice in the same
+//! words would read as a stutter in `asana auth login && asana auth
+//! status`, the way a script sets a machine up. `logout` mirrors gh's
+//! `Logged out of <host> account <name>`; the account name is kept beside
+//! the token (`user = "..."`) so it can name whose token it removed
+//! without a network call.
 
 use std::io::{self, BufRead, IsTerminal, Write};
 
@@ -139,6 +147,10 @@ This command does not revoke the token. A token set through the ASANA_TOKEN
 or ASANA_ACCESS_TOKEN environment variable is not touched either; unset the
 variable to stop using it.
 
+With no token stored there is nothing to remove, so the command exits 4,
+the code every authentication failure uses. Write `asana auth logout || true`
+in a script that does not care.
+
 To revoke a personal access token:
 
 1. Visit https://app.asana.com/0/my-apps
@@ -161,6 +173,8 @@ ASANA_ACCESS_TOKEN, then `token` in the config file
 (~/.config/asana/config.toml), in that order, so the output is exactly what
 every other command sends to Asana. Use it to hand the same credential to
 other tools.
+
+With no token in any of them, nothing is printed and the command exits 4.
 ";
 
 const TOKEN_EXAMPLES: &str = "\
@@ -225,13 +239,7 @@ pub async fn run_login(args: LoginArgs, palette: &Palette) -> Result<()> {
     let user = validate(&token).await?;
     let name = account_name(&user);
     let path = save_login(&token, Some(name.as_str()))?;
-    eprintln!(
-        "{} Logged in to {} account {} ({})",
-        palette.success_icon(),
-        host(),
-        palette.bold(&name),
-        tilde(&path)
-    );
+    eprintln!("{}", logged_in_line(&name, &tilde(&path), palette));
     if let Some(var) = env_token_var() {
         eprintln!(
             "{} {var} is set and takes precedence over the stored token",
@@ -253,15 +261,7 @@ pub async fn run_logout(_args: LogoutArgs, palette: &Palette) -> Result<()> {
         // Gone between the read and the write: nothing to remove after all.
         return Err(nothing_to_log_out(palette));
     }
-    let host = host();
-    match stored.user {
-        Some(user) => eprintln!(
-            "{} Logged out of {host} account {}",
-            palette.success_icon(),
-            palette.bold(&user)
-        ),
-        None => eprintln!("{} Logged out of {host}", palette.success_icon()),
-    }
+    eprintln!("{}", logged_out_line(stored.user.as_deref(), palette));
     if let Some(var) = env_token_var() {
         eprintln!(
             "{} {var} is still set and will be used for authentication",
@@ -285,6 +285,43 @@ pub async fn run_token(_args: TokenArgs, palette: &Palette) -> Result<()> {
             Err(SilentExit(EXIT_AUTH).into())
         }
         Err(err) => Err(err.into()),
+    }
+}
+
+// --------------------------------------------------------- success lines
+//
+// One line on stderr for each of the two commands that change something,
+// so stdout stays empty and pipeable. Each says what that command did and
+// nothing more: the standing state (who you are, where the token is read
+// from) belongs to `auth status`, which prints it in its own shape.
+
+/// `login`: whose token was accepted, and the file it now sits in. gh's
+/// own wording for this line is `Logged in as monalisa`; the file is added
+/// because it is the question a first login leaves behind, and because
+/// `auth status`, which may run next, opens with a line of its own shape
+/// (`Logged in to <host> account <name> (<source>)`) that this one would
+/// otherwise repeat word for word. Only the name is painted, as gh paints
+/// it.
+fn logged_in_line(name: &str, path: &str, palette: &Palette) -> String {
+    format!(
+        "{} Logged in as {} (token stored in {path})",
+        palette.success_icon(),
+        palette.bold(name)
+    )
+}
+
+/// `logout`: gh's `Logged out of <host> account <name>`. A token written
+/// into the file by hand has no name beside it, so the account is left
+/// out rather than guessed at.
+fn logged_out_line(user: Option<&str>, palette: &Palette) -> String {
+    let host = host();
+    match user {
+        Some(user) => format!(
+            "{} Logged out of {host} account {}",
+            palette.success_icon(),
+            palette.bold(user)
+        ),
+        None => format!("{} Logged out of {host}", palette.success_icon()),
     }
 }
 
@@ -571,10 +608,54 @@ mod tests {
         assert_eq!(account_name(&user(None, None)), "12345");
     }
 
+    /// The two lines that report a change: one line each on stderr, the
+    /// account named and painted the way gh paints a login name, nothing
+    /// else painted. `login` says what it did (took the token, put it
+    /// somewhere) rather than restating who you are, so `asana auth login
+    /// && asana auth status` does not print the same sentence twice.
+    #[test]
+    fn success_lines_say_what_changed_without_repeating_auth_status() {
+        let plain = Palette::off();
+        const PATH: &str = "~/.config/asana/config.toml";
+        let login = logged_in_line("Dave Div", PATH, &plain);
+        assert_eq!(
+            login,
+            "\u{2713} Logged in as Dave Div (token stored in ~/.config/asana/config.toml)"
+        );
+        let logout = logged_out_line(Some("Dave Div"), &plain);
+        assert_eq!(
+            logout,
+            format!("\u{2713} Logged out of {} account Dave Div", host())
+        );
+        assert_eq!(
+            logged_out_line(None, &plain),
+            format!("\u{2713} Logged out of {}", host())
+        );
+        // The line `auth status` opens with, which this one must not be.
+        let status = format!("\u{2713} Logged in to {} account Dave Div ({PATH})", host());
+        assert_ne!(login, status);
+        for line in [&login, &logout] {
+            assert!(!line.contains('\n'), "one line: {line}");
+            assert!(line.chars().count() <= 79, "too wide: {line}");
+            assert_eq!(line, &line.trim_end(), "trailing space: {line:?}");
+        }
+        let painted = logged_in_line("Dave Div", PATH, &Palette::new(true));
+        assert!(
+            painted.starts_with(
+                "\x1b[0;32m\u{2713}\x1b[0m Logged in as \x1b[0;1;39mDave Div\x1b[0m ("
+            ),
+            "{painted}"
+        );
+        assert!(
+            painted.ends_with(&format!("(token stored in {PATH})")),
+            "{painted}"
+        );
+    }
+
     /// The shared not-logged-in sentence (`cmd::not_logged_in`) is the one
     /// `logout` and `token` print, so it cannot drift from `auth status`:
     /// gh's `auth status` line, naming our host, with only the command
-    /// painted (bold, like `reference/gh-errors/auth-status-none.ansi.txt`).
+    /// painted bold, as gh paints it.
     /// One line, no trailing period after the command, under 80 columns.
     #[test]
     fn not_logged_in_is_one_sentence_with_the_next_step() {
