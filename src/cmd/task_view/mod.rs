@@ -21,10 +21,13 @@ use crate::api::{Story, Task, STORY_FIELDS, SUBTASK_FIELDS, TASK_VIEW_FIELDS};
 use crate::cmd::{comment_url, finish, open_in_browser, spinner, task_url};
 use crate::ctx::Ctx;
 use crate::render::json::{self, JsonArgs};
-use crate::render::notes::render_body;
 use crate::render::time::{due_phrase, fuzzy_ago, fuzzy_ago_abbr, iso, now, today, DueState};
 use crate::render::Palette;
 use crate::resolve::parse_task_id;
+
+mod notes;
+
+use notes::render_body;
 
 /// The top-level keys `--json` can select: the task as `TASK_VIEW_FIELDS`
 /// returns it, plus `comments` (the comment stories, oldest first), which
@@ -681,6 +684,32 @@ mod tests {
         );
     }
 
+    /// A description with structure — a heading, running text, a list —
+    /// reads as separate blocks: one blank line between each, and never two
+    /// where the text already ended with an empty line.
+    #[test]
+    fn body_separates_headings_lists_and_paragraphs() {
+        let ink = Palette::new(false);
+        let html = "<body><h2>Steps</h2>\nDo this first.\n\n<ul><li>one</li><li>two</li></ul>\nThen stop.</body>";
+        let lines: Vec<String> = body_lines(Some(html), None, 80, &ink)
+            .into_iter()
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "  ## Steps",
+                "",
+                "  Do this first.",
+                "",
+                "  • one",
+                "  • two",
+                "",
+                "  Then stop.",
+            ]
+        );
+    }
+
     #[test]
     fn plurals() {
         assert_eq!(plural(1, "comment"), "1 comment");
@@ -688,8 +717,8 @@ mod tests {
         assert_eq!(plural(3, "comment"), "3 comments");
     }
 
-    /// A finished task's due date is an absolute date with its year, never
-    /// `163 days overdue` (last loop's gap).
+    /// A finished task's due date is an absolute date with its year: a task
+    /// that is already done is never `163 days overdue`.
     #[test]
     fn completed_due_dates_are_absolute() {
         let d = chrono::NaiveDate::from_ymd_opt(2026, 3, 31).expect("date");
