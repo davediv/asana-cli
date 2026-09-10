@@ -39,17 +39,22 @@ const NON_INTERACTIVE: &str = "must provide `--title` when not running interacti
         The task goes into the project named by `--project` (a name, gid or URL), or\n\
         under the task named by `--parent` as a subtask. Without either it is created\n\
         in your workspace and assigned to you, so it shows up in My Tasks.\n\n\
-        Without `--title`, the command prompts for a title and notes when it can and\n\
-        fails when it cannot, so scripts pass `--title` (notes are optional). With\n\
-        `--editor`, the first line of the file is the title and the rest is the notes.\n\n\
+        Without `--title` the command prompts for a title and notes when there is a\n\
+        terminal to ask on and fails with a usage error when there is not, so scripts\n\
+        pass `--title` (notes stay optional). With `--editor` it skips the prompts and\n\
+        opens `$EDITOR`: the first line of the file is the title, the rest the notes.\n\n\
+        The new task's URL is printed on stdout and everything else on stderr, so\n\
+        `url=$(asana task create --title \"Fix the build\")` captures the URL alone.\n\n\
         The `--assignee` flag supports the following special values:\n\
         - `@me` or `me`: assign yourself\n\n\
         The `--due` flag accepts `YYYY-MM-DD`, `today`, `tomorrow`, or a weekday name\n\
         for the next such day.",
     after_help = "$ asana task create --title \"I found a bug\" --notes \"Nothing works\"\n\
+        $ asana task create --title \"Renew the domain\"\n\
         $ asana task create --title \"Write release notes\" --project \"Roadmap\"\n\
         $ asana task create --title \"Call the vendor\" --assignee \"@me\" --due tomorrow\n\
-        $ asana task create --title \"Review the spec\" --assignee jane@example.com --due friday\n\
+        $ asana task create --title \"Review the spec\" --assignee jane@example.com\n\
+        $ asana task create --title \"Ship the release\" --due friday\n\
         $ asana task create --title \"Draft the outline\" --parent 1211234567890123\n\
         $ asana task create --title \"Spec\" --notes-file spec.md\n\
         $ asana task create --title \"Spec\" --notes-file - < spec.md\n\
@@ -610,6 +615,78 @@ mod tests {
         );
         let empty = editor_template(None, None);
         assert_eq!(split_title_notes(&strip_hint(&empty)), (None, None));
+    }
+
+    /// The command's own prose, as clap holds it: the long description and
+    /// the examples.
+    fn help_prose() -> (String, String) {
+        use clap::CommandFactory;
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            args: Args,
+        }
+        let cmd = Wrap::command();
+        let long = cmd
+            .get_long_about()
+            .expect("a long description")
+            .to_string();
+        let examples = cmd.get_after_help().expect("examples").to_string();
+        (long, examples)
+    }
+
+    /// The description is hand-wrapped, so every line has to fit the width
+    /// the help renderer lays prose out at (`render::text::PROSE_WIDTH`);
+    /// a longer one would be re-wrapped and read ragged. Examples are never
+    /// wrapped, so they have to fit an 80-column terminal on their own.
+    #[test]
+    fn help_prose_fits_the_width() {
+        let (long, examples) = help_prose();
+        for line in long.lines() {
+            assert!(
+                line.chars().count() <= crate::render::text::PROSE_WIDTH,
+                "description line is {} wide: {line:?}",
+                line.chars().count()
+            );
+        }
+        for line in examples.lines() {
+            // Two spaces of indent under the EXAMPLES heading.
+            assert!(
+                line.chars().count() + 2 <= 80,
+                "example is {} wide: {line:?}",
+                line.chars().count() + 2
+            );
+        }
+    }
+
+    /// Every example runs without a prompt, so a reader can paste any of
+    /// them into a script: each supplies a title, or opts out of needing one
+    /// with `--editor` or `--web`.
+    #[test]
+    fn every_example_runs_non_interactively() {
+        let (_, examples) = help_prose();
+        let lines: Vec<&str> = examples.lines().collect();
+        assert!(lines.len() >= 9, "{lines:?}");
+        for line in lines {
+            assert!(
+                line.starts_with("$ asana task create "),
+                "example does not start with the command: {line:?}"
+            );
+            assert!(
+                line.contains("--title ") || line.contains("--editor") || line.contains("--web"),
+                "example would prompt: {line:?}"
+            );
+        }
+    }
+
+    /// The description tells a script what it gets: the URL on stdout, the
+    /// progress line on stderr, which is what `run` does.
+    #[test]
+    fn help_documents_the_stdout_stderr_split() {
+        let (long, _) = help_prose();
+        assert!(long.contains("printed on stdout"), "{long}");
+        assert!(long.contains("stderr"), "{long}");
+        assert!(long.contains("url=$(asana task create"), "{long}");
     }
 
     #[test]
