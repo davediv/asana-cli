@@ -1,10 +1,10 @@
 //! `asana task complete` (alias `close`) and `asana task reopen`.
 //!
-//! One status line per task on stderr, shaped like gh's
-//! `✓ Closed issue cli/cli#13 (The title of the issue)`: a coloured glyph, the
-//! verb in the past tense, the identifier, then the title in parentheses. A
-//! task already in the requested state gets `! Task ... is already complete`
-//! and still exits 0.
+//! One status line per task on stderr: a coloured glyph, the verb in the
+//! past tense, the gid, then the title in parentheses (`✓ Completed task
+//! 1211234567890123 (Fix the login page)`). A task already in the requested
+//! state gets `! Task ... is already complete` and still exits 0, so the
+//! command is safe to repeat.
 //!
 //! stdout is for data only: it stays empty unless `--comment` created a
 //! story, whose permalink is printed alone so it pipes (`asana task complete
@@ -34,11 +34,10 @@ const STORY_FIELDS: &str = "permalink_url";
 #[command(
     about = "Mark tasks complete",
     long_about = "Mark one or more tasks complete.\n\n\
-        A task that is already complete is reported and left alone, so the command\n\
-        is safe to repeat. With `--comment` a closing comment is added to each task\n\
-        first and its link is printed.\n\n\
-        The status line for each task goes to stderr and only the comment's link\n\
-        goes to stdout, so the command pipes cleanly.",
+        A task that is already complete is reported and left alone, so the command is\n\
+        safe to repeat. With `--comment` a closing comment is added to each task\n\
+        first, and its link is printed on stdout; the status lines go to stderr, so\n\
+        the link pipes cleanly.",
     after_help = "# Complete a task\n\
         $ asana task complete 1211234567890123\n\
         \n\
@@ -48,7 +47,7 @@ const STORY_FIELDS: &str = "permalink_url";
         # Complete several tasks at once\n\
         $ asana task complete 1211234567890123 1211234567890124\n\
         \n\
-        # Complete a task by URL\n\
+        # Complete a task by URL (`close` is an alias)\n\
         $ asana task close https://app.asana.com/0/1200000000000000/1211234567890123"
 )]
 pub struct CompleteArgs {
@@ -66,10 +65,9 @@ pub struct CompleteArgs {
     about = "Reopen tasks",
     long_about = "Reopen one or more completed tasks.\n\n\
         A task that is already open is reported and left alone, so the command is\n\
-        safe to repeat. With `--comment` a comment is added to each task first and\n\
-        its link is printed.\n\n\
-        The status line for each task goes to stderr and only the comment's link\n\
-        goes to stdout, so the command pipes cleanly.",
+        safe to repeat. With `--comment` a comment is added to each task first, and\n\
+        its link is printed on stdout; the status lines go to stderr, so the link\n\
+        pipes cleanly.",
     after_help = "# Reopen a task\n\
         $ asana task reopen 1211234567890123\n\
         \n\
@@ -77,7 +75,10 @@ pub struct CompleteArgs {
         $ asana task reopen 1211234567890123 --comment \"Regressed in 2.5\"\n\
         \n\
         # Reopen several tasks at once\n\
-        $ asana task reopen 1211234567890123 1211234567890124"
+        $ asana task reopen 1211234567890123 1211234567890124\n\
+        \n\
+        # Reopen a task by URL\n\
+        $ asana task reopen https://app.asana.com/0/1200000000000000/1211234567890123"
 )]
 pub struct ReopenArgs {
     /// Task gids or URLs
@@ -129,8 +130,7 @@ struct Action {
     verb: &'static str,
     /// `complete` / `open`, for the already-in-that-state line.
     state: &'static str,
-    /// gh paints the tick red when it closes something and green when it
-    /// reopens it (`SuccessIconWithColor(cs.Red)` in `issue close`).
+    /// Closing something paints the tick red, reopening it green.
     tick: fn(&Palette) -> String,
 }
 
@@ -171,26 +171,28 @@ async fn set_completed(
     // Coloured by stderr's own terminal-ness, never stdout's: `2>log` keeps
     // the log clean and `| cat` keeps the tick green (or red).
     let p = ctx.stderr_palette();
-    // gh's `issue close --comment ""` closes without commenting; so do we.
+    // `--comment ""` completes the task without commenting.
     let comment = comment.map(str::trim).filter(|c| !c.is_empty());
-    // Reject every bad identifier before touching the API, like gh's
-    // `invalid issue format: "abc"` (cli.rs prevalidates too, so this only
-    // matters for callers that skip it).
+    // Reject every bad identifier before touching the API, so a typo in the
+    // middle of a batch cannot half-complete it (cli.rs prevalidates too, so
+    // this only matters for callers that skip it).
     let gids = tasks
         .iter()
         .map(|t| parse_task_id(t))
         .collect::<Result<Vec<_>>>()?;
-    // One task at a time, stopping at the first error, the way `gh issue
-    // edit` walks several issues.
+    // One task at a time, stopping at the first error.
     for gid in &gids {
         let (task, outcome) = with_spinner(ctx, "", update(ctx, gid, comment, action)).await?;
         let label = label(gid, task.name.as_deref());
         match outcome {
             Outcome::Changed(link) => {
-                // gh's `CommentableRun` prints the comment URL first, then
-                // the close/reopen line: data on stdout, status on stderr.
+                // The comment's link first, then the status line: data on
+                // stdout, status on stderr. Flushed here so the two arrive
+                // in this order even under `2>&1 | ...`, where stdout is a
+                // block-buffered pipe and stderr is not.
                 if let Some(url) = link {
                     writeln!(out, "{url}")?;
+                    out.flush()?;
                 }
                 writeln!(err, "{}", done_line(&p, action, &label))?;
             }
@@ -259,8 +261,8 @@ fn comment_link(task_gid: &str, story: &Story) -> String {
         })
 }
 
-/// `1211234567890123 (Fix the login page)`, the way gh writes
-/// `cli/cli#13 (The title of the issue)`; the gid alone for an unnamed task.
+/// `1211234567890123 (Fix the login page)`: the identifier, then the title
+/// in parentheses; the gid alone for an unnamed task.
 fn label(gid: &str, name: Option<&str>) -> String {
     match name.map(str::trim).filter(|n| !n.is_empty()) {
         Some(name) => format!("{gid} ({name})"),
@@ -302,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn status_lines_read_like_gh() {
+    fn status_lines_name_the_verb_the_task_and_the_state() {
         let p = Palette::off();
         let label = "1211234567890123 (Fix the login page)";
         assert_eq!(
@@ -323,8 +325,8 @@ mod tests {
         );
     }
 
-    /// gh's bytes: a red tick for close, a green one for reopen, a yellow
-    /// bang for "already"; the words are never painted.
+    /// A red tick for complete, a green one for reopen, a yellow bang for
+    /// "already"; the words themselves are never painted.
     #[test]
     fn only_the_glyph_is_coloured() {
         let p = Palette::new(true);
@@ -391,9 +393,10 @@ mod tests {
         assert!(r.args.comment.is_none());
     }
 
-    /// The flag table reads like gh's `-c, --comment string`.
+    /// The flag table row is `-c, --comment string`: the placeholder is the
+    /// value's type, never its name.
     #[test]
-    fn comment_placeholder_is_ghs_noun() {
+    fn comment_placeholder_is_a_noun() {
         use clap::CommandFactory;
         for cmd in [Complete::command(), Reopen::command()] {
             let arg = cmd
@@ -411,23 +414,37 @@ mod tests {
         }
     }
 
-    /// The description is hand-wrapped under 80 columns the way gh's are
-    /// (the help renderer never rewraps a line that fits), and it tells the
-    /// reader which stream carries what.
+    /// The description and the examples are hand-wrapped under 80 columns
+    /// (the help renderer rewraps prose but prints examples verbatim, so a
+    /// long one would run off a narrow terminal), no line has a trailing
+    /// space, and the prose says which stream carries what.
     #[test]
-    fn help_prose_is_hand_wrapped_like_ghs() {
+    fn help_prose_and_examples_fit_eighty_columns() {
         use clap::CommandFactory;
         for cmd in [Complete::command(), Reopen::command()] {
             let about = cmd.get_long_about().unwrap().to_string();
+            let examples = cmd.get_after_help().unwrap().to_string();
             for line in about.lines() {
                 assert!(
                     line.chars().count() <= crate::render::text::PROSE_WIDTH,
-                    "wider than gh's prose: {line:?}"
+                    "wider than the prose width: {line:?}"
                 );
                 assert_eq!(line, line.trim_end(), "trailing space: {line:?}");
             }
-            assert!(about.contains("goes to stderr"));
-            assert!(about.contains("goes to stdout"));
+            for line in examples.lines() {
+                // Examples print two columns in, so they get two fewer.
+                assert!(
+                    line.chars().count() + 2 <= crate::render::text::PROSE_WIDTH,
+                    "example runs past the screen: {line:?}"
+                );
+                assert_eq!(line, line.trim_end(), "trailing space: {line:?}");
+                assert!(
+                    line.is_empty() || line.starts_with("# ") || line.starts_with("$ asana task "),
+                    "not a comment or an invocation: {line:?}"
+                );
+            }
+            assert!(about.contains("printed on stdout"), "{about}");
+            assert!(about.contains("go to stderr"), "{about}");
         }
     }
 
@@ -599,7 +616,37 @@ mod tests {
         );
     }
 
-    /// A blank `--comment` completes without commenting, like gh.
+    /// Several tasks in one command: one status line each, in the order
+    /// they were given, whether the task moved or was already there, and
+    /// stdout still carries nothing.
+    #[tokio::test]
+    async fn every_task_gets_its_own_status_line() {
+        const OTHER_DONE: &str = r#"{"data":{"gid":"34","name":"Ship the docs","completed":true}}"#;
+        let (base, seen) = serve(vec![OPEN_TASK, DONE_TASK, OTHER_DONE]);
+        let ctx = ctx_for(&base);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        set_completed(
+            &ctx,
+            &["12".into(), "34".into()],
+            None,
+            &COMPLETE,
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "");
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "✓ Completed task 12 (Fix the login page)\n\
+             ! Task 34 (Ship the docs) is already complete\n"
+        );
+        let seen = seen.join().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[2].starts_with("GET /tasks/34?"), "{}", seen[2]);
+    }
+
+    /// A blank `--comment` completes the task without commenting.
     #[tokio::test]
     async fn blank_comment_posts_no_story() {
         let (base, seen) = serve(vec![OPEN_TASK, DONE_TASK]);
