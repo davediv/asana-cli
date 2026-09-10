@@ -10,6 +10,12 @@
 //!   - Workspaces: 'Personal', 'Acme Corp'
 //! ```
 //!
+//! The `Workspaces:` line is there to choose from, so it is left out when it
+//! would only repeat the active one. `--json [fields]` prints the same facts
+//! as one object (`host`, `login`, `email`, `workspace`, `workspaces`,
+//! `tokenSource`, `token`), the token masked unless `--show-token` is given,
+//! as gh's `--json hosts` does; `--jq` filters it.
+//!
 //! The states gh reports, and what each does here:
 //!
 //! - no token anywhere: gh's one line (`You are not logged into any GitHub
@@ -27,24 +33,37 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 
 use anyhow::Result;
+use serde_json::{json, Value};
 
 use crate::api::{ApiError, User, Workspace};
 use crate::cli::SilentExit;
-use crate::cmd::Prevalidate;
+use crate::cmd::{not_logged_in, Prevalidate};
 use crate::config::{
     self, mask_token, tilde, Config, ConfigError, TokenSource, PAT_URL, WORKSPACE_ENV,
 };
 use crate::ctx::Ctx;
+use crate::render::json::{self, JsonArgs};
 use crate::render::Palette;
 
 const EXIT_ERROR: i32 = 1;
 const EXIT_AUTH: i32 = 4;
 
+/// The keys of the `--json` object, what `--help` lists under JSON FIELDS.
+const JSON_FIELDS: &[&str] = &[
+    "email",
+    "host",
+    "login",
+    "token",
+    "tokenSource",
+    "workspace",
+    "workspaces",
+];
+
 /// gh's description, said of one host and one token; the `about` alone is
 /// what `asana auth --help` lists, short enough to sit after `status:` on
 /// an 80-column screen. Hand-wrapped short of 78 columns like the rest of
-/// the help prose; the trailing newline leaves gh's two blank lines before
-/// USAGE.
+/// the help prose, and ending without a newline so one blank line sits
+/// before USAGE, as on `gh auth status --help`.
 const LONG_ABOUT: &str = "\
 Display the active account and authentication state.
 
@@ -54,13 +73,14 @@ or ~/.config/asana/config.toml) and the active workspace, which every command
 that needs one will use.
 
 If there is no token, or Asana rejects it, the command exits with 4 and
-reports on stderr.
+reports on stderr, with or without `--json`.
 
 To change the active workspace, pass `--workspace`, set `ASANA_WORKSPACE`, or
 put `workspace = \"...\"` in ~/.config/asana/config.toml.
 
 To change the account, see `asana auth login`.
-";
+
+For more information about output formatting, see `asana help formatting`.";
 
 const EXAMPLES: &str = "\
 # Display authentication status for the account and workspace in use
@@ -70,7 +90,16 @@ $ asana auth status
 $ asana auth status --workspace \"Acme Corp\"
 
 # Display the token in plain text
-$ asana auth status --show-token";
+$ asana auth status --show-token
+
+# Format authentication status as JSON
+$ asana auth status --json
+
+# Include the plain text token in the JSON output
+$ asana auth status --json --show-token
+
+# Print the gid of the active workspace
+$ asana auth status --json workspace --jq '.workspace.gid'";
 
 #[derive(clap::Args, Debug)]
 #[command(
@@ -82,17 +111,25 @@ pub struct Args {
     /// Display the auth token
     #[arg(short = 't', long)]
     pub show_token: bool,
+
+    #[command(flatten)]
+    pub json: JsonArgs,
 }
 
 impl Prevalidate for Args {
-    /// No token anywhere is this command's answer, not a failure to set it
-    /// up: gh's one not-logged-in line, exit 4. Anything else (a token, an
+    const JSON_FIELDS: &'static [&'static str] = JSON_FIELDS;
+
+    /// gh checks the flags first (an unknown `--json` field or a lone
+    /// `--jq` is a usage error, exit 1, token or not). Then no token
+    /// anywhere is this command's answer, not a failure to set it up: gh's
+    /// one not-logged-in line, exit 4. Anything else (a token, an
     /// unreadable or malformed config file) is left to `config::load`,
     /// which reports it the way every command does.
     fn prevalidate(&self, _interactive: bool) -> Result<()> {
+        self.json.check(JSON_FIELDS)?;
         match config::load(None) {
             Err(ConfigError::MissingToken(_)) => {
-                eprintln!("{}", not_logged_in(&stderr_palette()));
+                eprintln!("{}", not_logged_in(&early_stderr_palette()));
                 Err(SilentExit(EXIT_AUTH).into())
             }
             _ => Ok(()),
@@ -101,7 +138,7 @@ impl Prevalidate for Args {
 }
 
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
-    let palette = Palette::new(ctx.color);
+    let palette = ctx.palette();
     let host = config::host();
     let token = if args.show_token {
         ctx.config.token.clone()
@@ -114,6 +151,10 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
         Ok(me) => {
             let resolved = ctx.workspace().await.ok();
             let active = Active::classify(&ctx.config, &me, resolved);
+            if args.json.is_json() {
+                let value = status_json(&host, &me, &active, &source.label(), &token);
+                return json::print(&value, &args.json, JSON_FIELDS);
+            }
             let config_path = tilde(&ctx.config.config_path);
             print!(
                 "{}",
@@ -133,14 +174,14 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
             Some(ApiError::Unauthorized { .. }) => {
                 eprint!(
                     "{}",
-                    render_invalid(&stderr_palette(), &host, source, &token)
+                    render_invalid(&ctx.stderr_palette(), &host, source, &token)
                 );
                 Err(SilentExit(EXIT_AUTH).into())
             }
             Some(ApiError::Network(e)) if e.is_timeout() => {
                 eprint!(
                     "{}",
-                    render_timeout(&stderr_palette(), &host, &source.label())
+                    render_timeout(&ctx.stderr_palette(), &host, &source.label())
                 );
                 Err(SilentExit(EXIT_ERROR).into())
             }
@@ -149,25 +190,14 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     }
 }
 
-/// The palette for what this command writes on stderr, from stderr's own
-/// terminal-ness (`main` builds stdout's the same way): `asana auth status
-/// 2>log` keeps the log clean, and `--no-color`, `NO_COLOR` and `TERM=dumb`
-/// switch it off as usual. The flag is read from the command line because
-/// `Prevalidate` runs before `Ctx` exists.
-fn stderr_palette() -> Palette {
+/// The palette for the not-logged-in line, which `Prevalidate` prints
+/// before `Ctx` (and its `stderr_palette`) exists: stderr's own
+/// terminal-ness, and the `--no-color` flag read from the command line the
+/// way `main` reads it for its own stderr palette. Everything `run` writes
+/// on stderr uses `ctx.stderr_palette()` instead.
+fn early_stderr_palette() -> Palette {
     let no_color_flag = std::env::args_os().any(|a| a == "--no-color");
     Palette::for_stream(std::io::stderr().is_terminal(), no_color_flag)
-}
-
-/// gh's `You are not logged into any GitHub hosts. To log in, run: gh auth
-/// login`, said of the host we would have asked, with the command in bold
-/// as gh paints it. The same sentence `auth logout` and `auth token` print.
-fn not_logged_in(palette: &Palette) -> String {
-    format!(
-        "You are not logged in to {}. To log in, run: {}",
-        config::host(),
-        palette.bold("asana auth login")
-    )
 }
 
 /// `'Personal', 'Acme Corp'`, the way gh lists token scopes.
@@ -267,12 +297,49 @@ fn render_ok(
         let _ = writeln!(out, "  - Email: {}", p.bold(email));
     }
     let _ = writeln!(out, "  - Token: {}", p.bold(token));
-    let _ = writeln!(
-        out,
-        "  - Workspaces: {}",
-        p.bold(&quoted_list(me.workspaces.iter().map(Workspace::display)))
-    );
+    // The list is there to choose from (gh's token scopes are the same kind
+    // of line), so it is left out when it would only repeat the active
+    // workspace, or when there is nothing in it and the `!` line already
+    // said so.
+    if lists_workspaces(me, active) {
+        let _ = writeln!(
+            out,
+            "  - Workspaces: {}",
+            p.bold(&quoted_list(me.workspaces.iter().map(Workspace::display)))
+        );
+    }
     out
+}
+
+/// Whether the `Workspaces:` line adds anything: several to choose from, or
+/// one that is not the active one.
+fn lists_workspaces(me: &User, active: &Active) -> bool {
+    match active {
+        Active::Resolved(_) => me.workspaces.len() > 1,
+        _ => !me.workspaces.is_empty(),
+    }
+}
+
+/// The `--json` object: the facts of the `✓` block, keyed the way gh keys
+/// its `hosts` entries (`login`, `tokenSource`), the workspaces as
+/// `{gid, name}` pairs and `workspace` null when none is active. `token` is
+/// whatever the human line would show: masked, or plain with
+/// `--show-token`.
+fn status_json(host: &str, me: &User, active: &Active, source: &str, token: &str) -> Value {
+    let ws = |w: &Workspace| json!({ "gid": w.gid, "name": w.name });
+    let workspace = match active {
+        Active::Resolved(w) => ws(w),
+        _ => Value::Null,
+    };
+    json!({
+        "host": host,
+        "login": me.display(),
+        "email": me.email,
+        "workspace": workspace,
+        "workspaces": me.workspaces.iter().map(ws).collect::<Vec<_>>(),
+        "tokenSource": source,
+        "token": token,
+    })
 }
 
 /// gh's block for a rejected token (`X Failed to log in to github.com
@@ -461,7 +528,8 @@ mod tests {
         assert!(out.contains(
             "  ! Active workspace: none (this token does not belong to any workspace)\n"
         ));
-        assert!(out.ends_with("  - Workspaces: none\n"));
+        // The `!` line said there are none; no `Workspaces: none` after it.
+        assert!(out.ends_with("  - Token: t\n"), "{out}");
 
         let resolved = Active::classify(&config(None), &user, Some(ws("10", "Personal")));
         assert!(matches!(resolved, Active::Resolved(w) if w.gid == "10"));
@@ -526,6 +594,166 @@ mod tests {
         assert_eq!(quoted_list([]), "none");
     }
 
+    /// The `Workspaces:` line is a list to choose from: it goes when it
+    /// would only repeat `Active workspace`, and stays whenever there is a
+    /// choice, or one workspace that is not the active one.
+    #[test]
+    fn workspaces_line_is_left_out_when_it_repeats_the_active_one() {
+        let p = Palette::off();
+        let one = User {
+            workspaces: vec![ws("10", "Personal")],
+            ..me()
+        };
+        let active = Active::Resolved(ws("10", "Personal"));
+        let out = render_ok(
+            &p,
+            "app.asana.com",
+            &one,
+            &active,
+            "ASANA_TOKEN",
+            "t",
+            "~/c.toml",
+        );
+        assert_eq!(
+            out,
+            "app.asana.com\n\
+             \x20 ✓ Logged in to app.asana.com account Dave Div (ASANA_TOKEN)\n\
+             \x20 - Active workspace: Personal\n\
+             \x20 - Email: dave@example.com\n\
+             \x20 - Token: t\n"
+        );
+        assert!(!lists_workspaces(&one, &active));
+        // Two to choose from: listed.
+        assert!(lists_workspaces(&me(), &active));
+        // One, but not the active one: listed, so the `!` line's advice
+        // has something to point at.
+        let unknown = Active::Unknown {
+            value: "Nope".to_string(),
+            source: "ASANA_WORKSPACE".to_string(),
+        };
+        assert!(lists_workspaces(&one, &unknown));
+        let out = render_ok(
+            &p,
+            "app.asana.com",
+            &one,
+            &unknown,
+            "ASANA_TOKEN",
+            "t",
+            "~/c.toml",
+        );
+        assert!(out.ends_with("  - Workspaces: 'Personal'\n"), "{out}");
+        // Nothing at all: the `!` line already says so.
+        let lonely = User {
+            workspaces: Vec::new(),
+            ..me()
+        };
+        assert!(!lists_workspaces(&lonely, &Active::None));
+    }
+
+    /// `--json`: one object with the facts of the `✓` block, gh's key
+    /// style, the token exactly as the human line would show it.
+    #[test]
+    fn json_object_carries_the_status_facts() {
+        let user = me();
+        let active = Active::Resolved(ws("10", "Personal"));
+        let value = status_json("app.asana.com", &user, &active, "ASANA_TOKEN", "2/12****");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "host": "app.asana.com",
+                "login": "Dave Div",
+                "email": "dave@example.com",
+                "workspace": { "gid": "10", "name": "Personal" },
+                "workspaces": [
+                    { "gid": "10", "name": "Personal" },
+                    { "gid": "20", "name": "Acme Corp" }
+                ],
+                "tokenSource": "ASANA_TOKEN",
+                "token": "2/12****"
+            })
+        );
+        // Every key is advertised, and nothing else is.
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut advertised = JSON_FIELDS.to_vec();
+        advertised.sort_unstable();
+        assert_eq!(keys, advertised);
+        // No active workspace is null, never a missing key.
+        let value = status_json(
+            "app.asana.com",
+            &user,
+            &Active::Several(2),
+            "ASANA_TOKEN",
+            "t",
+        );
+        assert_eq!(value["workspace"], serde_json::Value::Null);
+        assert_eq!(value["workspaces"].as_array().map(Vec::len), Some(2));
+        // A user without an email or a name still serialises.
+        let bare = User {
+            gid: "7".to_string(),
+            name: None,
+            email: None,
+            workspaces: Vec::new(),
+        };
+        let value = status_json("app.asana.com", &bare, &Active::None, "~/c.toml", "t");
+        assert_eq!(value["login"], "7");
+        assert_eq!(value["email"], serde_json::Value::Null);
+        assert_eq!(value["tokenSource"], "~/c.toml");
+    }
+
+    /// The whole flag surface parses, and `--json` takes its field list
+    /// the way gh's does: the next word, never a following flag.
+    #[test]
+    fn json_flags_parse_and_are_checked_before_the_token() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: Args,
+        }
+        let parse = |argv: &[&str]| {
+            Cli::try_parse_from(std::iter::once("asana").chain(argv.iter().copied()))
+                .map(|c| c.args)
+        };
+        let plain = parse(&[]).unwrap();
+        assert!(!plain.json.is_json() && !plain.show_token);
+        let all = parse(&["--json", "--show-token"]).unwrap();
+        assert!(all.json.is_json() && all.show_token);
+        assert!(all.json.fields().is_empty());
+        let some = parse(&["--json", "workspace,login", "-q", ".workspace.gid"]).unwrap();
+        assert_eq!(some.json.fields(), vec!["workspace", "login"]);
+        assert_eq!(some.json.jq.as_deref(), Some(".workspace.gid"));
+        assert!(some.json.check(JSON_FIELDS).is_ok());
+        // gh's checks, from the shared helper, run before the token is read.
+        let bad = parse(&["--json", "scopes"]).unwrap();
+        let err = bad.json.check(JSON_FIELDS).unwrap_err().to_string();
+        assert!(
+            err.starts_with("Unknown JSON field: \"scopes\"\nAvailable fields:\n  email\n"),
+            "{err}"
+        );
+        let lone = parse(&["--jq", ".login"]).unwrap();
+        assert_eq!(
+            lone.json.check(JSON_FIELDS).unwrap_err().to_string(),
+            "cannot use `--jq` without specifying `--json`"
+        );
+        // A dotted field is judged by its first segment.
+        assert!(parse(&["--json", "workspace.gid"])
+            .unwrap()
+            .json
+            .check(JSON_FIELDS)
+            .is_ok());
+        // The help lists them sorted, on one line.
+        assert_eq!(
+            json::format_fields(JSON_FIELDS, "  ", 80),
+            "  email, host, login, token, tokenSource, workspace, workspaces\n"
+        );
+    }
+
     /// The help prose is hand-wrapped short of 78 columns (the help piece's
     /// rule, so it reads the same on an 80-column terminal), and the
     /// one-line `about` fits after `status:` on `asana auth --help`.
@@ -534,7 +762,7 @@ mod tests {
         for line in LONG_ABOUT.lines().chain(EXAMPLES.lines()) {
             assert!(line.chars().count() <= 78, "too long: {line}");
         }
-        assert!(LONG_ABOUT.ends_with(".\n"));
+        assert!(LONG_ABOUT.ends_with('.'), "one blank line before USAGE");
         let about = "Display the active account and authentication state";
         assert!(LONG_ABOUT.starts_with(about));
         assert!(format!("  status:        {about}").chars().count() <= 78);
