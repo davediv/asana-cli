@@ -7,11 +7,13 @@
 //! and still exits 0. stdout stays empty unless `--comment` created a story,
 //! whose permalink is printed alone so it pipes.
 
-use anyhow::{bail, Result};
+use std::io::IsTerminal;
+
+use anyhow::Result;
 use serde_json::json;
 
 use crate::api::{Story, Task};
-use crate::cmd::{finish, spinner};
+use crate::cmd::{comment_url, with_spinner};
 use crate::ctx::Ctx;
 use crate::render::Palette;
 use crate::resolve::parse_task_id;
@@ -44,7 +46,7 @@ pub struct CompleteArgs {
     pub tasks: Vec<String>,
 
     /// Leave a closing comment
-    #[arg(short = 'c', long, value_name = "text")]
+    #[arg(short = 'c', long, value_name = "string")]
     pub comment: Option<String>,
 }
 
@@ -70,40 +72,51 @@ pub struct ReopenArgs {
     pub tasks: Vec<String>,
 
     /// Add a reopening comment
-    #[arg(short = 'c', long, value_name = "text")]
+    #[arg(short = 'c', long, value_name = "string")]
     pub comment: Option<String>,
 }
 
-/// Nothing to check before the token is read; see `cmd::Prevalidate`.
+/// Nothing to check before the token is read (`cli.rs` already rejects bad
+/// identifiers for every task command); see `cmd::Prevalidate`.
 impl crate::cmd::Prevalidate for CompleteArgs {}
 
 /// Nothing to check before the token is read; see `cmd::Prevalidate`.
 impl crate::cmd::Prevalidate for ReopenArgs {}
 
 pub async fn run(ctx: &Ctx, args: CompleteArgs) -> Result<()> {
-    set_completed(ctx, &args.tasks, args.comment.as_deref(), true).await
+    set_completed(ctx, &args.tasks, args.comment.as_deref(), &COMPLETE).await
 }
 
 pub async fn run_reopen(ctx: &Ctx, args: ReopenArgs) -> Result<()> {
-    set_completed(ctx, &args.tasks, args.comment.as_deref(), false).await
+    set_completed(ctx, &args.tasks, args.comment.as_deref(), &REOPEN).await
 }
 
-/// The words that change between `complete` and `reopen`.
-struct Wording {
+/// What changes between `complete` and `reopen`: the state written, the
+/// words on the status lines, and the colour of the tick.
+struct Action {
+    /// The `completed` value sent to the API.
+    completed: bool,
     /// `Completed` / `Reopened`, for the success line.
     verb: &'static str,
     /// `complete` / `open`, for the already-in-that-state line.
     state: &'static str,
+    /// gh paints the tick red when it closes something and green when it
+    /// reopens it (`SuccessIconWithColor(cs.Red)` in `issue close`).
+    tick: fn(&Palette) -> String,
 }
 
-const COMPLETE: Wording = Wording {
+const COMPLETE: Action = Action {
+    completed: true,
     verb: "Completed",
     state: "complete",
+    tick: Palette::success_icon_red,
 };
 
-const REOPEN: Wording = Wording {
+const REOPEN: Action = Action {
+    completed: false,
     verb: "Reopened",
     state: "open",
+    tick: Palette::success_icon,
 };
 
 /// What happened to one task.
@@ -118,13 +131,11 @@ async fn set_completed(
     ctx: &Ctx,
     tasks: &[String],
     comment: Option<&str>,
-    completed: bool,
+    action: &Action,
 ) -> Result<()> {
-    let p = Palette::new(ctx.color);
-    let words = if completed { COMPLETE } else { REOPEN };
-    if comment.is_some_and(|c| c.trim().is_empty()) {
-        bail!("comment cannot be blank");
-    }
+    let p = stderr_palette();
+    // gh's `issue close --comment ""` closes without commenting; so do we.
+    let comment = comment.map(str::trim).filter(|c| !c.is_empty());
     // Reject every bad identifier before touching the API, like gh's
     // `invalid issue format: "abc"` (cli.rs prevalidates too, so this only
     // matters for callers that skip it).
@@ -135,19 +146,16 @@ async fn set_completed(
     // One task at a time, stopping at the first error, the way `gh issue
     // edit` walks several issues.
     for gid in &gids {
-        let sp = spinner(ctx);
-        let result = update(ctx, gid, comment, completed).await;
-        finish(sp);
-        let (task, outcome) = result?;
+        let (task, outcome) = with_spinner(ctx, "", update(ctx, gid, comment, action)).await?;
         let label = label(gid, task.name.as_deref());
         match outcome {
             Outcome::Changed(comment_url) => {
                 if let Some(url) = comment_url {
                     println!("{url}");
                 }
-                eprintln!("{}", done_line(&p, words.verb, &label));
+                eprintln!("{}", done_line(&p, action, &label));
             }
-            Outcome::Already => eprintln!("{}", already_line(&p, words.state, &label)),
+            Outcome::Already => eprintln!("{}", already_line(&p, action, &label)),
         }
     }
     Ok(())
@@ -159,13 +167,13 @@ async fn update(
     ctx: &Ctx,
     gid: &str,
     comment: Option<&str>,
-    completed: bool,
+    action: &Action,
 ) -> Result<(Task, Outcome)> {
     let task: Task = ctx
         .api
         .get(&format!("/tasks/{gid}"), &[("opt_fields", FIELDS)])
         .await?;
-    if task.is_completed() == completed {
+    if task.is_completed() == action.completed {
         return Ok((task, Outcome::Already));
     }
     let comment_url = match comment {
@@ -174,15 +182,29 @@ async fn update(
                 .api
                 .post(&format!("/tasks/{gid}/stories"), json!({ "text": text }))
                 .await?;
-            Some(comment_url(&task_url(&task), &story.gid))
+            Some(comment_url(&task, &story.gid))
         }
         None => None,
     };
     let _updated: Task = ctx
         .api
-        .put(&format!("/tasks/{gid}"), json!({ "completed": completed }))
+        .put(
+            &format!("/tasks/{gid}"),
+            json!({ "completed": action.completed }),
+        )
         .await?;
     Ok((task, Outcome::Changed(comment_url)))
+}
+
+/// The palette for the status lines, which go to stderr: coloured by
+/// stderr's own terminal-ness, never stdout's, so `asana task complete 1
+/// 2>log` keeps the log clean and `asana task complete 1 | cat` keeps its
+/// colour (`NO_COLOR` and `TERM=dumb` are honoured by `for_stream`). `Ctx`
+/// carries only stdout's decision, so `--no-color` is read from the command
+/// line again, the way `main` reads it.
+fn stderr_palette() -> Palette {
+    let no_color = std::env::args_os().any(|a| a == "--no-color");
+    Palette::for_stream(std::io::stderr().is_terminal(), no_color)
 }
 
 /// `1211234567890123 (Fix the login page)`, the way gh writes
@@ -195,29 +217,17 @@ fn label(gid: &str, name: Option<&str>) -> String {
 }
 
 /// `✓ Completed task 1211234567890123 (Fix the login page)`.
-fn done_line(p: &Palette, verb: &str, label: &str) -> String {
-    format!("{} {verb} task {label}", p.success_icon())
+fn done_line(p: &Palette, action: &Action, label: &str) -> String {
+    format!("{} {} task {label}", (action.tick)(p), action.verb)
 }
 
 /// `! Task 1211234567890123 (Fix the login page) is already complete`.
-fn already_line(p: &Palette, state: &str, label: &str) -> String {
-    format!("{} Task {label} is already {state}", p.warning_icon())
-}
-
-/// The task's permalink, or a URL Asana redirects to the task when the API
-/// did not send one.
-fn task_url(task: &Task) -> String {
-    task.permalink_url
-        .clone()
-        .unwrap_or_else(|| format!("https://app.asana.com/0/0/{}/f", task.gid))
-}
-
-/// `https://app.asana.com/0/<project>/<task>/<story>/f`: the task permalink
-/// with the story gid appended, the way Asana links to a comment. (Copied
-/// from `task_comment` so this piece does not depend on that one's API.)
-fn comment_url(task_url: &str, story_gid: &str) -> String {
-    let base = task_url.trim_end_matches('/').trim_end_matches("/f");
-    format!("{base}/{story_gid}/f")
+fn already_line(p: &Palette, action: &Action, label: &str) -> String {
+    format!(
+        "{} Task {label} is already {}",
+        p.warning_icon(),
+        action.state
+    )
 }
 
 #[cfg(test)]
@@ -244,53 +254,40 @@ mod tests {
         let p = Palette::off();
         let label = "1211234567890123 (Fix the login page)";
         assert_eq!(
-            done_line(&p, COMPLETE.verb, label),
+            done_line(&p, &COMPLETE, label),
             "✓ Completed task 1211234567890123 (Fix the login page)"
         );
         assert_eq!(
-            done_line(&p, REOPEN.verb, label),
+            done_line(&p, &REOPEN, label),
             "✓ Reopened task 1211234567890123 (Fix the login page)"
         );
         assert_eq!(
-            already_line(&p, COMPLETE.state, label),
+            already_line(&p, &COMPLETE, label),
             "! Task 1211234567890123 (Fix the login page) is already complete"
         );
         assert_eq!(
-            already_line(&p, REOPEN.state, label),
+            already_line(&p, &REOPEN, label),
             "! Task 1211234567890123 (Fix the login page) is already open"
         );
     }
 
+    /// gh's bytes: a red tick for close, a green one for reopen, a yellow
+    /// bang for "already"; the words are never painted.
     #[test]
     fn only_the_glyph_is_coloured() {
         let p = Palette::new(true);
-        let line = done_line(&p, COMPLETE.verb, "1 (x)");
-        assert!(
-            line.starts_with("\x1b[0;32m✓\x1b[0m Completed task 1 (x)"),
-            "{line:?}"
-        );
-        let line = already_line(&p, COMPLETE.state, "1 (x)");
-        assert!(
-            line.starts_with("\x1b[0;33m!\x1b[0m Task 1 (x) is already complete"),
-            "{line:?}"
-        );
-    }
-
-    #[test]
-    fn builds_comment_urls() {
         assert_eq!(
-            comment_url("https://app.asana.com/0/12/34", "56"),
-            "https://app.asana.com/0/12/34/56/f"
+            done_line(&p, &COMPLETE, "1 (x)"),
+            "\x1b[0;31m✓\x1b[0m Completed task 1 (x)"
         );
         assert_eq!(
-            comment_url("https://app.asana.com/0/12/34/f", "56"),
-            "https://app.asana.com/0/12/34/56/f"
+            done_line(&p, &REOPEN, "1 (x)"),
+            "\x1b[0;32m✓\x1b[0m Reopened task 1 (x)"
         );
-        let task = Task {
-            gid: "34".into(),
-            ..Task::default()
-        };
-        assert_eq!(task_url(&task), "https://app.asana.com/0/0/34/f");
+        assert_eq!(
+            already_line(&p, &COMPLETE, "1 (x)"),
+            "\x1b[0;33m!\x1b[0m Task 1 (x) is already complete"
+        );
     }
 
     #[derive(Parser)]
@@ -316,5 +313,25 @@ mod tests {
         let r = Reopen::try_parse_from(["x", "https://app.asana.com/0/1/2"]).unwrap();
         assert_eq!(r.args.tasks, vec!["https://app.asana.com/0/1/2"]);
         assert!(r.args.comment.is_none());
+    }
+
+    /// The flag table reads like gh's `-c, --comment string`.
+    #[test]
+    fn comment_placeholder_is_ghs_noun() {
+        use clap::CommandFactory;
+        for cmd in [Complete::command(), Reopen::command()] {
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_id() == "comment")
+                .unwrap();
+            assert_eq!(arg.get_short(), Some('c'));
+            let names: Vec<_> = arg
+                .get_value_names()
+                .unwrap_or_default()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert_eq!(names, ["string"]);
+        }
     }
 }
