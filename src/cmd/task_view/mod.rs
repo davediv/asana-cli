@@ -1,45 +1,44 @@
 //! `asana task view`: title, metadata, notes and comments of one task,
 //! laid out like `gh issue view`.
 //!
-//! On a terminal: bold title and muted identifier, a state line
+//! On a terminal: bold title and `<workspace>#<gid>`, a state line
 //! (`Open • who created when • N comments`), `Key: value` metadata, the
 //! notes wrapped with a two-space margin, then either the newest comment
 //! (with a `Not showing N comments` rule) or, with `--comments`, all of
 //! them, and a muted footer with the permalink. Piped: `key:\tvalue` lines,
-//! `--`, the raw notes.
-
-mod notes;
+//! `--`, the raw notes; piped with `--comments`, each comment as its own
+//! `key:\tvalue` record, as `gh issue view --comments | cat` prints them.
 
 use std::io::Write;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::api::{Story, Task, STORY_FIELDS, SUBTASK_FIELDS, TASK_VIEW_FIELDS};
-use crate::cmd::{finish, open_in_browser, print_json, spinner};
+use crate::cmd::{comment_url, finish, open_in_browser, print_json, spinner, task_url};
 use crate::ctx::Ctx;
+use crate::render::notes::render_body;
 use crate::render::time::{due_phrase, fuzzy_ago, fuzzy_ago_abbr, iso, now, today, DueState};
 use crate::render::Palette;
 use crate::resolve::parse_task_id;
-
-use self::notes::render_body;
-
-/// The shared `STORY_FIELDS` plus `is_edited`, for the ` • Edited` marker.
-fn story_fields() -> String {
-    format!("{STORY_FIELDS},is_edited")
-}
 
 #[derive(clap::Args, Debug)]
 #[command(
     about = "View a task",
     long_about = "Display the title, notes, and other information about a task.\n\n\
         With `--web` flag, open the task in a web browser instead.\n\n\
-        With `--comments` flag, show every comment on the task instead of only the newest one.",
-    after_help = "$ asana task view 1211234567890123\n\
-        $ asana task view https://app.asana.com/0/1200000000000000/1211234567890123 --comments\n\
-        $ asana task view 1211234567890123 --json"
+        With `--comments` flag, show every comment on the task, not only the newest.\n\n\
+        For more information about output formatting flags, see `asana help formatting`.",
+    after_help = "# View a task by gid or by URL\n\
+        $ asana task view 1211234567890123\n\
+        $ asana task view https://app.asana.com/0/1200000000000000/1211234567890123\n\
+        \n\
+        # Show the whole conversation\n\
+        $ asana task view 1211234567890123 --comments\n\
+        \n\
+        # Open the task in the browser\n\
+        $ asana task view 1211234567890123 --web"
 )]
 pub struct Args {
     /// Task gid or URL
@@ -57,24 +56,6 @@ pub struct Args {
     /// Open a task in the browser
     #[arg(short = 'w', long)]
     pub web: bool,
-}
-
-/// A comment story plus the `is_edited` flag the shared `Story` lacks.
-#[derive(Debug, Clone, Deserialize)]
-struct Comment {
-    #[serde(flatten)]
-    story: Story,
-    is_edited: Option<bool>,
-}
-
-impl Comment {
-    fn author(&self) -> &str {
-        self.story
-            .created_by
-            .as_ref()
-            .map(|a| a.display())
-            .unwrap_or("someone")
-    }
 }
 
 /// `writeln!` to stdout, ignoring errors so a closed pipe (`| head`) ends
@@ -96,31 +77,46 @@ fn plural(n: usize, word: &str) -> String {
     }
 }
 
-fn task_url(task: &Task) -> String {
-    task.permalink_url
-        .clone()
-        .unwrap_or_else(|| format!("https://app.asana.com/0/0/{}/f", task.gid))
+/// Who posted a comment, or `someone` when Asana sent no author.
+fn author_of(story: &Story) -> &str {
+    story
+        .created_by
+        .as_ref()
+        .map(|a| a.display())
+        .unwrap_or("someone")
 }
 
-/// The permalink of one comment: the task's `/0/<project>/<task>` link with
-/// the story appended, else the project-less form.
-fn comment_url(task: &Task, story_gid: &str) -> String {
-    let base = task_url(task);
-    let trimmed = base.trim_end_matches("/f").trim_end_matches('/');
-    let legacy = trimmed
-        .strip_prefix("https://app.asana.com/0/")
-        .is_some_and(|rest| {
-            let mut parts = rest.split('/');
-            let is_num = |s: Option<&str>| {
-                s.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            };
-            is_num(parts.next()) && is_num(parts.next()) && parts.next().is_none()
-        });
-    if legacy {
-        format!("{trimmed}/{story_gid}/f")
-    } else {
-        format!("https://app.asana.com/0/0/{}/{story_gid}/f", task.gid)
-    }
+/// The comments among a task's stories, oldest first (so the last one is
+/// the newest), each kept with the JSON it came from for `--json`.
+fn comments_of(stories: Vec<Value>) -> (Vec<Story>, Vec<Value>) {
+    let mut pairs: Vec<(Story, Value)> = stories
+        .into_iter()
+        .filter_map(|raw| {
+            let story = serde_json::from_value::<Story>(raw.clone()).ok()?;
+            story.is_comment().then_some((story, raw))
+        })
+        .collect();
+    pairs.sort_by_key(|(story, _)| story.created_at);
+    pairs.into_iter().unzip()
+}
+
+/// Notes or a comment laid out as gh lays an issue body out: the shared
+/// `render_body` (wrapped to `width - 4`, a two-space margin, every text
+/// line padded to `width - 2`), plus glamour's padding of the blank lines
+/// inside the body to that same width, so only the margin lines around the
+/// body are truly empty. Empty when there is nothing to show.
+fn body_lines(html: Option<&str>, text: Option<&str>, width: usize, ink: &Palette) -> Vec<String> {
+    let pad_to = width.saturating_sub(4).max(20) + 2;
+    render_body(html, text, width, ink)
+        .into_iter()
+        .map(|line| {
+            if line.is_empty() {
+                " ".repeat(pad_to)
+            } else {
+                line
+            }
+        })
+        .collect()
 }
 
 /// Nothing to check before the token is read; see `cmd::Prevalidate`.
@@ -132,7 +128,6 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let need_stories = !args.web && (!args.json || args.comments);
     let task_path = format!("/tasks/{gid}");
     let stories_path = format!("/tasks/{gid}/stories");
-    let story_fields = story_fields();
     let task_req = ctx
         .api
         .get::<Value>(&task_path, &[("opt_fields", TASK_VIEW_FIELDS)]);
@@ -141,7 +136,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
             return Ok(Vec::new());
         }
         ctx.api
-            .get_all::<Value>(&stories_path, &[("opt_fields", &story_fields)], None)
+            .get_all::<Value>(&stories_path, &[("opt_fields", STORY_FIELDS)], None)
             .await
     };
     let (raw, stories) = tokio::join!(task_req, stories_req);
@@ -170,16 +165,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
             return Err(e.into());
         }
     };
-    // Comments only (no system stories), oldest first so the last is newest.
-    let mut pairs: Vec<(Comment, Value)> = stories
-        .into_iter()
-        .filter_map(|story| {
-            let c = serde_json::from_value::<Comment>(story.clone()).ok()?;
-            c.story.is_comment().then_some((c, story))
-        })
-        .collect();
-    pairs.sort_by_key(|(c, _)| c.story.created_at);
-    let (comments, comments_raw): (Vec<Comment>, Vec<Value>) = pairs.into_iter().unzip();
+    let (comments, comments_raw) = comments_of(stories);
     let subtasks: Vec<Task> = if task.num_subtasks.unwrap_or(0) > 0 && !args.json {
         ctx.api
             .get_all(
@@ -214,15 +200,17 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     };
     if ctx.is_tty {
         view.print_human(ctx, args.comments);
+    } else if args.comments {
+        view.print_raw_comments();
     } else {
-        view.print_raw(args.comments);
+        view.print_raw();
     }
     Ok(())
 }
 
 struct View<'a> {
     task: &'a Task,
-    comments: &'a [Comment],
+    comments: &'a [Story],
     subtasks: &'a [Task],
     url: String,
     now: DateTime<Utc>,
@@ -266,9 +254,8 @@ impl View<'_> {
         self.subtasks.iter().filter(|s| s.is_completed()).count()
     }
 
-    /// `key:\tvalue` lines, `--`, the raw notes (and, with `--comments`,
-    /// each comment as its own `--`-delimited record), like gh when piped.
-    fn print_raw(&self, with_comments: bool) {
+    /// `key:\tvalue` lines, `--`, the raw notes, like gh when piped.
+    fn print_raw(&self) {
         let mut out = std::io::stdout().lock();
         let task = self.task;
         let state = if task.is_completed() {
@@ -293,17 +280,12 @@ impl View<'_> {
             "parent:\t{}",
             task.parent.as_ref().map(|p| p.display()).unwrap_or("")
         );
-        let n_sub = task.num_subtasks.unwrap_or(0);
+        let (n_sub, done) = match task.num_subtasks {
+            Some(n) => (n.to_string(), self.subtasks_done().to_string()),
+            None => (String::new(), String::new()),
+        };
         w!(out, "subtasks:\t{n_sub}");
-        w!(
-            out,
-            "subtasks-completed:\t{}",
-            if n_sub > 0 {
-                self.subtasks_done().to_string()
-            } else {
-                String::new()
-            }
-        );
+        w!(out, "subtasks-completed:\t{done}");
         w!(out, "likes:\t{}", task.num_likes.unwrap_or(0));
         w!(
             out,
@@ -318,21 +300,26 @@ impl View<'_> {
         w!(out, "gid:\t{}", task.gid);
         w!(out, "url:\t{}", self.url);
         w!(out, "--");
-        w!(out, "{}", task.notes.as_deref().unwrap_or("").trim_end());
-        if with_comments {
+        // The notes as written, with their own line ending, as gh prints
+        // the body (`fmt.Fprintln(out, issue.Body)`).
+        w!(out, "{}", task.notes.as_deref().unwrap_or(""));
+    }
+
+    /// `--comments` when piped: only the comments, each as `key:\tvalue`
+    /// lines, `--`, its text, `--`, the shape of gh's raw comment list.
+    fn print_raw_comments(&self) {
+        let mut out = std::io::stdout().lock();
+        for c in self.comments {
+            w!(out, "author:\t{}", author_of(c));
+            w!(
+                out,
+                "created:\t{}",
+                c.created_at.map(iso).unwrap_or_default()
+            );
+            w!(out, "edited:\t{}", c.is_edited.unwrap_or(false));
             w!(out, "--");
-            for c in self.comments {
-                w!(out, "author:\t{}", c.author());
-                w!(
-                    out,
-                    "created:\t{}",
-                    c.story.created_at.map(iso).unwrap_or_default()
-                );
-                w!(out, "edited:\t{}", c.is_edited.unwrap_or(false));
-                w!(out, "--");
-                w!(out, "{}", c.story.text.as_deref().unwrap_or("").trim_end());
-                w!(out, "--");
-            }
+            w!(out, "{}", c.text.as_deref().unwrap_or(""));
+            w!(out, "--");
         }
     }
 
@@ -342,19 +329,15 @@ impl View<'_> {
         let task = self.task;
         let width = ctx.width;
 
-        // Header: bold title, muted `<workspace>#<gid>`.
+        // Header: bold title, then `<workspace>#<gid>` in plain text, the
+        // way gh 2.97 prints `cli/cli#13111` after the title.
         let ws_name = task
             .workspace
             .as_ref()
             .and_then(|w| w.name.clone())
             .or_else(|| ctx.config.workspace.as_ref().map(|w| w.value.clone()))
             .unwrap_or_else(|| "asana".to_string());
-        w!(
-            out,
-            "{} {}",
-            ink.bold(task.display()),
-            ink.muted(&format!("{ws_name}#{}", task.gid))
-        );
+        w!(out, "{} {ws_name}#{}", ink.bold(task.display()), task.gid);
 
         // State line.
         let state = if task.is_completed() {
@@ -446,7 +429,7 @@ impl View<'_> {
         // Body: blank, blank, notes, blank, blank.
         w!(out);
         w!(out);
-        let body = render_body(
+        let body = body_lines(
             task.html_notes.as_deref(),
             task.notes.as_deref(),
             width,
@@ -462,10 +445,14 @@ impl View<'_> {
         w!(out);
         w!(out);
 
-        // Comments: the newest one (preview) or all of them.
+        // Comments: the newest one (preview) or all of them, in the shape of
+        // gh's comment list: a rule for the hidden ones, then per comment
+        // the header, a blank, the body, a blank, its link (never in the
+        // preview) and a blank, one more blank after the last, and the
+        // `Use --comments` hint when the preview hides any.
         if !self.comments.is_empty() {
             let preview = !with_comments;
-            let shown: &[Comment] = if preview {
+            let shown: &[Story] = if preview {
                 &self.comments[self.comments.len() - 1..]
             } else {
                 self.comments
@@ -485,9 +472,8 @@ impl View<'_> {
             }
             for (i, c) in shown.iter().enumerate() {
                 let newest = i + 1 == shown.len();
-                let mut header = ink.bold(c.author());
+                let mut header = ink.bold(author_of(c));
                 let when = c
-                    .story
                     .created_at
                     .map(|t| fuzzy_ago_abbr(self.now, t))
                     .unwrap_or_default();
@@ -497,7 +483,7 @@ impl View<'_> {
                 if c.is_edited.unwrap_or(false) {
                     header.push_str(&ink.bold(" • Edited"));
                 }
-                if c.story.is_pinned.unwrap_or(false) {
+                if c.is_pinned.unwrap_or(false) {
                     header.push_str(&ink.bold(" • Pinned"));
                 }
                 if newest {
@@ -505,16 +491,11 @@ impl View<'_> {
                     header.push_str(&ink.bold_cyan("Newest comment"));
                 }
                 w!(out, "{header}");
-                if let Some(n) = c.story.num_likes.filter(|n| *n > 0) {
+                if let Some(n) = c.num_likes.filter(|n| *n > 0) {
                     w!(out, "{n} 👍");
                 }
                 w!(out);
-                let body = render_body(
-                    c.story.html_text.as_deref(),
-                    c.story.text.as_deref(),
-                    width,
-                    &ink,
-                );
+                let body = body_lines(c.html_text.as_deref(), c.text.as_deref(), width, &ink);
                 if body.is_empty() {
                     w!(out, "  {}", ink.muted("No body provided"));
                 } else {
@@ -524,38 +505,34 @@ impl View<'_> {
                 }
                 w!(out);
                 if !preview {
-                    w!(
+                    // gh mutes the line and its two newlines in one run.
+                    let _ = write!(
                         out,
                         "{}",
                         ink.muted(&format!(
-                            "View this comment in Asana: {}",
-                            comment_url(task, &c.story.gid)
+                            "View this comment in Asana: {}\n\n",
+                            comment_url(task, &c.gid)
                         ))
                     );
                 }
-                if !newest {
+                if newest {
                     w!(out);
                 }
             }
-            w!(out);
-            if preview {
-                if hidden > 0 {
-                    w!(
-                        out,
-                        "{}",
-                        ink.muted("Use --comments to view the full conversation")
-                    );
-                }
-            } else {
-                w!(out);
+            if preview && hidden > 0 {
+                w!(
+                    out,
+                    "{}",
+                    ink.muted("Use --comments to view the full conversation")
+                );
             }
         }
 
-        // Footer.
-        w!(
+        // Footer, muted through its newline like gh's.
+        let _ = write!(
             out,
             "{}",
-            ink.muted(&format!("View this task in Asana: {}", self.url))
+            ink.muted(&format!("View this task in Asana: {}\n", self.url))
         );
     }
 }
@@ -563,60 +540,66 @@ impl View<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
-    fn task_with_url(url: Option<&str>) -> Task {
-        Task {
-            gid: "1211234567890123".to_string(),
-            permalink_url: url.map(str::to_string),
-            ..Task::default()
+    #[test]
+    fn comments_are_the_comment_stories_oldest_first() {
+        let stories = vec![
+            serde_json::json!({
+                "gid": "3", "type": "comment", "text": "third", "is_edited": true,
+                "created_at": "2026-09-03T00:00:00.000Z",
+                "created_by": {"gid": "2", "name": "Dave"}
+            }),
+            serde_json::json!({
+                "gid": "9", "type": "system", "text": "added to project",
+                "created_at": "2026-09-02T00:00:00.000Z"
+            }),
+            serde_json::json!({
+                "gid": "1", "type": "comment", "text": "first",
+                "created_at": "2026-09-01T00:00:00.000Z"
+            }),
+        ];
+        let (comments, raw) = comments_of(stories);
+        let gids: Vec<&str> = comments.iter().map(|c| c.gid.as_str()).collect();
+        assert_eq!(gids, ["1", "3"]);
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw[1]["gid"], "3");
+        assert_eq!(comments[1].is_edited, Some(true));
+        assert_eq!(author_of(&comments[1]), "Dave");
+        assert_eq!(author_of(&comments[0]), "someone");
+    }
+
+    #[test]
+    fn body_pads_blank_lines_inside_like_glamour() {
+        let ink = Palette::new(false);
+        let text = "Describe the bug\n\nIt breaks.\n";
+        let lines = body_lines(None, Some(text), 120, &ink);
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert_eq!(UnicodeWidthStr::width(line.as_str()), 118, "{line:?}");
         }
+        assert_eq!(lines[0].trim_end(), "  Describe the bug");
+        assert_eq!(lines[1].trim(), "");
+        assert_eq!(lines[2].trim_end(), "  It breaks.");
+        assert!(body_lines(Some("<body></body>"), Some("  "), 120, &ink).is_empty());
     }
 
     #[test]
-    fn comment_urls_follow_the_task_permalink() {
-        let t = task_with_url(Some(
-            "https://app.asana.com/0/1200000000000003/1211234567890123",
-        ));
+    fn body_keeps_link_urls_and_numbered_steps() {
+        let ink = Palette::new(false);
+        let html = "<body>Steps:\n1. Run <code>asana auth login</code>\n2. See <a href=\"https://example.com/docs\">the docs</a></body>";
+        let lines: Vec<String> = body_lines(Some(html), None, 80, &ink)
+            .into_iter()
+            .map(|l| l.trim_end().to_string())
+            .collect();
         assert_eq!(
-            comment_url(&t, "555"),
-            "https://app.asana.com/0/1200000000000003/1211234567890123/555/f"
+            lines,
+            [
+                "  Steps:",
+                "  1. Run `asana auth login`",
+                "  2. See the docs https://example.com/docs",
+            ]
         );
-        let t = task_with_url(Some(
-            "https://app.asana.com/0/1200000000000003/1211234567890123/f",
-        ));
-        assert_eq!(
-            comment_url(&t, "555"),
-            "https://app.asana.com/0/1200000000000003/1211234567890123/555/f"
-        );
-        let t = task_with_url(Some(
-            "https://app.asana.com/1/12/project/34/task/1211234567890123",
-        ));
-        assert_eq!(
-            comment_url(&t, "555"),
-            "https://app.asana.com/0/0/1211234567890123/555/f"
-        );
-        let t = task_with_url(None);
-        assert_eq!(task_url(&t), "https://app.asana.com/0/0/1211234567890123/f");
-        assert_eq!(
-            comment_url(&t, "555"),
-            "https://app.asana.com/0/0/1211234567890123/555/f"
-        );
-    }
-
-    #[test]
-    fn comments_deserialize_with_is_edited() {
-        let v = serde_json::json!({
-            "gid": "1", "type": "comment", "text": "hi", "is_edited": true,
-            "created_by": {"gid": "2", "name": "Dave"}
-        });
-        let c: Comment = serde_json::from_value(v).unwrap();
-        assert!(c.story.is_comment());
-        assert_eq!(c.is_edited, Some(true));
-        assert_eq!(c.author(), "Dave");
-        let v = serde_json::json!({"gid": "1", "type": "system", "text": "added to project"});
-        let c: Comment = serde_json::from_value(v).unwrap();
-        assert!(!c.story.is_comment());
-        assert_eq!(c.author(), "someone");
     }
 
     #[test]
