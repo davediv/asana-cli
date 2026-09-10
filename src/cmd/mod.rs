@@ -413,7 +413,10 @@ mod tests {
     /// help screens stay as they are.
     #[test]
     fn json_fields_default_to_none() {
-        assert!(json_fields(&["task", "list"]).is_empty());
+        // A leaf that offers `--json` declares its fields; everything else
+        // stays empty, so cli.rs prints no JSON FIELDS section for it.
+        assert!(json_fields(&["task", "list"]).contains(&"name"));
+        assert!(json_fields(&["task", "complete"]).is_empty());
         assert!(json_fields(&["nope"]).is_empty());
         assert!(json_fields(&[]).is_empty());
     }

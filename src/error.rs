@@ -2583,7 +2583,24 @@ mod tests {
             "{}",
             r.stderr
         );
-        assert_eq!(r.stderr.lines().count(), 5 + 6, "{}", r.stderr);
+        // Four framing lines and a blank, then nothing but flag rows: the
+        // whole table, every local flag of the command and no stray text.
+        let lines: Vec<&str> = r.stderr.lines().collect();
+        let (frame, rows) = lines.split_at(5);
+        assert_eq!(frame[4], "Flags:", "{}", r.stderr);
+        for row in rows {
+            assert!(row.starts_with("  ") && row.contains("--"), "{row:?}");
+        }
+        for flag in [
+            "--assignee",
+            "--jq",
+            "--json",
+            "--limit",
+            "--project",
+            "--state",
+        ] {
+            assert!(rows.iter().any(|r| r.contains(flag)), "{flag} missing");
+        }
         let r = render(&["asana", "nope"]);
         assert!(r.stderr.starts_with(
             "unknown command \"nope\" for \"asana\"\n\nUsage:  asana <command> <subcommand> [flags]\n\nAvailable commands:\n  auth:          Authenticate with Asana\n"

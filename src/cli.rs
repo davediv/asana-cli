@@ -1697,12 +1697,19 @@ LEARN MORE
                 "{line:?}"
             );
         }
-        // Without fields there is no section; the real tree has none yet.
+        // Without fields there is no section, and in the real tree the
+        // section appears exactly on the leaves that declare fields.
         let plain = render_help_for(&root, &path, &p, MAX_HELP_WIDTH, &[]);
         assert!(!plain.contains("JSON FIELDS"), "{plain}");
+        let mut with_fields = 0;
         for path in all_paths() {
-            assert!(!render_help_at(&path, &p, MAX_HELP_WIDTH).contains("JSON FIELDS"));
+            let borrowed: Vec<&str> = path.iter().map(String::as_str).collect();
+            let declared = !crate::cmd::json_fields(&borrowed).is_empty();
+            let shown = render_help_at(&path, &p, MAX_HELP_WIDTH).contains("JSON FIELDS");
+            assert_eq!(declared, shown, "{path:?}");
+            with_fields += usize::from(declared);
         }
+        assert!(with_fields >= 4, "no leaf declares JSON fields any more");
         // The list is coloured like every other heading.
         let coloured = render_help_for(&root, &path, &Palette::new(true), 80, &fields);
         assert!(coloured.contains("\x1b[0;1;39mJSON FIELDS\x1b[0m\n  assignee, "));
@@ -1780,7 +1787,13 @@ LEARN MORE
             "{}",
             r.stdout
         );
-        assert!(r.stdout.contains("\n```\n    --json"), "{}", r.stdout);
+        // The flag table is in a fenced block, sorted by long name.
+        assert!(
+            r.stdout.contains("\n```\n-q, --jq expression"),
+            "{}",
+            r.stdout
+        );
+        assert!(r.stdout.contains("    --json fields"), "{}", r.stdout);
         assert!(r.stdout.contains("\n-L, --limit int"), "{}", r.stdout);
         assert!(!r.stdout.contains("--help"), "{}", r.stdout);
         assert!(!r.stdout.contains("--workspace"), "{}", r.stdout);
