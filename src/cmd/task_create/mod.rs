@@ -8,8 +8,6 @@
 //! stdout so it pipes.
 
 use std::io::{BufRead, Write};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context as _, Result};
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
@@ -18,7 +16,8 @@ use serde_json::{json, Value};
 use crate::api::{Task, TASK_FIELDS};
 use crate::cli::{usage_error, Cancelled};
 use crate::cmd::{
-    can_prompt, open_in_browser, read_text_file, task_url, with_spinner, Prevalidate,
+    can_prompt, edit_in_editor, editor_command, editor_name, open_in_browser, read_text_file,
+    task_url, with_spinner, Prevalidate,
 };
 use crate::ctx::Ctx;
 use crate::render::time::today;
@@ -208,59 +207,6 @@ fn split_title_notes(text: &str) -> (Option<String>, Option<String>) {
     (title, tidy_notes(rest.join("\n").trim_start_matches('\n')))
 }
 
-/// `$VISUAL`, else `$EDITOR`, else `vi` (`notepad` on Windows), like gh.
-fn editor_command() -> String {
-    ["VISUAL", "EDITOR"]
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "notepad".to_string()
-            } else {
-                "vi".to_string()
-            }
-        })
-}
-
-/// Open the editor on a scratch file holding `initial` and return what was
-/// written.
-fn edit_in_editor(initial: &str) -> Result<String> {
-    let editor = editor_command();
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("asana-task-{}-{stamp}.md", std::process::id()));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .and_then(|mut f| f.write_all(initial.as_bytes()))
-        .with_context(|| format!("could not create {}", path.display()))?;
-    let status = if cfg!(windows) {
-        Command::new("cmd")
-            .arg("/C")
-            .arg(format!("{editor} \"{}\"", path.display()))
-            .status()
-    } else {
-        Command::new("sh")
-            .arg("-c")
-            .arg(format!("{editor} \"$1\""))
-            .arg(&editor)
-            .arg(&path)
-            .status()
-    };
-    let text = std::fs::read_to_string(&path);
-    let _ = std::fs::remove_file(&path);
-    let status = status.with_context(|| format!("could not run the editor `{editor}`"))?;
-    if !status.success() {
-        bail!("the editor `{editor}` exited with {status}");
-    }
-    text.with_context(|| format!("could not read {}", path.display()))
-}
-
 /// The file `--editor` opens: the title (or a blank line to type it on), a
 /// blank line, then the notes, with a comment explaining the layout the
 /// way gh's editor template does.
@@ -299,12 +245,7 @@ fn prompt_title(palette: &Palette) -> Result<String> {
 /// `? Notes [(e) to launch vi, enter to skip] `, gh's body prompt in one
 /// line: Enter skips, `e` opens the editor, anything else is the notes.
 fn prompt_notes() -> Result<Option<String>> {
-    let editor = editor_command();
-    let program = editor
-        .split_whitespace()
-        .next()
-        .and_then(|p| p.rsplit('/').next())
-        .unwrap_or("editor");
+    let program = editor_name(&editor_command());
     let Some(line) = ask(&format!("Notes [(e) to launch {program}, enter to skip]"))? else {
         return Err(Cancelled.into());
     };
@@ -332,6 +273,16 @@ fn ask(question: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(line))
+}
+
+/// gh's `\nCreating issue in cli/cli\n\n` (cli/cli `issue/create/create.go`):
+/// a blank line, the sentence, a blank line, all on stderr, so
+/// `url=$(asana task create ...)` captures the URL and nothing else and
+/// `2>/dev/null` leaves just the URL on the screen. It carries no colour in
+/// gh, so no palette is involved. `run` prints it only when stdout is a
+/// terminal, gh's `IsStdoutTTY` gate, so a piped run stays silent as well.
+fn creating_line(scope: &str) -> String {
+    format!("\nCreating {scope}\n\n")
 }
 
 /// Everything resolved and ready to send: where the task goes (for the
@@ -423,12 +374,13 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
 
     let Prepared { scope, mut data } = with_spinner(ctx, "", prepare(ctx, &args)).await?;
 
-    // Like gh, say where the task is going only when someone is watching,
-    // and before asking them anything.
+    // Like gh, say where the task is going only when someone is watching
+    // (stdout is a terminal), before asking them anything, and on stderr so
+    // stdout stays exactly the URL.
     if ctx.is_tty {
-        eprintln!();
-        eprintln!("Creating {scope}");
-        eprintln!();
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(creating_line(&scope).as_bytes());
+        let _ = err.flush();
     }
 
     if args.editor {
@@ -443,9 +395,9 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let title = match title {
         Some(t) => t,
         None => {
-            // Only reached when every stream is a terminal, so stdout's
-            // palette is stderr's too.
-            let t = prompt_title(&Palette::new(ctx.color))?;
+            // The prompt and its `X Title cannot be blank` are on stderr,
+            // so they take stderr's palette (`--no-color` still wins).
+            let t = prompt_title(&ctx.stderr_palette())?;
             if notes.is_none() {
                 notes = prompt_notes()?;
             }
@@ -575,6 +527,46 @@ mod tests {
             ..args(Some("Fix it"))
         };
         assert!(url.prevalidate(false).is_ok());
+    }
+
+    /// `--due` is checked before the token is read (it used to live in
+    /// cli.rs); the message is the bare one-liner, not a usage dump.
+    #[test]
+    fn a_bad_due_fails_before_auth() {
+        let bad = Args {
+            due: Some("next week".to_string()),
+            ..args(Some("Fix it"))
+        };
+        let err = bad.prevalidate(false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid due date \"next week\": expected YYYY-MM-DD, today, tomorrow or a weekday"
+        );
+        assert!(err.downcast_ref::<crate::cli::UsageError>().is_none());
+        for good in ["today", "tomorrow", "friday", "2026-12-01"] {
+            let ok = Args {
+                due: Some(good.to_string()),
+                ..args(Some("Fix it"))
+            };
+            assert!(ok.prevalidate(false).is_ok(), "input {good:?}");
+        }
+        // Interactive or not, a bad date never reaches the network.
+        assert!(bad.prevalidate(true).is_err());
+    }
+
+    /// gh-golden/issue-create.txt: a blank line, `Creating issue in
+    /// cli/cli`, a blank line, all on stderr and without colour.
+    #[test]
+    fn creating_line_is_gh_shaped() {
+        assert_eq!(
+            creating_line("task in Roadmap"),
+            "\nCreating task in Roadmap\n\n"
+        );
+        assert_eq!(
+            creating_line("subtask of Spec"),
+            "\nCreating subtask of Spec\n\n"
+        );
+        assert!(!creating_line("task in x").contains('\x1b'));
     }
 
     #[test]
