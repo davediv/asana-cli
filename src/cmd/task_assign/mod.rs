@@ -1,31 +1,41 @@
 //! `asana task assign`: give a task to someone (or to nobody).
 //!
-//! Modelled on `gh issue edit --add-assignee`: the only thing printed on
-//! success is the task's permalink, alone on stdout, so it pipes.
+//! Modelled on `gh issue edit --add-assignee`: the task's permalink is the
+//! only thing printed on stdout, so it pipes, and the confirmation (`✓
+//! Assigned task 1211234567890123 (Fix the login page) to Jane Doe`) goes
+//! to stderr in the shape of gh's close/reopen lines.
 
-use anyhow::{anyhow, bail, Result};
-use serde::Deserialize;
+use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::api::ApiError;
-use crate::cmd::{finish, spinner};
+use crate::api::Task;
+use crate::cmd::{task_url, with_spinner, Prevalidate};
 use crate::ctx::Ctx;
-use crate::resolve::{parse_task_id, resolve_assignee};
+use crate::render::Palette;
+use crate::resolve::{parse_task_id, resolve_assignee_value, IdKind, InvalidIdentifier};
 
 #[derive(clap::Args, Debug)]
 #[command(
     about = "Assign a task to someone",
     long_about = "Assign a task to a person in the workspace, or take it away from them.\n\n\
-        A task has at most one assignee, so assigning it replaces whoever had it before.\n\
-        The assignee can be given by email address, by user gid, or by name; a name that\n\
-        matches more than one person is an error that lists the candidates with their\n\
-        emails and gids.\n\n\
+        A task has at most one assignee, so assigning it replaces whoever had it\n\
+        before, and `--unassign` leaves it with nobody. The assignee can be given by\n\
+        email address, by user gid, or by name; a name that matches more than one\n\
+        person is an error that lists the candidates with their emails and gids.\n\n\
         The `<assignee>` argument supports the following special values:\n\
         - `@me`: assign yourself (`me` works too)",
-    after_help = "$ asana task assign 1211234567890123 \"@me\"\n\
+    after_help = "# Assign a task to yourself\n\
+        $ asana task assign 1211234567890123 \"@me\"\n\
+        \n\
+        # Assign a task to someone else, by email, by name or by user gid\n\
         $ asana task assign 1211234567890123 jane@example.com\n\
         $ asana task assign 1211234567890123 \"Jane Doe\"\n\
-        $ asana task assign https://app.asana.com/0/1200000000000000/1211234567890123 1200000000000001\n\
+        $ asana task assign 1211234567890123 1200000000000001\n\
+        \n\
+        # Assign a task by URL\n\
+        $ asana task assign https://app.asana.com/0/1200000000000000/1211234567890123 \"@me\"\n\
+        \n\
+        # Take a task away from whoever has it\n\
         $ asana task assign 1211234567890123 --unassign"
 )]
 pub struct Args {
@@ -46,85 +56,91 @@ pub struct Args {
     pub unassign: bool,
 }
 
-/// The slice of the updated task we need back from `PUT /tasks/{gid}`.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct Updated {
-    #[serde(default)]
-    gid: String,
-    permalink_url: Option<String>,
-}
-
-/// `me` and `@me` are understood by the API itself, so they need no lookup.
-pub fn self_assignee(input: &str) -> bool {
-    matches!(input.trim(), "me" | "@me")
-}
-
-/// The `assignee` value to send: `null` for `--unassign`, `me`, or a user gid.
-async fn assignee_value(ctx: &Ctx, assignee: Option<&str>) -> Result<Value> {
-    let Some(input) = assignee else {
-        return Ok(Value::Null);
-    };
-    if self_assignee(input) {
-        return Ok(Value::String("me".to_string()));
-    }
-    match resolve_assignee(ctx, input).await {
-        Ok(a) => Ok(Value::String(a.gid)),
-        Err(err) => Err(not_found_message(err, input)),
+/// A blank assignee can never name anyone, so it fails before the token is
+/// read, like gh's `invalid issue format: "abc"` (the task id is checked by
+/// `cli.rs` the same way).
+impl Prevalidate for Args {
+    fn prevalidate(&self, _interactive: bool) -> Result<()> {
+        check_assignee(self.assignee.as_deref())
     }
 }
 
-/// Keep Asana's own 404 text when it names what was looked up (like
-/// `user: Unknown object: x@y.z`); a bare `Not Found` gets the identifier.
-fn not_found_message(err: anyhow::Error, input: &str) -> anyhow::Error {
-    let wanted = input.trim();
-    match err.downcast_ref::<ApiError>() {
-        Some(ApiError::NotFound { message, .. })
-            if !message.to_lowercase().contains(&wanted.to_lowercase()) =>
-        {
-            anyhow!("no user matching \"{wanted}\"")
+/// `invalid assignee: ""` for an assignee that is nothing but whitespace.
+fn check_assignee(assignee: Option<&str>) -> Result<()> {
+    match assignee {
+        Some(blank) if blank.trim().is_empty() => {
+            Err(InvalidIdentifier::new(IdKind::Assignee, blank).into())
         }
-        _ => err,
+        _ => Ok(()),
     }
 }
 
-/// The permalink to print; Asana's `/0/0/<gid>/f` form when the API sent none.
-pub fn task_url(gid: &str, permalink: Option<&str>) -> String {
-    match permalink.filter(|u| !u.trim().is_empty()) {
-        Some(u) => u.trim().to_string(),
-        None => format!("https://app.asana.com/0/0/{gid}/f"),
+/// The `assignee` value to send: `null` for `--unassign`, else `me` or a
+/// user gid (an email, gid or name is looked up first).
+async fn assignee_value(ctx: &Ctx, assignee: Option<&str>) -> Result<Value> {
+    match assignee {
+        None => Ok(Value::Null),
+        Some(input) => Ok(Value::String(resolve_assignee_value(ctx, input).await?)),
     }
 }
 
-/// Nothing to check before the token is read; see `cmd::Prevalidate`.
-impl crate::cmd::Prevalidate for Args {}
+/// `1211234567890123 (Fix the login page)`, the way gh writes
+/// `cli/cli#13 (The title of the issue)`; the gid alone for an unnamed task.
+fn label(task: &Task) -> String {
+    match task
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        Some(name) => format!("{} ({name})", task.gid),
+        None => task.gid.clone(),
+    }
+}
+
+/// The stderr confirmation: `✓ Assigned task <label> to <name>` with the
+/// name Asana sent back, `✓ Unassigned task <label>` after `--unassign`.
+fn status_line(p: &Palette, task: &Task, unassigned: bool) -> String {
+    let label = label(task);
+    if unassigned {
+        return format!("{} Unassigned task {label}", p.success_icon());
+    }
+    match task
+        .assignee
+        .as_ref()
+        .map(|a| a.display().trim())
+        .filter(|n| !n.is_empty())
+    {
+        Some(name) => format!("{} Assigned task {label} to {name}", p.success_icon()),
+        None => format!("{} Assigned task {label}", p.success_icon()),
+    }
+}
 
 pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
     let gid = parse_task_id(&args.task)?;
-    if let Some(blank) = args.assignee.as_deref().filter(|a| a.trim().is_empty()) {
-        bail!("invalid assignee: \"{blank}\"");
+    check_assignee(args.assignee.as_deref())?;
+    let p = Palette::new(ctx.color);
+    let mut task: Task = with_spinner(ctx, "", async {
+        let assignee = assignee_value(ctx, args.assignee.as_deref()).await?;
+        let task: Task = ctx
+            .api
+            .put(&format!("/tasks/{gid}"), json!({ "assignee": assignee }))
+            .await?;
+        Ok::<_, anyhow::Error>(task)
+    })
+    .await?;
+    if task.gid.is_empty() {
+        task.gid = gid;
     }
-    let sp = spinner(ctx);
-    let assignee = match assignee_value(ctx, args.assignee.as_deref()).await {
-        Ok(v) => v,
-        Err(e) => {
-            finish(sp);
-            return Err(e);
-        }
-    };
-    let updated: Result<Updated, ApiError> = ctx
-        .api
-        .put(&format!("/tasks/{gid}"), json!({ "assignee": assignee }))
-        .await;
-    finish(sp);
-    let task = updated?;
-    let gid = if task.gid.is_empty() { gid } else { task.gid };
-    println!("{}", task_url(&gid, task.permalink_url.as_deref()));
+    eprintln!("{}", status_line(&p, &task, args.assignee.is_none()));
+    println!("{}", task_url(&task));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::Named;
     use clap::error::ErrorKind;
     use clap::Parser;
 
@@ -139,27 +155,17 @@ mod tests {
             .map(|h| h.args)
     }
 
-    #[test]
-    fn me_needs_no_lookup() {
-        assert!(self_assignee("me"));
-        assert!(self_assignee("@me"));
-        assert!(self_assignee(" me "));
-        assert!(!self_assignee("mee"));
-        assert!(!self_assignee("me@example.com"));
-        assert!(!self_assignee(""));
-    }
-
-    #[test]
-    fn task_urls_prefer_the_permalink() {
-        assert_eq!(
-            task_url("123", Some("https://app.asana.com/0/9/123")),
-            "https://app.asana.com/0/9/123"
-        );
-        assert_eq!(
-            task_url("123", Some("  ")),
-            "https://app.asana.com/0/0/123/f"
-        );
-        assert_eq!(task_url("123", None), "https://app.asana.com/0/0/123/f");
+    fn task(name: Option<&str>, assignee: Option<&str>) -> Task {
+        Task {
+            gid: "1211234567890123".to_string(),
+            name: name.map(str::to_string),
+            assignee: assignee.map(|n| Named {
+                gid: "1200000000000001".to_string(),
+                name: Some(n.to_string()),
+                email: None,
+            }),
+            ..Task::default()
+        }
     }
 
     #[test]
@@ -192,30 +198,63 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
 
+    /// A blank assignee is rejected before any request, with the shared
+    /// typed error so `error.rs` prints gh's `invalid assignee: ""`.
     #[test]
-    fn keeps_asana_text_that_names_the_user() {
-        let err = anyhow::Error::new(ApiError::NotFound {
-            message: "user: Unknown object: x@y.z".to_string(),
-            url: "u".to_string(),
-        });
-        // ApiError's Display belongs to the errors piece; only assert that
-        // Asana's own text survives untouched.
-        let shown = not_found_message(err, "x@y.z").to_string();
-        assert!(shown.contains("user: Unknown object: x@y.z"), "{shown}");
-        let err = anyhow::Error::new(ApiError::NotFound {
-            message: "Not Found".to_string(),
-            url: "u".to_string(),
-        });
+    fn blank_assignee_is_an_invalid_identifier() {
+        let args = parse(&["123", " "]).unwrap();
+        let err = args.prevalidate(true).unwrap_err();
+        assert_eq!(err.to_string(), "invalid assignee: \" \"");
         assert_eq!(
-            not_found_message(err, "x@y.z").to_string(),
-            "no user matching \"x@y.z\""
+            err.downcast_ref::<InvalidIdentifier>(),
+            Some(&InvalidIdentifier::new(IdKind::Assignee, " "))
         );
-        let err = anyhow::Error::new(ApiError::Forbidden {
-            message: "Forbidden".to_string(),
-            url: "u".to_string(),
-        });
-        assert!(not_found_message(err, "x@y.z")
-            .downcast_ref::<ApiError>()
-            .is_some());
+        assert!(parse(&["123", "me"]).unwrap().prevalidate(true).is_ok());
+        assert!(parse(&["123", "--unassign"])
+            .unwrap()
+            .prevalidate(false)
+            .is_ok());
+    }
+
+    #[test]
+    fn labels_read_like_gh() {
+        assert_eq!(
+            label(&task(Some("Fix the login page"), None)),
+            "1211234567890123 (Fix the login page)"
+        );
+        assert_eq!(label(&task(Some("  "), None)), "1211234567890123");
+        assert_eq!(label(&task(None, None)), "1211234567890123");
+    }
+
+    #[test]
+    fn status_lines_name_who_got_the_task() {
+        let p = Palette::off();
+        assert_eq!(
+            status_line(
+                &p,
+                &task(Some("Fix the login page"), Some("Jane Doe")),
+                false
+            ),
+            "✓ Assigned task 1211234567890123 (Fix the login page) to Jane Doe"
+        );
+        assert_eq!(
+            status_line(&p, &task(Some("Fix the login page"), None), false),
+            "✓ Assigned task 1211234567890123 (Fix the login page)"
+        );
+        assert_eq!(
+            status_line(&p, &task(Some("Fix the login page"), None), true),
+            "✓ Unassigned task 1211234567890123 (Fix the login page)"
+        );
+    }
+
+    #[test]
+    fn the_tick_is_green_only_with_colour() {
+        let line = status_line(&Palette::new(true), &task(None, Some("Jane Doe")), false);
+        assert!(
+            line.starts_with("\x1b[0;32m✓\x1b[0m Assigned task"),
+            "{line:?}"
+        );
+        let line = status_line(&Palette::new(false), &task(None, Some("Jane Doe")), false);
+        assert!(!line.contains('\x1b'), "{line:?}");
     }
 }
