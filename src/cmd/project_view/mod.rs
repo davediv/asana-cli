@@ -1,8 +1,8 @@
 //! `asana project view`: one project, laid out like `gh repo view` /
-//! `gh issue view`: a bold name, a `state • visibility • owner • activity •
-//! counts` line, `Label: value` lines, the description rendered with a
-//! two-space margin and padded to the width the way glamour does, and a
-//! muted permalink footer. Piped: `key:\tvalue` lines, `--`, the raw notes.
+//! `gh issue view`: a bold name followed by the gid that names it, a
+//! `state • visibility • owner • activity • counts` line, `Label: value`
+//! lines, the description with a two-space margin, and a muted permalink
+//! footer. Piped: `key:\tvalue` lines, `--`, the raw notes.
 //! `--json [fields]` and `--jq` are gh's, through `render::json`.
 
 use anyhow::Result;
@@ -14,7 +14,7 @@ use crate::api::{ApiError, Named, Project, PROJECT_FIELDS, TASK_COUNT_FIELDS};
 use crate::cmd::{open_in_browser, with_spinner};
 use crate::ctx::Ctx;
 use crate::render::json::{self, JsonArgs};
-use crate::render::notes::render_body;
+use crate::render::notes::{render_lines, Layout};
 use crate::render::time::{due_phrase, fuzzy_ago, iso, now, short_date, today, DueState};
 use crate::render::Palette;
 use crate::resolve::{parse_project_gid, resolve_project};
@@ -58,9 +58,11 @@ const JSON_FIELDS: &[&str] = &[
         With `--web`, open the project in a web browser instead.\n\n\
         For more information about output formatting flags, see `asana help formatting`.",
     after_help = "$ asana project view Roadmap\n\
+        $ asana project view 1200000000000000\n\
+        $ asana project view https://app.asana.com/0/1200000000000000/list\n\
         $ asana project view Roadmap --json name,owner,task_counts\n\
-        $ asana project view 1200000000000000 --json permalink_url --jq .permalink_url\n\
-        $ asana project view https://app.asana.com/0/1200000000000000/list --web"
+        $ asana project view Roadmap --json permalink_url --jq .permalink_url\n\
+        $ asana project view Roadmap --web"
 )]
 pub struct Args {
     /// Project gid, URL or name
@@ -70,7 +72,7 @@ pub struct Args {
     #[command(flatten)]
     pub json: JsonArgs,
 
-    /// Open the project in the browser
+    /// Open a project in the browser
     #[arg(short = 'w', long)]
     pub web: bool,
 }
@@ -282,8 +284,13 @@ async fn fetch_view(ctx: &Ctx, gid: &str) -> Result<Value, ApiError> {
 }
 
 /// The raw `/task_counts` object, or nothing when Asana will not say (the
-/// view still prints without the numbers).
-async fn fetch_counts(ctx: &Ctx, gid: &str) -> Option<Value> {
+/// view still prints without the numbers). `wanted` is false when `--json`
+/// named a field list that leaves `task_counts` out, so the second request
+/// is not made for a value nobody asked for.
+async fn fetch_counts(ctx: &Ctx, gid: &str, wanted: bool) -> Option<Value> {
+    if !wanted {
+        return None;
+    }
     ctx.api
         .get(
             &format!("/projects/{gid}/task_counts"),
@@ -291,6 +298,21 @@ async fn fetch_counts(ctx: &Ctx, gid: &str) -> Option<Value> {
         )
         .await
         .ok()
+}
+
+/// Whether the run needs `/task_counts`: the human view and `--json` with
+/// no field list always do; a field list does only when it asks for
+/// `task_counts` (`--json task_counts.num_tasks` counts, as `json::select`
+/// judges a dotted field by its first segment).
+fn wants_counts(args: &Args) -> bool {
+    if !args.json.is_json() {
+        return true;
+    }
+    let fields = args.json.fields();
+    fields.is_empty()
+        || fields
+            .iter()
+            .any(|f| f.split('.').next().unwrap_or(f) == "task_counts")
 }
 
 /// The gid `input` names: a gid or URL as is, a name through the shared
@@ -331,9 +353,10 @@ pub async fn run(ctx: &Ctx, args: Args) -> Result<()> {
         let view: View = serde_json::from_value(raw)?;
         return open_in_browser(&view.url());
     }
+    let wanted = wants_counts(&args);
     let (raw, counts) = with_spinner(ctx, "", async {
         let gid = resolve_gid(ctx, &args.project).await?;
-        let (raw, counts) = tokio::join!(fetch_view(ctx, &gid), fetch_counts(ctx, &gid));
+        let (raw, counts) = tokio::join!(fetch_view(ctx, &gid), fetch_counts(ctx, &gid, wanted));
         Ok::<_, anyhow::Error>((raw?, counts))
     })
     .await?;
@@ -365,7 +388,16 @@ fn render_tty(v: &View, counts: &Counts, width: usize, color: bool, now: DateTim
         out.push('\n');
     };
 
-    line(&mut out, &p.bold(v.display()));
+    // `gh issue view` heads its view with the bold subject and then, plain,
+    // the identifier another command would take (`... cli/cli#13111`); ours
+    // is the gid, so a name lookup shows what it resolved to and leaves
+    // something to paste. Nothing to add when the name IS the gid.
+    let gid = &v.project.gid;
+    if v.display() == gid {
+        line(&mut out, &p.bold(gid));
+    } else {
+        line(&mut out, &format!("{} {gid}", p.bold(v.display())));
+    }
 
     let mut meta: Vec<String> = Vec::new();
     let (label, hue) = state(v);
@@ -427,7 +459,7 @@ fn render_tty(v: &View, counts: &Counts, width: usize, color: bool, now: DateTim
     // Body: blank, blank, the notes in gh's issue-body shape, blank, blank.
     // Nothing to show is one muted line with a single blank line each
     // side, the way `gh repo view` prints its no-README line.
-    let body = render_body(
+    let body = body_lines(
         v.project.html_notes.as_deref(),
         v.project.notes.as_deref(),
         width,
@@ -454,6 +486,33 @@ fn render_tty(v: &View, counts: &Counts, width: usize, color: bool, now: DateTim
         &p.muted(&format!("View this project in Asana: {}", v.url())),
     );
     out
+}
+
+/// The description, in `gh`'s issue-body shape: wrapped to `width - 4`
+/// under a two-space margin, so the text keeps two free columns on the
+/// right the way glamour's document margin does.
+///
+/// `render::notes::render_body` also pads every line out to `width - 2`,
+/// because glamour fills the line it has painted. Nothing here paints a
+/// background behind running text, so that fill is nothing but trailing
+/// whitespace on every line of the description, which a copy-paste carries
+/// away with it. Same layout, `pad_to: None`.
+fn body_lines(
+    html: Option<&str>,
+    text: Option<&str>,
+    width: usize,
+    palette: &Palette,
+) -> Vec<String> {
+    render_lines(
+        html,
+        text,
+        &Layout {
+            width: width.saturating_sub(4).max(20),
+            color: palette.enabled,
+            margin: 2,
+            pad_to: None,
+        },
+    )
 }
 
 /// `tomorrow (Sep 11)`, `3 days overdue (Sep 7)` in red, `today` in yellow;
@@ -588,6 +647,15 @@ mod tests {
         .expect("sample project")
     }
 
+    /// The sample with a description long enough to wrap at 80 columns.
+    fn long_notes() -> View {
+        let mut v = sample();
+        let text = "The quarter's plan, written out at length so the renderer has to wrap it more than once at eighty columns.";
+        v.project.html_notes = Some(format!("<body>{text}</body>"));
+        v.project.notes = Some(text.to_string());
+        v
+    }
+
     fn at() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 9, 10, 0, 0)
             .single()
@@ -636,7 +704,7 @@ mod tests {
         };
         let out = render_tty(&sample(), &counts, 80, false, at());
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "Roadmap");
+        assert_eq!(lines[0], "Roadmap 1200000000000000");
         assert_eq!(
             lines[1],
             "Active • private to team • owned by Div • updated about 2 hours ago • 10 of 12 tasks open"
@@ -650,11 +718,18 @@ mod tests {
         assert_eq!(lines[5], "Members: Div, Alice");
         assert_eq!(lines[6], "");
         assert_eq!(lines[7], "");
-        // The body is padded to width - 2, as glamour pads an issue body.
-        assert_eq!(lines[8].trim_end(), "  Plan for Q4.");
-        assert_eq!(lines[9].trim_end(), "  Ship the CLI.");
-        assert_eq!(UnicodeWidthStr::width(lines[8]), 78);
-        assert_eq!(UnicodeWidthStr::width(lines[9]), 78);
+        // The body keeps gh's two-space margin and its two free columns on
+        // the right, but carries no trailing whitespace.
+        assert_eq!(lines[8], "  Plan for Q4.");
+        assert_eq!(lines[9], "  Ship the CLI.");
+        for l in &lines {
+            assert_eq!(l.trim_end(), *l, "trailing whitespace in {l:?}");
+        }
+        let long = render_tty(&long_notes(), &counts, 80, false, at());
+        for l in long.lines().filter(|l| l.starts_with("  ")) {
+            assert!(UnicodeWidthStr::width(l) <= 78, "{l:?}");
+            assert_eq!(l.trim_end(), l, "trailing whitespace in {l:?}");
+        }
         assert_eq!(lines[10], "");
         assert_eq!(lines[11], "");
         assert_eq!(
@@ -678,8 +753,17 @@ mod tests {
         let out = render_tty(&v, &Counts::default(), 80, false, at());
         assert_eq!(
             out,
-            "Bare\nActive\n\n  No description provided\n\nView this project in Asana: https://app.asana.com/0/42/list\n"
+            "Bare 42\nActive\n\n  No description provided\n\nView this project in Asana: https://app.asana.com/0/42/list\n"
         );
+    }
+
+    /// A project Asana sent no name for displays as its gid; the header
+    /// does not then print it twice.
+    #[test]
+    fn a_nameless_project_shows_its_gid_once() {
+        let v: View = serde_json::from_value(serde_json::json!({"gid": "42"})).unwrap();
+        let out = render_tty(&v, &Counts::default(), 80, false, at());
+        assert_eq!(out.lines().next(), Some("42"));
     }
 
     #[test]
@@ -693,7 +777,7 @@ mod tests {
         .unwrap();
         let out = render_tty(&v, &Counts::default(), 120, true, at());
         assert!(
-            out.starts_with("\x1b[0;1;39m👨\u{200d}⚖️ LEGAL\x1b[0m\n"),
+            out.starts_with("\x1b[0;1;39m👨\u{200d}⚖️ LEGAL\x1b[0m 9\n"),
             "{out:?}"
         );
         assert_eq!(
@@ -707,11 +791,7 @@ mod tests {
         let counts = Counts::default();
         let out = render_tty(&sample(), &counts, 80, true, at());
         let lines: Vec<&str> = out.lines().collect();
-        assert!(
-            lines[0].starts_with("\x1b[0;1;39mRoadmap\x1b[0m"),
-            "{:?}",
-            lines[0]
-        );
+        assert_eq!(lines[0], "\x1b[0;1;39mRoadmap\x1b[0m 1200000000000000");
         assert!(
             lines[1].starts_with("\x1b[0;32mActive\x1b[0m • private to team • owned by Div"),
             "{:?}",
@@ -924,6 +1004,29 @@ mod tests {
             "{err}"
         );
         assert!(err.ends_with("\n  workspace"), "{err}");
+    }
+
+    /// The second request is made for the human view and for any `--json`
+    /// that can print the counts, and skipped for a field list that cannot.
+    #[test]
+    fn the_counts_request_is_made_only_when_it_can_be_printed() {
+        for argv in [
+            &["Roadmap"][..],
+            &["Roadmap", "--web"],
+            &["Roadmap", "--json"],
+            &["Roadmap", "--json", "--jq", ".task_counts"],
+            &["Roadmap", "--json", "name,task_counts"],
+            &["Roadmap", "--json", "task_counts.num_tasks"],
+        ] {
+            assert!(wants_counts(&parse(argv).unwrap()), "{argv:?}");
+        }
+        for argv in [
+            &["Roadmap", "--json", "name"][..],
+            &["Roadmap", "--json", "gid,permalink_url"],
+            &["Roadmap", "--json", "owner", "--jq", ".owner.name"],
+        ] {
+            assert!(!wants_counts(&parse(argv).unwrap()), "{argv:?}");
+        }
     }
 
     #[test]
