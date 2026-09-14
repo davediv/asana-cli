@@ -26,7 +26,8 @@ use std::ffi::OsString;
 use clap::{ArgAction, Command, CommandFactory, Parser, Subcommand};
 
 use crate::cmd::{
-    auth_login, auth_status, help, project_list, project_view, task_assign, task_comment,
+    auth_login, auth_status, help, project_delete, project_list, project_view, task_assign,
+    task_comment,
     task_complete, task_create, task_delete, task_list, task_view, workspace_list,
     Prevalidate as _,
 };
@@ -151,7 +152,7 @@ pub enum Commands {
     Workspace(WorkspaceCmd),
     #[command(
         subcommand,
-        about = "List and view the projects in the workspace",
+        about = "List, view and delete the projects in the workspace",
         long_about = "Work with Asana projects.",
         after_help = "$ asana project list\n$ asana project list --archived\n$ asana project view \"Roadmap\" --web"
     )]
@@ -184,6 +185,7 @@ pub enum ProjectCmd {
     #[command(visible_alias = "ls")]
     List(project_list::Args),
     View(project_view::Args),
+    Delete(project_delete::Args),
 }
 
 /// The one-line `about` of each leaf is what its group screen lists. The
@@ -233,6 +235,7 @@ impl Commands {
             Commands::Workspace(WorkspaceCmd::List(a)) => a.prevalidate(interactive),
             Commands::Project(ProjectCmd::List(a)) => a.prevalidate(interactive),
             Commands::Project(ProjectCmd::View(a)) => a.prevalidate(interactive),
+            Commands::Project(ProjectCmd::Delete(a)) => a.prevalidate(interactive),
             Commands::Task(TaskCmd::List(a)) => a.prevalidate(interactive),
             Commands::Task(TaskCmd::View(a)) => a.prevalidate(interactive),
             Commands::Task(TaskCmd::Create(a)) => a.prevalidate(interactive),
@@ -916,7 +919,7 @@ USAGE
 
 CORE COMMANDS
   auth:          Authenticate with Asana
-  project:       List and view the projects in the workspace
+  project:       List, view and delete the projects in the workspace
   task:          Create, view, assign and complete tasks
   workspace:     List the workspaces your token can reach
 
@@ -1176,9 +1179,10 @@ TARGETED COMMANDS
 
     /// A GENERAL / TARGETED split earns its headings only when every
     /// section holds at least two commands: `task` (two against six) keeps
-    /// gh's `issue` layout, while `project`, with one of each, folds into a
-    /// single `AVAILABLE COMMANDS` section in name order, like `gh auth`,
-    /// instead of printing a heading over each of two lines.
+    /// gh's `issue` layout, while `project`, with one general command
+    /// against two targeted ones, folds into a single `AVAILABLE COMMANDS`
+    /// section in name order, like `gh auth`, instead of printing a heading
+    /// over a single line.
     #[test]
     fn one_entry_sections_fold_into_available_commands() {
         let p = Palette::off();
@@ -1188,6 +1192,7 @@ USAGE
   asana project <command> [flags]
 
 AVAILABLE COMMANDS
+  delete:        Delete a project
   list:          List projects in the workspace
   view:          View a project
 

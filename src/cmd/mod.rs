@@ -6,6 +6,7 @@
 pub mod auth_login;
 pub mod auth_status;
 pub mod help;
+pub mod project_delete;
 pub mod project_list;
 pub mod project_view;
 pub mod task_assign;
@@ -207,6 +208,7 @@ pub fn json_fields(path: &[&str]) -> &'static [&'static str] {
         ["workspace", "list"] => workspace_list::Args::JSON_FIELDS,
         ["project", "list"] => project_list::Args::JSON_FIELDS,
         ["project", "view"] => project_view::Args::JSON_FIELDS,
+        ["project", "delete"] => project_delete::Args::JSON_FIELDS,
         ["task", "list"] => task_list::Args::JSON_FIELDS,
         ["task", "view"] => task_view::Args::JSON_FIELDS,
         ["task", "create"] => task_create::Args::JSON_FIELDS,

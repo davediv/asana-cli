@@ -171,6 +171,7 @@ async fn dispatch(ctx: &Ctx, command: Commands) -> anyhow::Result<()> {
         Commands::Workspace(WorkspaceCmd::List(args)) => cmd::workspace_list::run(ctx, args).await,
         Commands::Project(ProjectCmd::List(args)) => cmd::project_list::run(ctx, args).await,
         Commands::Project(ProjectCmd::View(args)) => cmd::project_view::run(ctx, args).await,
+        Commands::Project(ProjectCmd::Delete(args)) => cmd::project_delete::run(ctx, args).await,
         Commands::Task(TaskCmd::List(args)) => cmd::task_list::run(ctx, args).await,
         Commands::Task(TaskCmd::View(args)) => cmd::task_view::run(ctx, args).await,
         Commands::Task(TaskCmd::Create(args)) => cmd::task_create::run(ctx, args).await,

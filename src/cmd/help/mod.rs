@@ -116,6 +116,7 @@ pub fn usage(path: &[&str]) -> Option<&'static str> {
         [] => "asana <command> <subcommand> [flags]",
         ["auth"] | ["workspace"] | ["project"] | ["task"] => return None,
         ["project", "view"] => "asana project view {<gid> | <url> | <name>} [flags]",
+        ["project", "delete"] => "asana project delete {<gid> | <url> | <name>} [flags]",
         ["task", "view"] => "asana task view {<gid> | <url>} [flags]",
         ["task", "complete"] => "asana task complete {<gids> | <urls>} [flags]",
         ["task", "reopen"] => "asana task reopen {<gids> | <urls>} [flags]",
@@ -132,8 +133,8 @@ pub fn usage(path: &[&str]) -> Option<&'static str> {
 /// here fall into `ADDITIONAL COMMANDS`. This is the classification only:
 /// the renderer in `cli.rs` prints the split when every section holds at
 /// least two commands (`task` does) and otherwise one `AVAILABLE COMMANDS`
-/// section, so `project`, with one of each, reads like `gh auth --help`
-/// rather than like a template built for a fifteen-command group.
+/// section, so `project`, with a single general command, reads like `gh auth
+/// --help` rather than like a template built for a fifteen-command group.
 pub fn groups(path: &[&str]) -> Vec<(&'static str, &'static [&'static str])> {
     match path {
         [] => vec![("CORE COMMANDS", &["auth", "project", "task", "workspace"])],
@@ -146,7 +147,7 @@ pub fn groups(path: &[&str]) -> Vec<(&'static str, &'static [&'static str])> {
         ],
         ["project"] => vec![
             ("GENERAL COMMANDS", &["list"]),
-            ("TARGETED COMMANDS", &["view"]),
+            ("TARGETED COMMANDS", &["delete", "view"]),
         ],
         _ => Vec::new(),
     }
